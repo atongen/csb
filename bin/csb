@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+#
+# csb (claude sandbox)
+#
+# Runs Claude Code, sandboxed, in a per-branch git worktree.
+#
+#   csb [BRANCH]            ensure a worktree for BRANCH (off current HEAD) and
+#                           launch sandboxed claude with the worktree as cwd
+#   csb -y [BRANCH]         ...with --dangerously-skip-permissions (allow-all)
+#   csb [BRANCH] -- ARGS    pass ARGS straight through to claude
+#   csb -d BRANCH           remove the worktree for BRANCH (branch is NOT deleted)
+#   csb                     list existing csb worktrees
+#
+# The sandbox itself is provided by the repo's own flake (a `claude-sandboxed`
+# package built with csb's lib.mkClaudeSandbox). A repo flake is required; run
+#   nix flake init -t github:atongen/csb
+# to scaffold one. tmux is managed by you, outside the sandbox — only claude is
+# jailed.
+#
+# Env:
+#   CSB_FLAKE        flake ref providing #claude-sandboxed (default: repo root)
+#   CSB_EXTRA_DOMAINS  (consumed by the repo flake, not here)
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+
+usage() {
+  cat <<EOF
+USAGE:
+  $PROG [-y] [BRANCH] [-- CLAUDE_ARGS...]   launch sandboxed claude in BRANCH's worktree
+  $PROG -d BRANCH                           remove BRANCH's worktree (keeps the branch)
+  $PROG                                     list csb worktrees
+
+OPTIONS:
+  -y, --yolo      pass --dangerously-skip-permissions to claude (allow-all)
+      --no-sandbox  run claude unjailed (debugging escape hatch)
+  -d, --delete    delete mode (remove the worktree for BRANCH)
+  -h, --help      show this help
+EOF
+}
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+# --- git / worktree helpers ---------------------------------------------------
+
+flatten_branch() { echo "${1//\//-}"; }
+
+worktree_path() {
+  local repo_root="$1" branch="$2"
+  echo "$repo_root/.worktrees/$(flatten_branch "$branch")"
+}
+
+# In a linked worktree, --git-dir and --git-common-dir differ.
+in_worktree() {
+  local gd cd
+  gd=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) || return 1
+  cd=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  [[ "$gd" != "$cd" ]]
+}
+
+# Echo the registered worktree path for $branch, else nothing.
+find_worktree() {
+  local repo_root="$1" branch="$2"
+  git -C "$repo_root" worktree list --porcelain 2>/dev/null | \
+    awk -v want="branch refs/heads/$branch" '
+      /^worktree / { wt = substr($0, 10) }
+      $0 == want   { print wt; exit }
+    '
+}
+
+branch_exists() {
+  local repo_root="$1" branch="$2"
+  git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch" || \
+    git -C "$repo_root" show-ref --verify --quiet "refs/remotes/origin/$branch"
+}
+
+# Echo the worktree path, creating/reusing as needed. Branch is created off the
+# current HEAD if it doesn't already exist.
+ensure_worktree() {
+  local repo_root="$1" branch="$2" existing path
+  existing=$(find_worktree "$repo_root" "$branch")
+  if [[ -n "$existing" ]]; then
+    echo "$existing"
+    return 0
+  fi
+  path=$(worktree_path "$repo_root" "$branch")
+  if branch_exists "$repo_root" "$branch"; then
+    git -C "$repo_root" worktree add "$path" "$branch" >&2
+  else
+    git -C "$repo_root" worktree add -b "$branch" "$path" >&2
+  fi
+  echo "$path"
+}
+
+# Copy gitignored files matching <repo>/.worktreeinclude into a fresh worktree.
+# Only files that match a pattern AND are gitignored are copied; existing files
+# in the worktree are never overwritten. No-op if .worktreeinclude is missing.
+process_worktreeinclude() {
+  local repo_root="$1" wt_path="$2"
+  local include_file="$repo_root/.worktreeinclude"
+  [[ -f "$include_file" ]] || return 0
+
+  local count=0 f src dest
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    git -C "$repo_root" check-ignore -q -- "$f" || continue
+    src="$repo_root/$f"
+    [[ -e "$src" ]] || continue
+    dest="$wt_path/$f"
+    [[ -e "$dest" ]] && continue
+    mkdir -p "$(dirname "$dest")"
+    cp -p "$src" "$dest"
+    count=$((count + 1))
+  done < <(git -C "$repo_root" ls-files --others -i --exclude-from="$include_file")
+
+  if (( count > 0 )); then
+    echo "$PROG: copied $count file(s) into worktree per .worktreeinclude" >&2
+  fi
+}
+
+# Ensure the host paths claude's config sandbox binds back in actually exist
+# (agent-sandbox fails closed if a declared bind target is missing).
+ensure_claude_state() {
+  mkdir -p "$HOME/.claude"
+  [[ -e "$HOME/.claude.json" ]] || echo '{}' > "$HOME/.claude.json"
+}
+
+print_allowlist() {
+  local repo_root="$1"
+  local domains_file="$repo_root/.csb/allowed-domains"
+  echo "$PROG: network allowlist (DNS otherwise blocked):" >&2
+  echo "  built-in: anthropic.com, claude.com, claude.ai, registry.npmjs.org," >&2
+  echo "            github.com, githubusercontent.com" >&2
+  if [[ -f "$domains_file" ]]; then
+    echo "  $domains_file:" >&2
+    sed 's/^/    /' "$domains_file" >&2
+  fi
+}
+
+# --- argument parsing ---------------------------------------------------------
+
+mode="launch"
+yolo="false"
+no_sandbox="false"
+branch=""
+claude_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -d|--delete) mode="delete"; shift ;;
+    -y|--yolo) yolo="true"; shift ;;
+    --no-sandbox) no_sandbox="true"; shift ;;
+    --) shift; claude_args+=("$@"); break ;;
+    -*) usage >&2; die "unknown option: $1" ;;
+    *)
+      if [[ -z "$branch" ]]; then
+        branch="$1"; shift
+      else
+        die "unexpected argument: $1"
+      fi
+      ;;
+  esac
+done
+
+if [[ "$yolo" == "true" ]]; then
+  claude_args=("--dangerously-skip-permissions" "${claude_args[@]+"${claude_args[@]}"}")
+fi
+
+# --- locate repo --------------------------------------------------------------
+
+git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+repo_root=$(git rev-parse --show-toplevel)
+
+# --- list mode (no branch, launch) --------------------------------------------
+
+if [[ "$mode" == "launch" && -z "$branch" ]]; then
+  echo "csb worktrees under $repo_root/.worktrees:"
+  if ! git -C "$repo_root" worktree list 2>/dev/null \
+      | awk -v pre="$repo_root/.worktrees/" 'index($1, pre) == 1'; then
+    true
+  fi
+  exit 0
+fi
+
+# Everything past here operates from the main checkout.
+if in_worktree; then
+  die "refusing to operate from inside a worktree: $repo_root
+  run $PROG from the main checkout instead"
+fi
+
+# --- delete mode --------------------------------------------------------------
+
+if [[ "$mode" == "delete" ]]; then
+  [[ -n "$branch" ]] || die "delete mode requires a branch name"
+  wt_path=$(find_worktree "$repo_root" "$branch")
+  if [[ -z "$wt_path" ]]; then
+    candidate=$(worktree_path "$repo_root" "$branch")
+    [[ -d "$candidate" ]] && wt_path="$candidate"
+  fi
+  if [[ -z "$wt_path" ]]; then
+    echo "$PROG: nothing to do (no worktree for '$branch')"
+    exit 0
+  fi
+  if [[ -d "$wt_path" ]]; then
+    echo "$PROG: removing worktree $wt_path"
+    if ! git -C "$repo_root" worktree remove "$wt_path"; then
+      echo "$PROG: worktree remove failed (uncommitted or untracked files?)" >&2
+      echo "  to force: git -C $repo_root worktree remove --force $wt_path" >&2
+      exit 1
+    fi
+  else
+    echo "$PROG: pruning stale worktree registration for '$branch'"
+    git -C "$repo_root" worktree prune
+  fi
+  exit 0
+fi
+
+# --- launch mode --------------------------------------------------------------
+
+[[ -n "$branch" ]] || die "branch name required"
+
+worktree=$(ensure_worktree "$repo_root" "$branch")
+process_worktreeinclude "$repo_root" "$worktree"
+ensure_claude_state
+
+cd "$worktree"
+
+if [[ "$no_sandbox" == "true" ]]; then
+  echo "$PROG: WARNING running claude UNSANDBOXED in $worktree" >&2
+  exec claude "${claude_args[@]+"${claude_args[@]}"}"
+fi
+
+if [[ ! -f "$repo_root/flake.nix" ]]; then
+  die "no flake.nix at $repo_root — a repo flake providing #claude-sandboxed is required.
+  scaffold one with:  nix flake init -t github:atongen/csb
+  (or run unsandboxed with: $PROG --no-sandbox $branch)"
+fi
+
+flake_ref="${CSB_FLAKE:-$repo_root}"
+print_allowlist "$repo_root"
+echo "$PROG: launching sandboxed claude in $worktree" >&2
+
+exec nix run "${flake_ref}#claude-sandboxed" -- "${claude_args[@]+"${claude_args[@]}"}"

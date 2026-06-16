@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+#
+# tm
+#
+# Wraps tmux for easy workspace switching.
+# Searches paths listed in $TMPATH for workspace root directories.
+#
+# To see all running sessions/windows + their cwds:
+#   tmux list-windows -a -F '#S:#W  #{pane_current_path}'
+#
+# Agent/worktree sandboxing was intentionally moved out of tm into the
+# separate `csb` tool — tm only manages tmux now.
+
+function usage() {
+  echo "USAGE: $ $(basename "$0") path/to/workspace [WINDOW_NAME] [CMD...]"
+}
+
+function expand_workspace() {
+  local ws="$1"
+  local p=${TMPATH:-.}
+  local IFS=":"
+  read -ra TP <<< "$p"
+  for x in "${TP[@]}"; do
+    if [[ -d "$x/$ws" ]]; then
+      cd "$x/$ws"
+      pwd
+      return
+    fi
+  done
+}
+
+enable_debugging="false"
+function debug() {
+  [[ "$enable_debugging" == "true" ]] && \
+    [[ -n "$1" ]] && \
+    echo "$1"
+}
+
+WORKSPACE="$1"
+
+if [[ -z "$WORKSPACE" ]]; then
+  usage
+  echo
+  echo "Sessions:"
+  tmux ls 2>/dev/null || echo "  (no tmux server)"
+  echo
+  echo "Windows:"
+  tmux list-windows -a -F '  #S:#W  #{pane_current_path}' 2>/dev/null || true
+  exit 0
+fi
+
+SESSION_NAME=$(basename "$WORKSPACE")
+shift
+WINDOW_NAME="${1:-main}"
+shift
+CMD=$@
+
+mapfile -t sessions < <( tmux list-sessions -F "#{session_name}" 2>/dev/null )
+
+for i in "${!sessions[@]}"; do
+  name="${sessions[$i]}"
+  if [[ "$name" == "$SESSION_NAME" ]]; then
+    session_exist="true"
+  fi
+done
+
+[[ -z "$session_exist" ]] && session_exist="false"
+
+workspace_dir=$(expand_workspace "$WORKSPACE")
+
+if [[ -n "$TMUX" ]]; then
+  debug "in tmux"
+  # we are currently in a tmux session
+  current=$(tmux display-message -p '#{session_name}:#{window_name}')
+  if [[ "$current" == "$SESSION_NAME:$WINDOW_NAME" ]]; then
+    debug "current session and window"
+    # we are already in this session and window
+    exit 0
+  elif echo "$current" | grep -q -e "^$SESSION_NAME:"; then
+    debug "current session, not window"
+    # we are in the session, but not attached to the requested window
+    # attempt to make the window active in the session
+    tmux select-window -t "$WINDOW_NAME" 2>/dev/null
+    if [[ "$?" -ne "0" ]]; then
+      debug "window didn't exist, create it"
+      tmux new-window -c "$workspace_dir" -n "$WINDOW_NAME" $CMD
+    fi
+  elif [[ "$session_exist" == "true" ]]; then
+    debug "session exists, we aren't in it"
+    # attempt to make the window active in the session
+    tmux select-window -t "$SESSION_NAME:$WINDOW_NAME" 2>/dev/null
+    if [[ "$?" -ne "0" ]]; then
+      debug "window didn't exist, create it"
+      # https://stackoverflow.com/questions/24100721/tmux-attach-to-a-session-and-specify-window
+      # if it wasn't successful, then the window doesn't exist, create it but don't attach
+      TMUX='' tmux new-window -a -c "$workspace_dir" -d -n "$WINDOW_NAME" -t "$SESSION_NAME" $CMD
+    fi
+    tmux switch-client -t "$SESSION_NAME:$WINDOW_NAME"
+  else
+    debug "session doesn't exist"
+    # session does not exist; create it, but do not attach
+    # http://stackoverflow.com/questions/16398850/create-new-tmux-session-from-inside-a-tmux-session
+    TMUX='' tmux new-session -c "$workspace_dir" -d -s "$SESSION_NAME" -n "$WINDOW_NAME" $CMD
+    tmux switch-client -t "$SESSION_NAME:$WINDOW_NAME"
+  fi
+else
+  debug "not in tmux"
+  # we are not currently in a tmux session
+  if [[ "$session_exist" == "true" ]]; then
+    debug "session exists"
+    tmux select-window -t "$SESSION_NAME:$WINDOW_NAME"
+    if [[ "$?" -ne "0" ]]; then 2>/dev/null
+      debug "window didn't exist, create it"
+      TMUX='' tmux new-window -a -c "$workspace_dir" -d -n "$WINDOW_NAME" -t "$SESSION_NAME" $CMD
+    fi
+    tmux attach-session -t "$SESSION_NAME"
+  else
+    debug "session does not exist"
+    # session does not exist, create it and attach
+    tmux new-session -c "$workspace_dir" -s "$SESSION_NAME" -n "$WINDOW_NAME" $CMD
+  fi
+fi

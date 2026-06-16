@@ -1,0 +1,13 @@
+# Per-repo network egress allowlist for the sandboxed claude.
+#
+# Format: one entry per line —  domain [METHOD...]
+#   - methods default to "*" (all) when omitted
+#   - "#" comments and blank lines are ignored
+# Merged on top of csb's built-in hardened defaults (anthropic.com, claude.com,
+# claude.ai, registry.npmjs.org, github.com, githubusercontent.com).
+#
+# This file must be tracked by git for the flake to read it.
+#
+# Examples:
+#   api.mycorp.internal   *
+#   docs.example.com      GET HEAD
