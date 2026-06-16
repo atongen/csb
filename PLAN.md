@@ -226,3 +226,139 @@ csb -d feature/foo      # tear down the worktree when done
 
 - `csb -D` to also delete the branch.
 - macOS `sandbox-exec` deprecation contingency.
+
+---
+
+# Follow-up: running other agents / local models (not just claude-code)
+
+Today the whole pipeline is hardwired to Claude Code. This section scopes what it
+would take to run a *different* cloud agent (Codex/OpenAI, Gemini CLI, aider,
+opencode, …) or a *local* model (Ollama, llama.cpp, vLLM, LM Studio). The easy
+part is swapping the agent; the real curveball is local models vs. the network
+jail.
+
+## Where "claude" is hardcoded (the swap surface)
+
+- **`flake.nix`** — `mkClaudeSandbox` pins `pkg = pkgs.claude-code`,
+  `binName = "claude"`, `outName = "claude-sandboxed"`, `rwDirs = ["$HOME/.claude"]`,
+  `rwFiles = ["$HOME/.claude.json"]`, and the Anthropic-centric `defaultDomains`.
+  The `claude-code` overlay is a flake input.
+- **`bin/csb`** — launches `#claude-sandboxed`; `--no-sandbox` execs `claude`;
+  `-y` injects the Claude-specific `--dangerously-skip-permissions`;
+  `ensure_claude_state` creates `~/.claude` + `~/.claude.json`; `print_allowlist`
+  hardcodes the Claude defaults.
+- **`templates/repo/flake.nix`** — the `claude-sandboxed` package + `mkClaudeSandbox`.
+
+## Step 1 — generalize the wrapper: `mkAgentSandbox` + presets
+
+Refactor `mkClaudeSandbox` into a generic `mkAgentSandbox` and make Claude one
+preset among several:
+
+```nix
+mkAgentSandbox {
+  package;                 # the agent CLI derivation
+  binName;                 # "claude" | "codex" | "aider" | ...
+  outName ? "${binName}-sandboxed";
+  stateDirs ? [ ];         # rw $HOME dirs to persist  (e.g. ["$HOME/.claude"])
+  stateFiles ? [ ];        # rw $HOME files to persist (e.g. ["$HOME/.claude.json"])
+  domains ? { };           # egress allowlist for THIS agent's API
+  yoloArgs ? [ ];          # the allow-all flag(s) for this agent
+  allowedPackages ? [ ];
+  env ? { };               # NON-secret env only (see secrets note)
+}
+```
+
+Ship a small registry of presets (the agent name → spec), e.g.:
+
+| agent | pkg | binName | state paths | egress domains | allow-all flag |
+|---|---|---|---|---|---|
+| claude | `claude-code` | `claude` | `~/.claude`, `~/.claude.json` | anthropic/claude | `--dangerously-skip-permissions` |
+| codex | `codex` | `codex` | `~/.codex` | `api.openai.com` | `--full-auto` (verify) |
+| gemini | `gemini-cli` | `gemini` | `~/.gemini` | `generativelanguage.googleapis.com` | (verify) |
+| aider | `aider-chat` | `aider` | `~/.aider*` | provider-dependent | `--yes` (verify) |
+| local | (see below) | varies | model cache dir | none / LAN host | varies |
+
+`mkClaudeSandbox` stays as a thin alias over the `claude` preset for back-compat.
+(`agent-sandbox` itself already ships `claude` + `copilot` templates, confirming
+this multi-agent shape is the intended use.)
+
+## Step 2 — make `csb` agent-agnostic
+
+- Select the agent via `--agent NAME` (flag), `CSB_AGENT` (env), or a per-repo
+  `.csb/agent` file; default `claude`.
+- Launch `nix run "$flake#${agent}-sandboxed"` instead of the literal name.
+- Keep csb free of a hardcoded per-agent table by having the repo flake expose
+  per-agent **metadata** (state paths, `yoloArgs`, `binName`) that csb reads via
+  `nix eval --json`. csb then: `mkdir -p` the state paths (agent-sandbox fails
+  closed on missing bind targets), map `-y` → that agent's `yoloArgs`, and print
+  the agent's allowlist. This generalizes `ensure_claude_state` and
+  `print_allowlist` without csb knowing any agent specifics.
+- Naming: `csb` = "claude sandbox" — either keep the name and document it as
+  agent-generic, or rebrand to "code sandbox".
+
+## Step 3 — the real curveball: local models
+
+`agent-sandbox` removes the network namespace, blocks DNS, and makes **host
+loopback unreachable** by default. So a jailed agent **cannot** reach a model
+server running on the host's `127.0.0.1` (e.g. Ollama on `:11434`). Three patterns,
+roughly increasing in isolation cost:
+
+1. **Network-addressable endpoint via the allowlist (easiest).** Run the model on
+   a LAN box or remote host reachable by hostname (self-hosted vLLM/Ollama/
+   OpenAI-compatible), add that host to `.csb/allowed-domains`, point the agent's
+   `OPENAI_BASE_URL` at it. Then a "local" model is just another API agent. Needs
+   confirmation that the proxy allowlist accepts a LAN hostname / `host:port` /
+   bare IP, and that name resolution works given DNS is blocked (see Q below).
+2. **Model server inside the sandbox.** Add the runtime (ollama/llama.cpp/vLLM) to
+   `allowedPackages`, **ro-bind the host weights dir** (e.g. `~/.ollama/models`,
+   potentially tens of GB → read-only so it's not re-downloaded), start the server
+   on the sandbox's own loopback, and point the agent there. Fully isolated but
+   heavyweight, and the server is ephemeral per run (cold start). Likely needs GPU
+   access (next bullet).
+3. **Permit host loopback.** Investigate whether agent-sandbox can share the host
+   net namespace / allow connecting to host `127.0.0.1`. This weakens isolation
+   (re-opens an exfil channel — cf. upstream `allowLocalBinding` / issue #88) and
+   may not even be supported for *connecting* to host loopback from a separate
+   netns. Lowest-effort if supported, but the least safe.
+
+**GPU:** patterns 2 (and any real local inference) need GPU passthrough — on Linux
+binding `/dev/nvidia*` / `/dev/dri`, on macOS Metal access from within seatbelt.
+Unknown whether agent-sandbox exposes device binds; this gates local-model
+feasibility and needs verification.
+
+## Step 4 — secrets / API-key auth (non-Claude)
+
+Claude auths via a file (`~/.claude.json`) we bind in — clean. Key-based agents
+read `OPENAI_API_KEY`/`GEMINI_API_KEY`/etc. from the environment, but the sandbox
+**clears host env**, and the `env` attr's values are **baked into the world-readable
+Nix store**. So: **never put secrets in `env`.** Preferred: bind a *creds file*
+(file-based, like Claude). Alternative: a runtime env passthrough — if agent-sandbox
+expands shell variables in `env` values (mirroring the `$HOME`-in-paths behavior),
+`env.OPENAI_API_KEY = "$OPENAI_API_KEY"` would forward the host value without
+storing it. Both need verification.
+
+## Open research questions (verify against agent-sandbox source)
+
+These were going to be confirmed at the source level before finalizing this section
+(the verification pass was interrupted by a session limit):
+
+1. **Host loopback:** can a jailed process *connect* to a service on the host's
+   `127.0.0.1`? What exactly does `allowLocalBinding` permit (bind own ports vs.
+   connect to host)? Any net-namespace-share / host-networking option?
+2. **Proxy allowlist granularity:** does it accept `host:port`, bare IPs, and LAN
+   hostnames — and does it function with DNS blocked for non-public names?
+3. **Runtime env forwarding:** can a host env var reach the sandbox without writing
+   the value into `/nix/store`?
+4. **GPU/device access:** Linux `/dev/nvidia*` / `/dev/dri` binds; macOS Metal.
+5. **Per-agent specifics:** exact state dirs/files and allow-all flags for codex,
+   gemini-cli, aider, opencode.
+
+## Effort estimate
+
+- **Another cloud/API agent** (codex, gemini, aider): **small** — add a preset +
+  the `--agent` plumbing in csb. The sandbox model is identical to Claude's.
+- **Local model via a network endpoint** (pattern 1): **small-to-moderate** —
+  mostly an allowlist entry + base-URL env, pending the proxy/DNS confirmation.
+- **Local model in-sandbox** (pattern 2): **moderate-to-large** — weights bind,
+  bundled runtime, GPU passthrough, cold-start ergonomics.
+- **Host-loopback** (pattern 3): gated on an upstream capability that may not exist.
