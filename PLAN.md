@@ -107,8 +107,10 @@ Commands: `csb [branch]`, `csb -d <branch>`, `csb` (no args → list).
      here): copy gitignored+included files into new worktrees, never overwriting.
   4. **Launch the sandbox** rooted at the worktree (see §4). Foreground exec in
      the current terminal — no tmux; the user manages panes/windows with `tm`.
-- **`csb -d <branch>`:** `git worktree remove` the worktree (branch not deleted);
-  idempotent; prints `--force` hint on failure.
+- **`csb -d <branch>`:** `git worktree remove` the worktree (branch not deleted)
+  **and** `rm -rf` the branch's namespace config under `~/.csb/claudes`;
+  idempotent; prints `--force` hint on failure. Skips config removal for `-E`
+  (nothing persisted) and `--ns global` (your real `~/.claude`).
 - **No args:** `git worktree list` filtered to `.worktrees/*`.
 
 ## 3. Nix flake (`flake.nix`)
@@ -417,8 +419,61 @@ stock template — simplest, but exposes your cross-project history + MCP tokens
 the agent); **(B)** a dedicated *shared* sandbox config dir; **(C)** ephemeral +
 token + onboarding seed. **Chose C.** Note none of A/B/C isolate sandboxed agents
 *from each other* — the only real distinction is whether your personal Claude data
-is in reach of a (possibly auto-approved) agent. C excludes it entirely, at the
-cost of no persistent session history across runs.
+is in reach of a (possibly auto-approved) agent. C excludes it entirely. Session
+history *is* persisted, but in a csb-owned per-branch namespace (see below), never
+in your real `~/.claude`.
+
+## Namespacing model (decided — branch-default, no stickiness)
+
+A namespace partitions the agent's claude config (history/sessions/settings) under
+`~/.csb/claudes/<ns>` — always isolated from your real `~/.claude` (posture C).
+**The default namespace is the branch itself** (flattened, `/`→`-`):
+
+| Invocation | Namespace | Config |
+|---|---|---|
+| `csb feature/foo` | `feature-foo` (from the branch) | persistent `~/.csb/claudes/feature-foo` |
+| `csb --here` (on `feature/foo`) | `feature-foo` (from current HEAD) | persistent, same dir |
+| `csb --here` (detached HEAD) | — | **error: fail fast** |
+| `csb --ns drip feature/foo` | `drip` (explicit override) | persistent `~/.csb/claudes/drip` |
+| `csb -E feature/foo` | none | throwaway (not persisted) |
+| `csb --ns global feature/foo` | global | your **real** `~/.claude` (csb never mutates it) |
+
+Unifying rule: **the namespace is the branch claude operates on** — the `BRANCH`
+arg in worktree mode, the current HEAD in `--here` mode.
+
+Why this replaced the earlier design (explicit `--ns` + per-worktree *sticky* file
+in the git dir):
+
+- **Stickiness was awkward and is now redundant.** Its only job was to remember a
+  chosen `--ns` across re-launches; a branch-derived default is deterministic every
+  run, so `csb BRANCH` reuses the same config with **no hidden state** to remember
+  or be surprised by. The `$gitdir/csb-namespace` file and its read/write logic are
+  removed (old files are inert — no migration needed).
+- **Switching context within a repo is now natural** — different branch → different
+  config automatically; `--ns` is a true per-invocation override that doesn't
+  linger.
+- **`-E`/`--ephemeral`** is the explicit opt-out (the old default), kept as a flag
+  rather than a magic `--ns` name for discoverability and to avoid sentinel/branch
+  collisions. Mutually exclusive with `--ns`.
+- **Reserved-name safety:** the `global` special-case (bind real `~/.claude`) is
+  honored **only** from an explicit `--ns`, never from a derived name — so a branch
+  literally named `global` gets a plain `~/.csb/claudes/global` dir, not your real
+  config.
+- **`--here` × namespace are orthogonal except for the default's *source*:** `--here`
+  has no `BRANCH` arg, so the default comes from the current HEAD; a detached HEAD
+  fails fast (pass `--ns` or `-E`).
+- **Deletion GC:** because configs now persist by default and accumulate per
+  branch, `csb -d BRANCH` removes the namespace dir too — stale configs hold session
+  history and the auth they were seeded with, so leaving them around is a footprint
+  risk. (`-E`/`--ns global` are skipped.)
+
+Known trade-offs (unchanged from before): the fixed `~/.csb/claudes` parent bind
+means namespaces are **not** isolated from each other (an agent can read sibling
+namespaces — same property as the deferred sticky-token note); and two branches
+that flatten to the same name share a config dir (same collision class as worktree
+paths). Namespace ≠ token: the OAuth token still comes from the env every launch
+(sticky-token still deferred — below), so a branch-named config is reused
+regardless of which token you launch with.
 
 ## vs the stock agent-sandbox Claude template
 
@@ -447,9 +502,12 @@ native-gem prerequisites discovered: `postgresql.pg_config` (its own output now)
 ## Sticky per-namespace token (deferred)
 
 Right now `CLAUDE_CODE_OAUTH_TOKEN` must be exported on every launch, even for a
-named namespace. Making it sticky (persist once, not required afterward) was
+persistent namespace. Making it sticky (persist once, not required afterward) was
 deferred — two approaches, both write the token to disk in plaintext (vs the
-current `pass` flow), which is inherent to "sticky":
+current `pass` flow), which is inherent to "sticky". Note: with branch-default
+namespaces, "per-namespace token" becomes "per-branch token memory", which
+interacts with intentionally switching tokens for the same branch (you'd be
+overwriting the saved token) — decide that behavior if/when this lands:
 
 - **A — claude-native:** write `<ns>/.credentials.json` so claude reads it
   directly. Downsides: the token lands in the bound namespace dir, which the jail
@@ -458,24 +516,29 @@ current `pass` flow), which is inherent to "sticky":
   exact credential JSON schema (accessToken/refreshToken/expiresAt/scopes)
   reconstructed from just the OAuth token — fragile.
 - **B — csb-managed, host-side (preferred):** persist the token *outside* the bind
-  (e.g. `~/.csb/tokens/<ns>`, mode `0600`); csb saves it on first `--ns` launch and
-  re-forwards it via the env var on later launches. The token file never enters
-  the jail filesystem (only the env var, which the agent has anyway); no
-  cross-namespace file exposure; no schema guessing.
+  (e.g. `~/.csb/tokens/<ns>`, mode `0600`); csb saves it on first launch for that
+  namespace and re-forwards it via the env var on later launches. The token file
+  never enters the jail filesystem (only the env var, which the agent has anyway);
+  no cross-namespace file exposure; no schema guessing.
 
 If/when we do this, prefer **B**. Note the cross-namespace exposure is a property
 of the fixed-parent-bind; truly isolating namespaces from each other (per-ns bind)
-would require giving up runtime `--ns` switching.
+would require giving up runtime namespace switching.
 
 ## Remaining features / verification
 
+0. **Branch-default namespacing** — DONE. The namespace defaults to the branch
+   (flattened); `--ns` overrides, `-E/--ephemeral` opts out; the old per-worktree
+   sticky-namespace file is removed; `-d` GCs the namespace config. See
+   "Namespacing model (decided)" above.
 1. **`global` namespace** — DONE. `--ns global` runs a separate
    `claude-sandboxed-global` variant that binds the real host `~/.claude` +
    `~/.claude.json` and runs `claude` directly (no seed), so csb never mutates the
-   real config. Sticky like other namespaces; creates no namespace dir.
+   real config. Honored only from an explicit `--ns`; creates no namespace dir.
 2. **`--here` flag** — DONE. Runs the sandbox in the current directory with no
    worktree (skips `ensure_worktree`, cwd = `$PWD`, allowed inside a worktree).
-   Caveat surfaced in `--help`: operates on the live checkout (less isolated).
+   Caveat surfaced in `--help`: operates on the live checkout (less isolated). The
+   namespace comes from the current HEAD branch; a detached HEAD fails fast.
 3. **Allow specific local ports** — TODO. Let the jailed claude reach selected
    host `localhost` ports (e.g. Postgres/Redis) so it can run DB-backed tests
    itself, instead of only the human's devShell. This is the host-loopback problem

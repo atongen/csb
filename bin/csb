@@ -9,17 +9,20 @@
 #   csb -y [BRANCH]         ...with --dangerously-skip-permissions (allow-all)
 #   csb --here              launch in the current dir, no worktree (quick ops)
 #   csb -n [BRANCH]         prepare/reuse the worktree only; don't launch claude
-#   csb --ns NAME [BRANCH]  use the named claude namespace (persistent, isolated
-#                           config under ~/.csb/claudes/NAME); sticky per worktree
+#   csb --ns NAME [BRANCH]  override the claude namespace (default: the branch)
+#   csb -E [BRANCH]         ephemeral (throwaway) config, no namespace
 #   csb [BRANCH] -- ARGS    pass ARGS straight through to claude
-#   csb -d BRANCH           remove the worktree for BRANCH (branch is NOT deleted)
+#   csb -d BRANCH           remove the worktree for BRANCH AND its namespace config
+#                           (the branch itself is NOT deleted)
 #   csb                     list existing csb worktrees
 #
 # Namespaces partition the sandboxed claude's config (history/sessions/settings).
-# Without --ns the config is ephemeral (throwaway). With --ns NAME it persists
-# under ~/.csb/claudes/NAME and is reused by every csb claude in that namespace.
-# The choice is sticky: once set for a worktree it's remembered (stored in the
-# worktree's git dir), so later `csb BRANCH` reuses it without re-passing --ns.
+# By default the namespace IS the branch (flattened): `csb feature/foo` uses a
+# persistent config under ~/.csb/claudes/feature-foo, reused on every later run
+# for that branch. --ns NAME overrides the default; -E/--ephemeral opts out of a
+# namespace entirely (throwaway config); --ns global uses the real host ~/.claude
+# (csb never mutates it). In --here mode the branch is taken from the current
+# HEAD (a detached HEAD is an error — pass --ns or -E).
 #
 # The sandboxed claude comes from csb's OWN flake (generic jail), so the repo
 # needs no csb-specific flake — any git repo works. `--no-sandbox` instead runs
@@ -53,16 +56,19 @@ USAGE:
 OPTIONS:
   -y, --yolo      pass --dangerously-skip-permissions to claude (allow-all)
       --here      no worktree: run the sandbox in the current directory (quick
-                  ops). Operates on the live checkout, so less isolated.
-  -N, --ns NAME   use the named claude namespace (persistent config under
-                  ~/.csb/claudes/NAME, isolated from other namespaces). Sticky per
-                  worktree. Omit for an ephemeral (throwaway) config.
+                  ops). Operates on the live checkout, so less isolated. The
+                  namespace comes from the current HEAD branch (detached = error).
+  -N, --ns NAME   override the claude namespace (default: the branch, flattened).
+                  Persistent, isolated config under ~/.csb/claudes/NAME.
                   --ns global uses the real host ~/.claude (csb never mutates it).
+  -E, --ephemeral use a throwaway config with no namespace (not persisted).
+                  Mutually exclusive with --ns.
   -n, --no-launch prepare/reuse the worktree (incl. .worktreeinclude) and exit;
                   prints the worktree path on stdout
       --no-sandbox  run claude unjailed, inside the repo's own devShell (full
                   toolchain; needs a flake.nix with devShells.default)
-  -d, --delete    delete mode (remove the worktree for BRANCH)
+  -d, --delete    delete mode: remove BRANCH's worktree AND its namespace config
+                  under ~/.csb/claudes (keeps the branch itself)
   -h, --help      show this help
 EOF
 }
@@ -172,45 +178,54 @@ warn_if_no_token() {
 
 CSB_NS_ROOT="$HOME/.csb/claudes"
 
-# Resolve the effective claude namespace for a worktree and export
-# CSB_CLAUDE_CONFIG_DIR for the sandbox (empty = ephemeral). Precedence:
-# explicit --ns (also made sticky) > sticky value saved for this worktree >
-# ephemeral. Sticky state lives in the worktree's git dir, so it's per-worktree
-# and removed with the worktree.
+# Resolve the effective claude namespace and export CSB_CLAUDE_CONFIG_DIR for the
+# sandbox (empty = ephemeral / global). Precedence:
+#   -E/--ephemeral          -> throwaway config (no namespace)
+#   --ns global  (explicit) -> the real host ~/.claude (a separate variant)
+#   --ns NAME    (explicit) -> persistent ~/.csb/claudes/NAME
+#   default                 -> persistent ~/.csb/claudes/<branch> (flattened)
+# There is no sticky state: the default is derived from the branch every run, so
+# `csb BRANCH` is deterministic without remembering anything. The 'global'
+# special-case is honored ONLY from an explicit --ns, never from a derived name,
+# so a branch literally named "global" gets a plain dir, not your real config.
 setup_namespace() {
-  local worktree="$1" gitdir nsfile ns ns_dir
-  gitdir=$(git -C "$worktree" rev-parse --absolute-git-dir 2>/dev/null || true)
-  nsfile="${gitdir:+$gitdir/csb-namespace}"
+  local worktree="$1" ns ns_dir cur_branch
 
-  if [[ -n "$namespace" ]]; then
-    ns="$namespace"
-    [[ -n "$nsfile" ]] && printf '%s\n' "$ns" > "$nsfile"
-  elif [[ -n "$nsfile" && -f "$nsfile" ]]; then
-    ns=$(<"$nsfile")
-  else
-    ns=""
+  if [[ "$ephemeral" == "true" ]]; then
+    sandbox_attr="claude-sandboxed"
+    export CSB_CLAUDE_CONFIG_DIR=""
+    echo "$PROG: namespace: ephemeral  (throwaway config)" >&2
+    return
   fi
 
   # global: bind the real host ~/.claude via a separate variant that runs claude
-  # directly (csb never seeds/mutates the real config).
-  if [[ "$ns" == "global" ]]; then
+  # directly (csb never seeds/mutates the real config). Explicit --ns only.
+  if [[ "$namespace" == "global" ]]; then
     sandbox_attr="claude-sandboxed-global"
     export CSB_CLAUDE_CONFIG_DIR=""
     echo "$PROG: namespace: global  (real host ~/.claude — not modified by csb)" >&2
     return
   fi
 
+  if [[ -n "$namespace" ]]; then
+    ns="$namespace"
+  elif [[ "$here" == "true" ]]; then
+    # --here has no BRANCH arg: derive from the current HEAD branch. Fail fast
+    # and loud on a detached HEAD rather than guessing.
+    cur_branch=$(git -C "$worktree" branch --show-current 2>/dev/null || true)
+    [[ -n "$cur_branch" ]] || die "--here on a detached HEAD: no branch to derive a namespace from.
+  Pass --ns NAME or -E/--ephemeral explicitly."
+    ns=$(flatten_branch "$cur_branch")
+  else
+    ns=$(flatten_branch "$branch")
+  fi
+
   sandbox_attr="claude-sandboxed"
   mkdir -p "$CSB_NS_ROOT"   # the fixed bind target must exist before launch
-  if [[ -n "$ns" ]]; then
-    ns_dir="$CSB_NS_ROOT/$ns"
-    mkdir -p "$ns_dir"
-    export CSB_CLAUDE_CONFIG_DIR="$ns_dir"
-    echo "$PROG: namespace: $ns  (persistent: $ns_dir)" >&2
-  else
-    export CSB_CLAUDE_CONFIG_DIR=""
-    echo "$PROG: namespace: ephemeral  (throwaway config)" >&2
-  fi
+  ns_dir="$CSB_NS_ROOT/$ns"
+  mkdir -p "$ns_dir"
+  export CSB_CLAUDE_CONFIG_DIR="$ns_dir"
+  echo "$PROG: namespace: $ns  (persistent: $ns_dir)" >&2
 }
 
 # --- argument parsing ---------------------------------------------------------
@@ -221,6 +236,7 @@ no_sandbox="false"
 no_launch="false"
 here="false"
 namespace=""
+ephemeral="false"
 sandbox_attr="claude-sandboxed"
 branch=""
 claude_args=()
@@ -233,6 +249,7 @@ while [[ $# -gt 0 ]]; do
     -n|--no-launch) no_launch="true"; shift ;;
     --here) here="true"; shift ;;
     -N|--ns) [[ $# -ge 2 ]] || die "--ns requires a NAME"; namespace="$2"; shift 2 ;;
+    -E|--ephemeral) ephemeral="true"; shift ;;
     --no-sandbox) no_sandbox="true"; shift ;;
     --) shift; claude_args+=("$@"); break ;;
     -*) usage >&2; die "unknown option: $1" ;;
@@ -245,6 +262,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# --ns and -E are mutually exclusive: one names a namespace, the other opts out.
+if [[ -n "$namespace" && "$ephemeral" == "true" ]]; then
+  die "--ns and -E/--ephemeral are mutually exclusive"
+fi
 
 # Validate the namespace name: named namespaces become a directory under
 # ~/.csb/claudes; 'global' is special (real host ~/.claude, no namespace dir).
@@ -290,10 +312,8 @@ if [[ "$mode" == "delete" ]]; then
     [[ -d "$candidate" ]] && wt_path="$candidate"
   fi
   if [[ -z "$wt_path" ]]; then
-    echo "$PROG: nothing to do (no worktree for '$branch')"
-    exit 0
-  fi
-  if [[ -d "$wt_path" ]]; then
+    echo "$PROG: no worktree for '$branch'"
+  elif [[ -d "$wt_path" ]]; then
     echo "$PROG: removing worktree $wt_path"
     if ! git -C "$repo_root" worktree remove "$wt_path"; then
       echo "$PROG: worktree remove failed (uncommitted or untracked files?)" >&2
@@ -303,6 +323,23 @@ if [[ "$mode" == "delete" ]]; then
   else
     echo "$PROG: pruning stale worktree registration for '$branch'"
     git -C "$repo_root" worktree prune
+  fi
+
+  # Also remove the persistent namespace config for this branch. Leaving stale
+  # per-branch configs (session history + the auth they were seeded with) around
+  # is a footprint/credential risk. Skip when an override makes removal unsafe or
+  # irrelevant: -E (no namespace) or --ns global (the real ~/.claude).
+  if [[ "$ephemeral" != "true" ]]; then
+    if [[ "$namespace" == "global" ]]; then
+      echo "$PROG: namespace 'global' is the real ~/.claude — not removing" >&2
+    else
+      ns_name="${namespace:-$(flatten_branch "$branch")}"
+      ns_dir="$CSB_NS_ROOT/$ns_name"
+      if [[ -d "$ns_dir" ]]; then
+        echo "$PROG: removing namespace config $ns_dir"
+        rm -rf "$ns_dir"
+      fi
+    fi
   fi
   exit 0
 fi

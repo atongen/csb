@@ -40,8 +40,8 @@ export CLAUDE_CODE_OAUTH_TOKEN=…          # or, e.g.: CLAUDE_CODE_OAUTH_TOKEN=
 ```
 
 csb forwards it into the sandbox at runtime (never written to the Nix store). The
-token is currently needed on **every** launch that uses a namespace (per-namespace
-sticky storage is planned — see `PLAN.md`). `ANTHROPIC_API_KEY` works too.
+token is currently needed on **every** launch (sticky per-namespace token storage
+is planned — see `PLAN.md`). `ANTHROPIC_API_KEY` works too.
 
 ## Use
 
@@ -50,10 +50,11 @@ csb feature/foo                  # worktree for feature/foo (off HEAD) + sandbox
 csb -y feature/foo               # allow-all (--dangerously-skip-permissions)
 csb feature/foo -- --model opus  # everything after -- is passed to claude
 csb --no-sandbox feature/foo     # run claude UNSANDBOXED in the repo's dev shell (full toolchain)
-csb --here                       # run in the current dir, no worktree (quick ops)
-csb --ns drip feature/foo        # use a named, persistent, isolated config namespace
+csb --here                       # run in the current dir, no worktree (namespace = current branch)
+csb --ns drip feature/foo        # override the namespace (default is the branch)
+csb -E feature/foo               # ephemeral: throwaway config, no namespace
 csb -n feature/foo               # just prepare/reuse the worktree, don't launch (prints its path)
-csb -d feature/foo               # remove the worktree (the branch is kept)
+csb -d feature/foo               # remove the worktree AND its namespace config (branch is kept)
 csb                              # list csb worktrees
 ```
 
@@ -77,17 +78,34 @@ capability lives in `--no-sandbox`. (See the M1-vs-M2 discussion in `PLAN.md`.)
 
 ## Namespaces
 
-A namespace partitions the agent's claude config (history/sessions/settings):
+A namespace partitions the agent's claude config (history/sessions/settings).
+**By default the namespace is the branch** (flattened, `/`→`-`), so config is
+deterministic per branch with no hidden state to remember:
 
-- **(default, no `--ns`)** — ephemeral throwaway config.
-- **`--ns NAME`** — persistent, isolated config under `~/.csb/claudes/NAME`, reused
-  by every csb claude in that namespace. **Sticky per worktree**: once chosen for a
-  worktree it's remembered (in the worktree's git dir), so later `csb <branch>`
-  reuses it without re-passing `--ns`.
+| Invocation | Namespace | Config |
+|---|---|---|
+| `csb feature/foo` | `feature-foo` (from the branch) | persistent `~/.csb/claudes/feature-foo` |
+| `csb --here` (on `feature/foo`) | `feature-foo` (from current HEAD) | persistent, same dir |
+| `csb --here` (detached HEAD) | — | **error: fail fast** |
+| `csb --ns drip feature/foo` | `drip` (explicit override) | persistent `~/.csb/claudes/drip` |
+| `csb -E feature/foo` | none | throwaway (not persisted) |
+| `csb --ns global feature/foo` | global | your **real** `~/.claude` (csb never mutates it) |
+
+- **(default)** — the namespace is the branch. Reused on every later run for that
+  branch; switching branches switches config automatically.
+- **`-E`, `--ephemeral`** — throwaway config, no namespace. Mutually exclusive with
+  `--ns`.
+- **`-N`, `--ns NAME`** — override the default with a named, isolated config under
+  `~/.csb/claudes/NAME`.
 - **`--ns global`** — use your **real** host `~/.claude` (full history/config); csb
-  never mutates it.
+  never mutates it. Honored only as an explicit `--ns`, so a branch literally named
+  `global` gets a plain `~/.csb/claudes/global` dir, **not** your real config.
 
-Namespaces apply to both sandboxed and `--no-sandbox` launches.
+`csb -d <branch>` removes the worktree **and** its per-branch namespace config
+(stale configs hold session history and the auth they were seeded with, so leaving
+them around is a footprint risk). `-E`/`--ns global` are skipped on delete (nothing
+persisted / it's your real config). Namespaces apply to both sandboxed and
+`--no-sandbox` launches.
 
 ## Sandbox posture (hardened)
 
