@@ -75,28 +75,94 @@
             "githubusercontent.com" = [ "GET" "HEAD" ];
           };
 
-          # Wrap claude with our hardened defaults. $HOME is an ephemeral tmpfs
-          # in the jail (masking ~/.ssh, ~/.aws, …); we persist only claude's own
-          # config/auth by binding the real host paths back in. These must exist
-          # before launch (csb ensures this).
+          # Wrap claude with our hardened defaults. The jail's $HOME is an
+          # ephemeral tmpfs (agent-sandbox default), so the host's ~/.claude /
+          # ~/.claude.json — and ~/.ssh, ~/.aws, … — are NOT visible: nothing
+          # personal leaks in, and there's no cross-run/cross-agent state.
+          #
+          # Auth is provided by forwarding CLAUDE_CODE_OAUTH_TOKEN at runtime.
+          # agent-sandbox expands the "$VAR" reference in the launching shell, so
+          # the token value is never written to the world-readable /nix/store —
+          # only the literal string "$CLAUDE_CODE_OAUTH_TOKEN" is. Generate one
+          # with `claude setup-token` and export it before launching (csb passes
+          # it through). ANTHROPIC_API_KEY is forwarded too if you prefer that.
           mkClaudeSandbox =
             { allowedPackages ? [ ]
             , extraDomains ? { }
             , extraRwDirs ? [ ]
             , extraRwFiles ? [ ]
             , extraRoDirs ? [ ]
+            , extraRoFiles ? [ ]
             , env ? { }
             , claudePackage ? pkgs.claude-code
             , outName ? "claude-sandboxed"
+              # global = true binds the REAL host ~/.claude + ~/.claude.json
+              # (full host config/history/MCP) instead of the per-namespace dir.
+              # csb runs this variant for `--ns global`.
+            , global ? false
             }:
+            let
+              # Interactive claude runs first-run login/onboarding on an empty
+              # config (its OAuth callback server can't bind a port in the jail),
+              # and prompts to "trust" each new folder. Seed a config into the
+              # ephemeral $HOME marking onboarding complete AND the cwd trusted, so
+              # interactive claude skips both and just uses CLAUDE_CODE_OAUTH_TOKEN.
+              # Runs inside the jail, touching only the throwaway tmpfs HOME.
+              claudeSeeded = pkgs.writeShellScriptBin "claude" ''
+                # Namespace: csb forwards CSB_CLAUDE_CONFIG_DIR (a dir under the
+                # bound ~/.csb/claudes parent). When set, claude persists its
+                # state there (incl. .claude.json); when empty, use the ephemeral
+                # tmpfs ~/.claude.
+                if [ -n "''${CSB_CLAUDE_CONFIG_DIR:-}" ]; then
+                  export CLAUDE_CONFIG_DIR="$CSB_CLAUDE_CONFIG_DIR"
+                fi
+                # Merge onboarding-complete + cwd-trust into the .claude.json that
+                # claude actually reads (CLAUDE_CONFIG_DIR when set, else $HOME) so
+                # interactive claude skips first-run login + folder-trust and uses
+                # the forwarded CLAUDE_CODE_OAUTH_TOKEN. Idempotent; preserves any
+                # existing state in a persistent namespace.
+                _dir="''${CLAUDE_CONFIG_DIR:-$HOME}"
+                mkdir -p "$_dir"
+                _cfg="$_dir/.claude.json"
+                _base='{}'; [ -e "$_cfg" ] && _base="$(cat "$_cfg")"
+                _tmp="$(mktemp)"
+                printf '%s' "$_base" | ${pkgs.jq}/bin/jq --arg p "$PWD" \
+                  '.hasCompletedOnboarding = true
+                   | .projects[$p].hasTrustDialogAccepted = true
+                   | .projects[$p].projectOnboardingSeenCount = ((.projects[$p].projectOnboardingSeenCount) // 1)' \
+                  > "$_tmp" && cat "$_tmp" > "$_cfg" && rm -f "$_tmp"
+                exec ${claudePackage}/bin/claude "$@"
+              '';
+            in
             sandbox.mkSandbox {
-              pkg = claudePackage;
+              # global: run real claude directly so we NEVER mutate the host's
+              # real ~/.claude (claude manages it itself). otherwise: the seed
+              # wrapper marks onboarding/trust in the throwaway/namespace config.
+              pkg = if global then claudePackage else claudeSeeded;
               binName = "claude";
-              inherit outName env;
+              inherit outName;
+              # Runtime-expanded "$VAR" references (never baked into the store):
+              #  - OAuth token for auth (only this one by default; an unset
+              #    ANTHROPIC_API_KEY="" could shadow it, so callers add it via env).
+              #  - git identity so claude can commit in the jail; csb populates
+              #    these from the host's effective `git config`. No file is bound,
+              #    so it's portable (works regardless of where gitconfig lives).
+              env = {
+                CLAUDE_CODE_OAUTH_TOKEN = "$CLAUDE_CODE_OAUTH_TOKEN";
+                CSB_CLAUDE_CONFIG_DIR = "$CSB_CLAUDE_CONFIG_DIR";
+                GIT_AUTHOR_NAME = "$GIT_AUTHOR_NAME";
+                GIT_AUTHOR_EMAIL = "$GIT_AUTHOR_EMAIL";
+                GIT_COMMITTER_NAME = "$GIT_COMMITTER_NAME";
+                GIT_COMMITTER_EMAIL = "$GIT_COMMITTER_EMAIL";
+              } // env;
               allowedPackages = defaultAllowedPackages ++ allowedPackages;
-              rwDirs = [ "$HOME/.claude" ] ++ extraRwDirs;
-              rwFiles = [ "$HOME/.claude.json" ] ++ extraRwFiles;
+              # global: bind the real host config. otherwise: bind the fixed
+              # ~/.csb/claudes parent (the specific namespace dir is selected at
+              # runtime via CSB_CLAUDE_CONFIG_DIR).
+              rwDirs = (if global then [ "$HOME/.claude" ] else [ "$HOME/.csb/claudes" ]) ++ extraRwDirs;
+              rwFiles = (if global then [ "$HOME/.claude.json" ] else [ ]) ++ extraRwFiles;
               roDirs = extraRoDirs;
+              roFiles = extraRoFiles;
               allowedDomains = defaultDomains // extraDomains;
             };
         in
@@ -128,6 +194,17 @@
           # NOTE: csb deliberately does NOT fall back to this — a per-repo flake
           # is required so each repo controls its own toolchain and allowlist.
           claude-sandboxed = (libFor system).mkClaudeSandbox { };
+
+          # `--ns global` variant: binds the real host ~/.claude + ~/.claude.json.
+          claude-sandboxed-global = (libFor system).mkClaudeSandbox {
+            global = true;
+            outName = "claude-sandboxed-global";
+          };
+
+          # Plain (unsandboxed) claude, for `csb --no-sandbox` — csb runs this
+          # inside the repo's own devShell (`nix develop <repo> -c claude`), so
+          # it gets the repo's full toolchain without the repo importing csb.
+          claude = pkgs.claude-code;
         });
 
       apps = forAllSystems (system: {

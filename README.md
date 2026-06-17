@@ -1,116 +1,132 @@
 # csb — claude sandbox
 
-`csb` runs [Claude Code](https://www.anthropic.com/claude-code) **sandboxed**, in a
-**per-branch git worktree**. You get a fresh, isolated working directory for each
-branch and an agent that's jailed to it — with a hardened filesystem and a network
-egress allowlist — on both Linux and macOS.
+`csb` runs [Claude Code](https://www.anthropic.com/claude-code) in a **per-branch
+git worktree**, either **sandboxed** (jailed, isolated) or **unsandboxed inside the
+repo's own dev shell** (full toolchain). It's a thin orchestrator over
+[`agent-sandbox.nix`](https://github.com/archie-judd/agent-sandbox.nix) (bubblewrap
+on Linux, `sandbox-exec` on macOS) and `nix`.
 
-It pairs with [`tm`](./bin/tm) (a thin tmux workspace switcher): you manage tmux
-yourself, outside the sandbox; only `claude` is jailed.
+**Decoupled by design:** a repo needs no csb-specific files or flake. The sandboxed
+agent comes from *csb's own* flake (so any git repo works), and `--no-sandbox` runs
+claude inside whatever `devShells.default` the repo already has. The repo never
+imports csb.
 
-## How it works
-
-- The sandbox is provided by [`agent-sandbox.nix`](https://github.com/archie-judd/agent-sandbox.nix),
-  which uses **bubblewrap** on Linux and **`sandbox-exec`** on macOS.
-- `csb` creates/reuses a worktree at `<repo>/.worktrees/<branch>` (branched off your
-  current `HEAD`), then launches the repo's `claude-sandboxed` package with that
-  worktree as the working directory.
-- Each repo provides its own `claude-sandboxed` via a small flake (see below), so
-  the repo controls the agent's toolchain and network allowlist while keeping its
-  interactive dev shell separate.
-
-### Sandbox posture (hardened)
-
-- `$HOME` inside the jail is an ephemeral tmpfs, so `~/.ssh`, `~/.aws`, etc. are
-  **not visible**. Only `~/.claude` and `~/.claude.json` are bound back in (for auth
-  and config).
-- Writable scope = the worktree cwd. The repo's `.git` object store is bound rw so
-  `git commit`/`log`/`diff`/`blame` work inside the jail; `.git/hooks` and
-  `.git/config` are read-only (no hook-injection escape). The rest of the main repo
-  is read-only.
-- Network egress is limited to an allowlist (DNS is otherwise blocked). Built-in
-  defaults: `anthropic.com`, `claude.com`, `claude.ai`, `registry.npmjs.org`,
-  `github.com`, `githubusercontent.com`. Add more per-repo (see below).
-- **`git push`/`fetch` over SSH happens in your own shell**, not inside the jail
-  (SSH keys are masked by the tmpfs `$HOME`).
+> Status: developed/tested on `aarch64-darwin`. Linux is supported by the
+> underlying tooling but not yet verified end-to-end (see `PLAN.md`).
 
 ## Install
 
 ```sh
-./install.sh            # symlinks bin/csb and bin/tm into ~/bin
+./install.sh                 # copies bin/csb into ~/bin
 # or: BIN_DIR=~/.local/bin ./install.sh
 ```
 
-Requires [Nix](https://nixos.org) with flakes enabled (Determinate Nix works out of
-the box). `csb` calls `nix run` under the hood.
+Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
+box); `csb` shells out to `nix`.
 
-## Set up a repo
+- **`CSB_SELF`** — the flake ref csb pulls its own claude binaries from. Defaults
+  to the network-local remote `git+ssh://git@git.grandrew.com/atongen/csb.git`.
+  For local development against a working tree, override per-invocation:
+  `CSB_SELF=path:/path/to/csb csb …`.
 
-From the repo root:
+## Auth
+
+The jailed claude can't reach the macOS Keychain, so authenticate with a token.
+Generate one once on the host and export it:
 
 ```sh
-nix flake init -t github:atongen/csb
-git add flake.nix flake.lock .csb/allowed-domains .gitignore
+claude setup-token                       # prints a long-lived sk-ant-oat01-… token
+export CLAUDE_CODE_OAUTH_TOKEN=…          # or, e.g.: CLAUDE_CODE_OAUTH_TOKEN=$(pass claude/token) csb …
 ```
 
-This scaffolds:
-
-- `flake.nix` — a `devShells.default` for your interactive tools (neovim, tmux,
-  toolchains) **and** a `packages.claude-sandboxed` built from
-  `csb.lib.<system>.mkClaudeSandbox`. Edit `allowedPackages` to match your repo's
-  runtime toolchain (e.g. `nodejs`, `cargo`).
-- `.csb/allowed-domains` — extra egress domains (one `domain [METHOD...]` per line).
-- `.gitignore` — ignores `.worktrees/`.
-
-> Files must be **git-tracked** for the flake (and `.csb/allowed-domains`) to be read.
+csb forwards it into the sandbox at runtime (never written to the Nix store). The
+token is currently needed on **every** launch that uses a namespace (per-namespace
+sticky storage is planned — see `PLAN.md`). `ANTHROPIC_API_KEY` works too.
 
 ## Use
 
 ```sh
-csb feature/foo            # worktree for feature/foo + sandboxed claude (prompts on)
-csb -y feature/foo         # allow-all mode (--dangerously-skip-permissions)
-csb feature/foo -- --model opus   # pass extra args straight to claude
-csb                        # list csb worktrees
-csb -d feature/foo         # remove the worktree (branch is kept)
-csb --no-sandbox feature/foo      # debugging escape hatch: run claude unjailed
+csb feature/foo                  # worktree for feature/foo (off HEAD) + sandboxed claude
+csb -y feature/foo               # allow-all (--dangerously-skip-permissions)
+csb feature/foo -- --model opus  # everything after -- is passed to claude
+csb --no-sandbox feature/foo     # run claude UNSANDBOXED in the repo's dev shell (full toolchain)
+csb --here                       # run in the current dir, no worktree (quick ops)
+csb --ns drip feature/foo        # use a named, persistent, isolated config namespace
+csb -n feature/foo               # just prepare/reuse the worktree, don't launch (prints its path)
+csb -d feature/foo               # remove the worktree (the branch is kept)
+csb                              # list csb worktrees
 ```
 
-Typical workflow with `tm`:
+tmux is yours to manage (e.g. with a separate `tm`): run `csb` in one pane, edit /
+`git push` from another. Only `claude` is ever jailed.
 
-```sh
-tm myrepo                  # tmux session/window at the repo
-csb feature/foo            # in a pane: worktree + jailed claude
-# edit / git push from your own (unsandboxed) shell as usual
-csb -d feature/foo         # tear down when done
-```
+## Modes
 
-## Per-repo network allowlist
+- **Sandboxed** (`csb <branch>`) — a hardened, **generic** jail from csb's own
+  flake. Minimal, language-agnostic toolset (coreutils, bash, git, ripgrep, less,
+  cacert); it does **not** include the repo's toolchain, so it's best for editing,
+  reading, search, and git — not running the app. The repo flake isn't consulted.
+- **`--no-sandbox`** — claude run inside the repo's `devShells.default`
+  (`nix develop <worktree> -c claude`): the **full toolchain** and your dev-shell
+  env, unjailed. Needs a `flake.nix` with `devShells.default`. This is the mode for
+  actually running consoles/tests. (Authenticates via your token; on macOS the nix
+  claude may trigger a one-time Keychain-access prompt.)
 
-Add domains the agent legitimately needs to `.csb/allowed-domains`:
+This split is deliberate: the jail is the safe-but-minimal "editing" mode; full
+capability lives in `--no-sandbox`. (See the M1-vs-M2 discussion in `PLAN.md`.)
 
-```
-api.mycorp.internal   *
-docs.example.com      GET HEAD
-```
+## Namespaces
 
-These merge on top of the built-in defaults. `csb` prints the effective allowlist
-on launch.
+A namespace partitions the agent's claude config (history/sessions/settings):
+
+- **(default, no `--ns`)** — ephemeral throwaway config.
+- **`--ns NAME`** — persistent, isolated config under `~/.csb/claudes/NAME`, reused
+  by every csb claude in that namespace. **Sticky per worktree**: once chosen for a
+  worktree it's remembered (in the worktree's git dir), so later `csb <branch>`
+  reuses it without re-passing `--ns`.
+- **`--ns global`** — use your **real** host `~/.claude` (full history/config); csb
+  never mutates it.
+
+Namespaces apply to both sandboxed and `--no-sandbox` launches.
+
+## Sandbox posture (hardened)
+
+- `$HOME` in the jail is an ephemeral tmpfs — `~/.ssh`, `~/.aws`, and your real
+  `~/.claude` are **not** visible. Nothing personal leaks in; auth is the forwarded
+  token only.
+- Interactive first-run login + folder-trust are pre-seeded so claude starts
+  straight up; git identity is forwarded from your host `git config`
+  (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`) so the agent can commit. Local git works;
+  **`git push`/`fetch` over SSH stays in your own shell** (keys are masked).
+- Writable scope = the worktree cwd; the repo's `.git` object store is bound so
+  commits/log/diff work, with `.git/hooks` and `.git/config` read-only.
+- Network egress is limited to an allowlist (DNS otherwise blocked):
+  `anthropic.com`, `claude.com`, `claude.ai`, `registry.npmjs.org`, `github.com`,
+  `githubusercontent.com`. (Per-repo egress tailoring is a future, tailored-sandbox
+  feature; the generic jail uses these defaults.)
 
 ## `.worktreeinclude`
 
-If a repo has a `.worktreeinclude` file (same syntax as `.gitignore`), `csb` copies
-matching **gitignored** files (e.g. local `.env`s) into a newly created worktree.
-Existing files are never overwritten.
+If the repo root has a `.worktreeinclude` (same syntax as `.gitignore`), csb copies
+matching **gitignored** files (e.g. local `.env`s, generated config) into a newly
+created worktree; existing files are never overwritten. It's a generic
+worktree-tooling convention (predates csb), not csb-specific.
+
+## What a repo needs
+
+Nothing csb-specific. For `--no-sandbox`, just a standard `flake.nix` exposing
+`devShells.default`. `nix flake init -t <csb>` scaffolds a minimal standalone dev
+flake to start from.
 
 ## Files
 
 ```
-bin/csb                    orchestrator: worktree + launch
-bin/tm                     tmux workspace switcher (no agent logic)
-flake.nix                  lib.mkClaudeSandbox / lib.readAllowedDomains + csb app + template
-templates/repo/            scaffold for a consuming repo
-install.sh                 symlink bin/* into ~/bin
+bin/csb                    the orchestrator (worktree + launch)
+flake.nix                  lib.mkClaudeSandbox/readAllowedDomains + packages
+                           {csb, claude, claude-sandboxed, claude-sandboxed-global} + template
+templates/repo/            scaffold: a standalone dev-shell flake
+install.sh                 copy bin/csb into ~/bin
 ```
 
-See [`PLAN.md`](./PLAN.md) for the design rationale and the research behind the
-backend choice.
+See [`PLAN.md`](./PLAN.md) for design rationale, the agent-sandbox research, the
+auth model, and remaining work.

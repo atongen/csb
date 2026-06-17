@@ -362,3 +362,348 @@ These were going to be confirmed at the source level before finalizing this sect
 - **Local model in-sandbox** (pattern 2): **moderate-to-large** — weights bind,
   bundled runtime, GPU passthrough, cold-start ergonomics.
 - **Host-loopback** (pattern 3): gated on an upstream capability that may not exist.
+
+---
+
+# As-built: sandbox auth & git identity (macOS findings)
+
+Integrating drip (the first real csb target) surfaced a chain of macOS-specific
+facts about authenticating the jailed claude. This records the resulting design
+and the why, so it isn't relearned.
+
+## Findings
+
+- `agent-sandbox` jails with an **ephemeral tmpfs `$HOME`** — your real
+  `~/.claude`, `~/.claude.json`, `~/.ssh`, and the macOS Keychain are all
+  invisible inside the jail by default.
+- **macOS stores Claude's OAuth token in the login Keychain** (item
+  `Claude Code-credentials`), not in a file — and the jail can't reach the
+  Keychain. (Linux stores a file credential at `~/.claude/.credentials.json`,
+  which *is* bindable — the easy path that simply doesn't exist on macOS.)
+- `CLAUDE_CONFIG_DIR` relocates `~/.claude` but **not** `~/.claude.json` (where
+  the `hasCompletedOnboarding` marker lives).
+- **Token forwarding is the macOS auth path.** `env = { CLAUDE_CODE_OAUTH_TOKEN =
+  "$CLAUDE_CODE_OAUTH_TOKEN"; }` — agent-sandbox expands the `"$VAR"` reference in
+  the launching shell, so the secret never lands in `/nix/store` (confirmed in its
+  source + README; its seatbelt profile also denies `kern.procargs2` to stop the
+  jailed process scraping the token from host memory). Generate with
+  `claude setup-token`, export on the host; csb passes it through.
+- **Headless vs interactive:** `claude -p` authenticates with the token fine. But
+  **interactive** claude on an *empty* config runs a first-run onboarding/login
+  flow whose OAuth callback server can't bind a port in the jail → fails. Anthropic
+  documents no flag to skip it (`--dangerously-skip-permissions` skips only *tool*
+  prompts; `--bare` needs `ANTHROPIC_API_KEY`, not the OAuth token).
+
+## As-built design (`mkClaudeSandbox` in csb's flake)
+
+- **Do not bind real `~/.claude` / `~/.claude.json`** → the jail `$HOME` stays
+  ephemeral; no personal history or MCP secrets are exposed.
+- **Auth:** forward `CLAUDE_CODE_OAUTH_TOKEN` via `env` (runtime-expanded).
+- **Onboarding seed:** a thin wrapper (`pkg = writeShellScriptBin "claude"`) writes
+  `{"hasCompletedOnboarding":true}` into the jail's tmpfs `~/.claude.json` before
+  exec'ing claude, so interactive claude skips login and uses the token. *Verified
+  working.* (If claude later also gates on `lastOnboardingVersion`, add it.)
+- **git identity:** `roFiles` binds `~/.gitconfig`, `~/.gitignore`,
+  `~/.config/git/ignore` read-only so the jailed git has identity + ignores and
+  claude can commit. `~/.config/git/config` is omitted (commonly absent; binding a
+  missing path fails closed). Override via the `gitConfigFiles` arg.
+- **Consequence:** local git + commits work in-jail; push/fetch over SSH stay in
+  the unsandboxed shell (keys masked by the tmpfs `$HOME`), as intended.
+
+## Isolation posture (decided)
+
+Three options were weighed: **(A)** bind the real `~/.claude` (agent-sandbox's
+stock template — simplest, but exposes your cross-project history + MCP tokens to
+the agent); **(B)** a dedicated *shared* sandbox config dir; **(C)** ephemeral +
+token + onboarding seed. **Chose C.** Note none of A/B/C isolate sandboxed agents
+*from each other* — the only real distinction is whether your personal Claude data
+is in reach of a (possibly auto-approved) agent. C excludes it entirely, at the
+cost of no persistent session history across runs.
+
+## vs the stock agent-sandbox Claude template
+
+`templates/claude` binds the real `~/.claude` (rwDirs) + `CLAUDE_CONFIG_DIR`,
+forwards `CLAUDE_CODE_OAUTH_TOKEN`, and documents a macOS Keychain→file export
+(`security dump-keychain … > ~/.claude/.credentials.json`) for the bind path. We
+deliberately diverge: **don't** bind `~/.claude`, and **seed** onboarding instead —
+stricter isolation, same interactive result. The read-only-gitconfig idea is
+borrowed from their template.
+
+## drip dev flake (reference)
+
+The drip repo flake provides a `devShells.default` (toolchain mirroring
+`devbox.json` + native-gem deps + `bashInteractive`) for the human (console/tests
+against host services, run via `nix-dev-pure.sh`), and `packages.claude-sandboxed`
+(via `csb.lib.mkClaudeSandbox`) for the agent. Personal shell ergonomics (prompt,
+bash-completion) live in `~/.config/nix-dev-pure.bashrc`, not the repo flake. Key
+native-gem prerequisites discovered: `postgresql.pg_config` (its own output now),
+`openssh` (gitconfig rewrites https→ssh), `which` (`lib/git.rb`), and a writable
+`BUNDLE_PATH=vendor/bundle-nix` (the store ruby is read-only).
+
+---
+
+# Deferred / remaining work
+
+## Sticky per-namespace token (deferred)
+
+Right now `CLAUDE_CODE_OAUTH_TOKEN` must be exported on every launch, even for a
+named namespace. Making it sticky (persist once, not required afterward) was
+deferred — two approaches, both write the token to disk in plaintext (vs the
+current `pass` flow), which is inherent to "sticky":
+
+- **A — claude-native:** write `<ns>/.credentials.json` so claude reads it
+  directly. Downsides: the token lands in the bound namespace dir, which the jail
+  mounts via the fixed `~/.csb/claudes` parent — so it's readable by agents in
+  *other* namespaces (cross-namespace credential theft); and it needs claude's
+  exact credential JSON schema (accessToken/refreshToken/expiresAt/scopes)
+  reconstructed from just the OAuth token — fragile.
+- **B — csb-managed, host-side (preferred):** persist the token *outside* the bind
+  (e.g. `~/.csb/tokens/<ns>`, mode `0600`); csb saves it on first `--ns` launch and
+  re-forwards it via the env var on later launches. The token file never enters
+  the jail filesystem (only the env var, which the agent has anyway); no
+  cross-namespace file exposure; no schema guessing.
+
+If/when we do this, prefer **B**. Note the cross-namespace exposure is a property
+of the fixed-parent-bind; truly isolating namespaces from each other (per-ns bind)
+would require giving up runtime `--ns` switching.
+
+## Remaining features / verification
+
+1. **`global` namespace** — DONE. `--ns global` runs a separate
+   `claude-sandboxed-global` variant that binds the real host `~/.claude` +
+   `~/.claude.json` and runs `claude` directly (no seed), so csb never mutates the
+   real config. Sticky like other namespaces; creates no namespace dir.
+2. **`--here` flag** — DONE. Runs the sandbox in the current directory with no
+   worktree (skips `ensure_worktree`, cwd = `$PWD`, allowed inside a worktree).
+   Caveat surfaced in `--help`: operates on the live checkout (less isolated).
+3. **Allow specific local ports** — TODO. Let the jailed claude reach selected
+   host `localhost` ports (e.g. Postgres/Redis) so it can run DB-backed tests
+   itself, instead of only the human's devShell. This is the host-loopback problem
+   from the local-models follow-up (agent-sandbox strips the net namespace + blocks
+   loopback); needs investigation of whether agent-sandbox can permit a specific
+   host loopback port, and the isolation trade-off of doing so.
+4. **Linux verification** — TODO (gated on the push below). Exercise the whole flow
+   on `x86_64-linux`: the sandbox build, token-env auth, the onboarding/trust seed,
+   git identity, namespaces, `--no-sandbox`-in-devShell, and confirm
+   `CLAUDE_CONFIG_DIR` relocation behaves the same (on Linux, file credentials at
+   `~/.claude/.credentials.json` also exist, which may make the sticky-token story
+   easier than on macOS).
+5. **Push csb + flip `CSB_SELF`** — `CSB_SELF` default is now flipped to
+   `git+ssh://git@git.grandrew.com/atongen/csb.git` (done). Remaining: **push csb
+   to that remote** so it resolves; then Linux verification (#4) can fetch it.
+   For local dev against the working tree, override `CSB_SELF=path:/path/to/csb`.
+
+## Remaining capability work (makes the *sandbox* itself useful — M2)
+
+Consolidated, since several threads point here (also see the M1-vs-M2 section):
+- **Sticky per-namespace token** — above; prefer option B.
+- **Tailored sandbox** — bake the repo's toolchain + egress domains into the jail
+  so the *sandboxed* agent can run/verify (today the jail is generic-minimal; full
+  capability is only via `--no-sandbox`). Needs: (a) a per-repo config convention
+  (globally-gitignored `.csb/` for packages/domains, read from the repo root —
+  same pattern `.worktreeinclude` uses, except `.worktreeinclude` is now a
+  *tracked, generic* worktree convention), and (b) **host DB/Redis access** (the
+  `#3` investigation below: Linux unix-socket bind is the no-patch path; macOS
+  needs a seatbelt patch or DB-in-sandbox).
+- **Other agents / local models** — the `mkAgentSandbox` generalization +
+  local-model networking/GPU/secrets (its own follow-up section earlier).
+
+> Note: `tm` has been **removed from csb** — it's a complementary, standalone tool
+> (it lives in your `~/bin` independently). csb now ships only `bin/csb`.
+
+## Reaching host DB/Redis from the jail — investigation result (for #3)
+
+Verified against agent-sandbox source. **Host loopback is blocked unconditionally
+on both platforms, and its proxy is HTTP/HTTPS-only** — it cannot tunnel the
+Postgres/Redis wire protocol. There is **no built-in knob** to allow a specific
+host TCP port (`allowedDomains` is domain/HTTP-method only). Linux uses pasta +
+nftables that drop the host-loopback gateway (`10.0.2.2`); macOS seatbelt denies
+`network-outbound` to `localhost`. Maintainer's stance: run the service inside the
+sandbox, or open an issue.
+
+Options if we ever want the *jailed agent* (not the devShell human) to run
+DB-backed tests:
+
+- **A. Run Postgres/Redis inside the sandbox** — add them to `allowedPackages`,
+  persist a data dir via `rwDirs`, connect to the jail's own loopback. Works on
+  both OSes, best isolation, but it's a separate ephemeral DB, not your real one.
+- **B. Unix-domain socket bind-mount (preferred on Linux; no patch).** Connecting
+  to an `AF_UNIX` socket is a *filesystem* op on Linux, and agent-sandbox's Linux
+  path has **no seccomp/AF_UNIX restriction** — so binding the host PG/Redis
+  **socket directory** via `extraRwDirs` (bind the dir, not the socket inode) lets
+  the agent reach the *real* host DB over the socket, no networking involved.
+  Requires app config to use the socket (`PGHOST=/socketdir`; Redis `unixsocket`).
+  **macOS does NOT allow this unpatched:** seatbelt classifies a unix-socket
+  `connect()` as `network-outbound (remote unix-socket …)` and denies it
+  *independently of filesystem access* (open mode has an explicit
+  `(deny network-outbound (remote unix-socket))`, restricted mode lacks any allow
+  → `(deny default)`). Their `test-unix-socket-egress-denied.sh` proves a bound
+  host socket still fails to connect. macOS parity would need patching the seatbelt
+  profile: `(allow network-outbound (remote unix-socket (path-literal "/…/.s.PGSQL.5432")))`.
+- **C. Patch agent-sandbox** to allow specific loopback ports (Linux: nftables/
+  pasta `-t` flags; macOS: seatbelt rule). Small edits but means maintaining a fork.
+
+No csb changes are needed for **B** — `mkClaudeSandbox` already exposes
+`extraRwDirs`/`extraRoDirs`; it's a per-repo flake + app-config pattern. Status:
+**deferred / do nothing for now** — under the current design the human runs
+DB-backed tests in the devShell; the jailed agent edits code.
+
+## Sandbox toolset is intentionally minimal (NOT the devShell)
+
+The jailed `claude-sandboxed` only gets csb's `defaultAllowedPackages` (coreutils,
+bash, git, ripgrep, less, cacert) **plus whatever the repo flake passes as
+`allowedPackages`** (drip: just `ruby_3_3` + `nodejs_24`), and **none of the
+devShell's `shellHook` env** (no `DYLD_FALLBACK_LIBRARY_PATH`/`LD_LIBRARY_PATH`,
+no `BUNDLE_PATH`, etc.). So the agent cannot boot the full Rails app: gems with
+native runtime deps (e.g. **ruby-vips** needs `libvips`; also imagemagick, the pg
+client lib, libyaml/libffi) aren't present, and even if they were, the DB is
+unreachable (above). This is by design — minimal, isolated agent vs. flexible
+devShell. If we ever want the agent to run Rails (rubocop, non-DB unit tests,
+`rails runner`), expand drip's `mkClaudeSandbox` `allowedPackages` to mirror the
+devShell's runtime libs and add the matching lib-path env — a deliberate
+toolset-vs-isolation choice, not a bug.
+
+## M1 vs M2: where verification happens (and what makes allow-unsafe worth it)
+
+There are two coherent operating models, and they change the value of running the
+agent with `--dangerously-skip-permissions` (allow-unsafe / YOLO):
+
+- **M1 (current): agent edits in the jail, the human verifies in the devShell.**
+  The sandbox is intentionally minimal (no full toolchain, no DB), so the agent
+  can't boot the app / run the suite. Simplest and most isolated, but allow-unsafe
+  here is "edit aggressively without prompts, but fly blind" — the safety is real,
+  the *autonomy* mostly isn't, because the agent can't close an edit→run→fix loop.
+  (It can still do `git diff`, grep, parse/syntax, RuboCop, and pure-Ruby unit
+  tests that don't boot Rails or hit the DB.)
+- **M2 (target for allow-unsafe to pay off): agent edits AND verifies in a
+  full-capability jail.** Give the sandbox the devShell's runtime libs (the
+  toolset item above) *and* service access (the unix-socket/DB item above), and
+  the agent can run the real suite — making allow-unsafe genuinely valuable:
+  contained, credential-isolated, autonomous edit→test→fix loops. Cost: a heavier,
+  less-minimal sandbox.
+
+We built M1 (safety first) and deferred capability. The practical takeaway: the
+"expand toolset" + "service access" items are not just nice-to-haves — they are
+**what converts allow-unsafe from safe-but-blind (M1) into safe-and-autonomous
+(M2)**. If allow-unsafe is a priority, those two items should move up.
+
+---
+
+# Nix flake best practices (2025–2026 research) + the csb decoupling plan
+
+Captured so it isn't lost. Sources: nix.dev, flake.parts, NixOS Wiki, nixpkgs
+manuals, and assorted well-regarded posts (ayats.org, nixcademy, jade.fyi, flox).
+
+## Flake structure
+
+- **`flake-parts`** is the de-facto modern way to structure a non-trivial,
+  multi-output flake you own — it brings the NixOS module system to `flake.nix`
+  (typed options, merging, `perSystem` that defines outputs once and transposes
+  across systems, `self'`/`inputs'`, composable `flakeModule`s).
+- **`flake-utils` / `eachDefaultSystem`** is community-*discouraged* (not formally
+  deprecated): no validation, an avoidable eval dep, opaque system coverage.
+- **Bare `genAttrs` `forAllSystems`** (what csb + the simple drip flake use) is the
+  right *minimalist* choice specifically for flakes meant to be **consumed by
+  others** — adds zero deps to their lock.
+- Alternatives are mostly complementary: **devenv** (dev shells; ships a flake
+  module), **haumea** (fs→attrset loader, below the output layer), snowfall (dotfiles),
+  std/divnix (monorepo DevOps), and emerging numtide **Blueprint** / the
+  **dendritic** pattern. No official nix.dev endorsement of any framework.
+
+## Dev vs production outputs
+
+- Principle: **devShell = the build-time toolchain + dev tools you *enter*
+  (a superset); production = the built package's minimal *runtime closure* you
+  *ship*** (or a container of it). Never deploy a devShell.
+- Define the app **once** in `nix/package.nix` (`callPackage`), expose as
+  `packages.<sys>.default`. The dev shell **reuses** it:
+  `mkShellNoCC { inputsFrom = [ self'.packages.default ]; packages = [ dev-only ]; }`
+  — single source of truth for build deps.
+- `nativeBuildInputs` (build-only) vs `buildInputs` (runtime) is *hygiene, not
+  enforcement*: closure membership is determined by actual store-path references.
+  Verify with `nix path-info -rsh`; use `makeWrapper` to pin only real runtime deps.
+- Output roles: `packages.*` = deployables; `devShells.*` = `nix develop` envs;
+  `apps.*` = thin `nix run` pointers.
+
+## Containers & staging-vs-prod
+
+- Minimal OCI images: **`dockerTools.streamLayeredImage`** (streams the tarball,
+  no multi-GB store blob — good for a Rails closure) or **`nix2container`** (fast
+  incremental pushes). Only the runtime closure ships; reproducible by default.
+- **Staging vs prod = build once, promote the same image digest, inject config at
+  runtime via env vars (12-factor).** Don't rebuild per environment. For NixOS
+  *hosts* instead, the idiom is separate `nixosConfigurations.{staging,production}`
+  parameterized at build time via module options/`specialArgs`.
+- Deploy tooling (NixOS): `nixos-rebuild --target-host` (simplest/blessed),
+  **deploy-rs** (flake-native, auto-rollback), **colmena** (fleets). NixOps is dead.
+
+## DRY / the "contract"
+
+- One `package.nix`; expose **`overlays.default`** (`final: prev: { drip = final.callPackage ./package.nix {}; }`).
+  Your own `packages.default` reads back from the same overlay — one definition
+  feeds your outputs *and* external consumers.
+- `overlays.default` + `nixosModules.default` (plural names) + `packages.default`
+  are the standardized contract other flakes consume. `lib` output for pure helpers.
+
+## Rails specifics (+ gotchas)
+
+- Build with **`bundlerEnv`** + **`bundix`** (`gemset.nix`, committed).
+  `defaultGemConfig` handles pg/nokogiri/ffi; extend per-gem as needed.
+- **Restrict gem groups for prod** (`groups = [ "default" "production" ]`) — naive
+  all-groups was ~2 GB vs <200 MB.
+- Assets: **importmap-rails (Rails 7+ default) = no JS build / no Node**; if using
+  jsbundling/shakapacker, pre-fetch JS deps in a fixed-output derivation
+  (`fetchYarnDeps`/`pnpm.fetchDeps`) — the build sandbox has no network.
+  Precompile with `SECRET_KEY_BASE_DUMMY=1`.
+- Minimal image: `cacert` + `tzdata` + `dockerTools.fakeNss` + writable `tmp/`
+  (store is read-only); migrations as a separate one-shot, not the puma entrypoint.
+- Gotchas: `BUNDLED WITH` mismatch (override bundler in an overlay — already hit);
+  **pin a specific `ruby_3_y`** and verify vs your nixpkgs rev (default trails the
+  tree); `BUNDLE_FORCE_RUBY_PLATFORM=true bundle lock` (`force_ruby_platform`) so
+  Nix builds gems from source; `mkYarnPackage`/`yarn2nix` are **removed** (use the
+  hook-based JS tooling); bundix is dormant but works.
+
+## Recommended multi-env skeleton
+
+```
+flake.nix          # flake-parts; imports ./nix/*; own nixpkgs
+nix/package.nix    # the app derivation (bundlerEnv + asset FOD)
+nix/overlay.nix    # overlays.default → drip
+nix/devshell.nix   # mkShellNoCC { inputsFrom = [ self'.packages.default ]; packages = [dev-only]; }
+nix/container.nix  # streamLayeredImage of the runtime closure
+nix/nixos/…        # nixosModules.default + nixosConfigurations.{staging,production}
+```
+
+## Opt-in integration: consumer-pulls (the csb decoupling)
+
+The idiomatic way to keep an integration opt-in is **consumer-pulls**: the
+external tool imports the repo as an input and reads its standard outputs/overlay;
+**the repo never imports the tool.** Overlays are the preferred decoupling
+mechanism (the consumer merges your package into *its own* nixpkgs); plural output
+names; `inputs.repo.inputs.nixpkgs.follows` keeps it cheap.
+
+### DECIDED DIRECTION: fully decouple csb from the repo flake
+
+- **The repo flake (drip) is a normal standalone flake** — own `nixpkgs`,
+  `devShells`, and (later) `packages.default` + `overlays.default`. It has **no
+  csb input and no `claude-sandboxed*` outputs.** Usable by anyone (dev/CI/prod)
+  with zero knowledge of csb. *(Done: drip's `flake.nix` is now just the dev shell
+  on its own nixpkgs; package/overlay/container outputs to be added later per the
+  skeleton above.)*
+- **csb is a pure consumer — AS BUILT.** csb supplies the claude binaries from
+  its OWN flake via `CSB_SELF` (default: the network-local remote
+  `git+ssh://git@git.grandrew.com/atongen/csb.git`; override `CSB_SELF=path:…`
+  for local dev against a working tree). Two modes:
+  - **Sandboxed** (`csb <branch>`) → `nix run "$CSB_SELF#claude-sandboxed[-global]"`
+    — csb's **generic** jail (minimal, language-agnostic toolset). The repo flake
+    is not consulted, so any git repo works.
+  - **`--no-sandbox`** → `nix develop "<worktree>" --command "$CSB_SELF#claude"`
+    — claude inside the repo's **own devShell** (full toolchain; works where host
+    claude isn't on PATH). Namespacing applies in both modes.
+- **Status: DONE.** drip flake standalone (done); csb-side consumer (done:
+  `CSB_SELF`, generic sandbox, devShell `--no-sandbox`, `packages.claude`; template
+  is now a plain devShell flake). **Note:** we deliberately did NOT build the
+  earlier ephemeral-flake / "repo-toolchain-into-the-jail" idea — instead the
+  sandbox is generic and full capability comes from `--no-sandbox` in the devShell
+  (the M1/M2 split). A repo-*tailored sandbox* (toolchain + domains baked into the
+  jail, via a `.csb/` convention or a repo overlay) is **deferred** — see below.

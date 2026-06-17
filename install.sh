@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 #
-# install.sh — symlink csb's scripts into a bin directory on your PATH.
+# install.sh — copy csb into a bin directory on your PATH.
 #
-#   ./install.sh            # symlink into ~/bin
+#   ./install.sh            # copy into ~/bin
 #   BIN_DIR=~/.local/bin ./install.sh
+#
+# Copies (not symlinks): the target bin dir may itself be under version
+# control, so it must hold real, portable file content.
 
 set -euo pipefail
 
@@ -12,17 +15,16 @@ bin_dir="${BIN_DIR:-$HOME/bin}"
 
 mkdir -p "$bin_dir"
 
-for script in csb tm; do
-  src="$src_dir/$script"
-  dest="$bin_dir/$script"
-  if [[ ! -f "$src" ]]; then
-    echo "install: missing $src" >&2
-    exit 1
-  fi
-  chmod +x "$src"
-  ln -sfn "$src" "$dest"
-  echo "install: $dest -> $src"
-done
+src="$src_dir/csb"
+dest="$bin_dir/csb"
+if [[ ! -f "$src" ]]; then
+  echo "install: missing $src" >&2
+  exit 1
+fi
+rm -f "$dest"          # clear any pre-existing symlink
+cp "$src" "$dest"
+chmod +x "$dest"
+echo "install: copied -> $dest"
 
 case ":$PATH:" in
   *":$bin_dir:"*) ;;
