@@ -17,8 +17,8 @@
 #   csb                     list existing csb worktrees
 #
 # Namespaces partition the sandboxed claude's config (history/sessions/settings).
-# By default the namespace IS the branch (flattened): `csb feature/foo` uses a
-# persistent config under ~/.csb/claudes/feature-foo, reused on every later run
+# By default the namespace IS the branch (percent-encoded): `csb feature/foo`
+# uses a persistent config under ~/.csb/claudes/feature%2Ffoo, reused on every later run
 # for that branch. --ns NAME overrides the default; -E/--ephemeral opts out of a
 # namespace entirely (throwaway config); --ns global uses the real host ~/.claude
 # (csb never mutates it). In --here mode the branch is taken from the current
@@ -58,17 +58,26 @@ OPTIONS:
       --here      no worktree: run the sandbox in the current directory (quick
                   ops). Operates on the live checkout, so less isolated. The
                   namespace comes from the current HEAD branch (detached = error).
-  -N, --ns NAME   override the claude namespace (default: the branch, flattened).
+  -N, --ns NAME   override the claude namespace (default: the branch, percent-encoded).
                   Persistent, isolated config under ~/.csb/claudes/NAME.
                   --ns global uses the real host ~/.claude (csb never mutates it).
   -E, --ephemeral use a throwaway config with no namespace (not persisted).
                   Mutually exclusive with --ns.
   -n, --no-launch prepare/reuse the worktree (incl. .worktreeinclude) and exit;
                   prints the worktree path on stdout
-      --no-sandbox  run claude unjailed, inside the repo's own devShell (full
-                  toolchain; needs a flake.nix with devShells.default)
+      --no-sandbox  run claude inside the repo's own devShell (full toolchain;
+                  needs a flake.nix with devShells.default). NOT a jail: the fs and
+                  network are unrestricted. But the environment is scrubbed
+                  (nix develop --ignore-environment + an allowlist) and HOME is
+                  redirected to the per-branch ~/.csb/claudes/<ns> so the agent
+                  can't see ~/.ssh, ~/.aws, your real ~/.gitconfig, etc. --ns
+                  global keeps your real HOME; -E uses a throwaway HOME.
+  -k, --keep VAR  (--no-sandbox only) also keep env var VAR across the scrubbed
+                  environment. Repeatable.
   -d, --delete    delete mode: remove BRANCH's worktree AND its namespace config
-                  under ~/.csb/claudes (keeps the branch itself)
+                  under ~/.csb/claudes (keeps the branch itself). Pass the same
+                  --ns you launched with; without it, -d only removes the
+                  branch-derived namespace (csb keeps no record of how you ran).
   -h, --help      show this help
 EOF
 }
@@ -77,11 +86,20 @@ die() { echo "$PROG: $*" >&2; exit 1; }
 
 # --- git / worktree helpers ---------------------------------------------------
 
-flatten_branch() { echo "${1//\//-}"; }
+# Map a branch name to one filesystem-safe path component, injectively:
+# percent-encode the only chars that could collide (`%` first, then `/`). So
+# `feature/foo` -> `feature%2Ffoo` while `feature-foo` maps to itself — the two
+# can no longer share a dir (the old `/`->`-` flatten sent both to `feature-foo`).
+encode_branch() {
+  local s="$1"
+  s="${s//%/%25}"
+  s="${s//\//%2F}"
+  echo "$s"
+}
 
 worktree_path() {
   local repo_root="$1" branch="$2"
-  echo "$repo_root/.worktrees/$(flatten_branch "$branch")"
+  echo "$repo_root/.worktrees/$(encode_branch "$branch")"
 }
 
 # In a linked worktree, --git-dir and --git-common-dir differ.
@@ -169,10 +187,60 @@ process_worktreeinclude() {
 # The sandbox auths via a forwarded token (the jail's $HOME is ephemeral, so the
 # host's ~/.claude is not used). Warn if nothing is exported to forward.
 warn_if_no_token() {
-  if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "$PROG: warning: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set;" >&2
+  if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo "$PROG: warning: CLAUDE_CODE_OAUTH_TOKEN is not set;" >&2
     echo "  sandboxed claude won't be able to log in (no Keychain in the jail)." >&2
     echo "  Generate a token once with 'claude setup-token' and export it." >&2
+  fi
+}
+
+# Export the host's effective git identity as GIT_AUTHOR_*/GIT_COMMITTER_* so the
+# agent can commit. Both launch modes need it exported: the sandbox forwards these
+# into the jail, and --no-sandbox redirects HOME away from the real ~/.gitconfig
+# (so without these git wouldn't know who's committing). Left unset if git has no
+# identity configured.
+export_git_identity() {
+  local git_name git_email
+  git_name=$(git -C "$repo_root" config user.name 2>/dev/null || true)
+  git_email=$(git -C "$repo_root" config user.email 2>/dev/null || true)
+  if [[ -n "$git_name" ]]; then export GIT_AUTHOR_NAME="$git_name" GIT_COMMITTER_NAME="$git_name"; fi
+  if [[ -n "$git_email" ]]; then export GIT_AUTHOR_EMAIL="$git_email" GIT_COMMITTER_EMAIL="$git_email"; fi
+}
+
+# Seed an onboarding-complete + folder-trusted .claude.json so interactive claude
+# starts straight from CLAUDE_CODE_OAUTH_TOKEN instead of forcing a login/trust
+# prompt (it does so even with the token in the env until onboarding is marked
+# done). This is the same bypass the sandbox's claudeSeeded wrapper applies, but
+# host-side for --no-sandbox, which runs unwrapped claude. Idempotent; a jq merge
+# preserves any existing state, and a fresh file is written directly so the common
+# case (new namespace) needs no jq at all.
+#   $1 = path to the .claude.json to seed; $2 = project (cwd) key to trust
+seed_claude_config() {
+  local cfg="$1" proj="$2" base tmp
+  mkdir -p "$(dirname "$cfg")"
+  if command -v jq >/dev/null 2>&1; then
+    base='{}'; [[ -s "$cfg" ]] && base="$(cat "$cfg")"
+    tmp="$(mktemp)"
+    printf '%s' "$base" | jq --arg p "$proj" \
+      '.hasCompletedOnboarding = true
+       | .projects[$p].hasTrustDialogAccepted = true
+       | .projects[$p].projectOnboardingSeenCount = ((.projects[$p].projectOnboardingSeenCount) // 1)' \
+      > "$tmp" && mv "$tmp" "$cfg"
+  elif [[ ! -s "$cfg" ]]; then
+    # No jq, but a fresh/empty file needs no merge — write the minimal seed. proj
+    # is a filesystem path under the repo, so no JSON-significant chars are expected.
+    cat > "$cfg" <<EOF
+{
+  "hasCompletedOnboarding": true,
+  "projects": {
+    "$proj": { "hasTrustDialogAccepted": true, "projectOnboardingSeenCount": 1 }
+  }
+}
+EOF
+  else
+    echo "$PROG: warning: jq not found; can't merge the onboarding seed into the existing" >&2
+    echo "  $cfg — claude may prompt for login/trust. Install jq, or run this branch" >&2
+    echo "  sandboxed once (which seeds the shared config)." >&2
   fi
 }
 
@@ -183,7 +251,7 @@ CSB_NS_ROOT="$HOME/.csb/claudes"
 #   -E/--ephemeral          -> throwaway config (no namespace)
 #   --ns global  (explicit) -> the real host ~/.claude (a separate variant)
 #   --ns NAME    (explicit) -> persistent ~/.csb/claudes/NAME
-#   default                 -> persistent ~/.csb/claudes/<branch> (flattened)
+#   default                 -> persistent ~/.csb/claudes/<branch> (percent-encoded)
 # There is no sticky state: the default is derived from the branch every run, so
 # `csb BRANCH` is deterministic without remembering anything. The 'global'
 # special-case is honored ONLY from an explicit --ns, never from a derived name,
@@ -215,16 +283,20 @@ setup_namespace() {
     cur_branch=$(git -C "$worktree" branch --show-current 2>/dev/null || true)
     [[ -n "$cur_branch" ]] || die "--here on a detached HEAD: no branch to derive a namespace from.
   Pass --ns NAME or -E/--ephemeral explicitly."
-    ns=$(flatten_branch "$cur_branch")
+    ns=$(encode_branch "$cur_branch")
   else
-    ns=$(flatten_branch "$branch")
+    ns=$(encode_branch "$branch")
   fi
 
+  # The config dir is <ns>/.claude — not <ns> itself — so it coincides with
+  # claude's default $HOME/.claude when --no-sandbox redirects HOME to <ns>. Both
+  # modes then share one config/history per branch (incl. .claude.json, which
+  # follows CLAUDE_CONFIG_DIR when set). The fixed bind target ~/.csb/claudes is
+  # created as a side effect of this mkdir -p.
   sandbox_attr="claude-sandboxed"
-  mkdir -p "$CSB_NS_ROOT"   # the fixed bind target must exist before launch
   ns_dir="$CSB_NS_ROOT/$ns"
-  mkdir -p "$ns_dir"
-  export CSB_CLAUDE_CONFIG_DIR="$ns_dir"
+  mkdir -p "$ns_dir/.claude"
+  export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
   echo "$PROG: namespace: $ns  (persistent: $ns_dir)" >&2
 }
 
@@ -240,6 +312,7 @@ ephemeral="false"
 sandbox_attr="claude-sandboxed"
 branch=""
 claude_args=()
+extra_keep=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -250,6 +323,10 @@ while [[ $# -gt 0 ]]; do
     --here) here="true"; shift ;;
     -N|--ns) [[ $# -ge 2 ]] || die "--ns requires a NAME"; namespace="$2"; shift 2 ;;
     -E|--ephemeral) ephemeral="true"; shift ;;
+    -k|--keep)
+      [[ $# -ge 2 ]] || die "--keep requires a VAR name"
+      [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env var name for --keep: '$2'"
+      extra_keep+=("$2"); shift 2 ;;
     --no-sandbox) no_sandbox="true"; shift ;;
     --) shift; claude_args+=("$@"); break ;;
     -*) usage >&2; die "unknown option: $1" ;;
@@ -266,6 +343,12 @@ done
 # --ns and -E are mutually exclusive: one names a namespace, the other opts out.
 if [[ -n "$namespace" && "$ephemeral" == "true" ]]; then
   die "--ns and -E/--ephemeral are mutually exclusive"
+fi
+
+# --keep only affects the --no-sandbox scrubbed environment; the jail uses a fixed
+# allowlist, so warn rather than silently ignore.
+if [[ ${#extra_keep[@]} -gt 0 && "$no_sandbox" != "true" ]]; then
+  echo "$PROG: warning: --keep has no effect without --no-sandbox (ignored)" >&2
 fi
 
 # Validate the namespace name: named namespaces become a directory under
@@ -288,10 +371,10 @@ repo_root=$(git rev-parse --show-toplevel)
 
 if [[ "$mode" == "launch" && -z "$branch" && "$here" != "true" ]]; then
   echo "csb worktrees under $repo_root/.worktrees:"
-  if ! git -C "$repo_root" worktree list 2>/dev/null \
-      | awk -v pre="$repo_root/.worktrees/" 'index($1, pre) == 1'; then
-    true
-  fi
+  # `|| true` keeps pipefail from tripping when there are no matching worktrees
+  # (awk exits 0 either way) or `git worktree list` fails outside a repo.
+  git -C "$repo_root" worktree list 2>/dev/null \
+    | awk -v pre="$repo_root/.worktrees/" 'index($1, pre) == 1' || true
   exit 0
 fi
 
@@ -333,7 +416,7 @@ if [[ "$mode" == "delete" ]]; then
     if [[ "$namespace" == "global" ]]; then
       echo "$PROG: namespace 'global' is the real ~/.claude — not removing" >&2
     else
-      ns_name="${namespace:-$(flatten_branch "$branch")}"
+      ns_name="${namespace:-$(encode_branch "$branch")}"
       ns_dir="$CSB_NS_ROOT/$ns_name"
       if [[ -d "$ns_dir" ]]; then
         echo "$PROG: removing namespace config $ns_dir"
@@ -355,8 +438,8 @@ else
   worktree=$(ensure_worktree "$repo_root" "$branch") || exit 1
   process_worktreeinclude "$repo_root" "$worktree"
 fi
-setup_namespace "$worktree"
-
+# --no-launch is purely a worktree-prep step (the namespace only matters at
+# launch), so exit before setup_namespace — no stray ~/.csb/claudes dir.
 if [[ "$no_launch" == "true" ]]; then
   if [[ "$here" == "true" ]]; then
     echo "$PROG: --no-launch: nothing to prepare for --here" >&2
@@ -367,32 +450,72 @@ if [[ "$no_launch" == "true" ]]; then
   exit 0
 fi
 
+setup_namespace "$worktree"
+
 cd "$worktree"
 
+# Git identity for the agent's commits (both modes; see the helper).
+export_git_identity
+
 # --- unsandboxed: run a nix claude inside the repo's OWN devShell ------------
-# Full toolchain + the repo's shellHook env; works where host claude isn't on
-# PATH (e.g. a pure devShell). The repo flake is consumed as-is — just its
-# devShell — so the repo never imports csb.
+# Full toolchain + the repo's shellHook env, consumed as-is (the repo never
+# imports csb). NOT a jail — the fs and network are open — but the environment is
+# scrubbed (nix develop --ignore-environment + an allowlist) and HOME is
+# redirected to a private per-branch dir for the claude process, so the agent
+# can't read ~/.ssh, ~/.aws, the real ~/.gitconfig, shell history, etc.
 if [[ "$no_sandbox" == "true" ]]; then
   [[ -f "$worktree/flake.nix" ]] || die "--no-sandbox runs claude in the repo's devShell, but no flake.nix at $worktree"
-  echo "$PROG: WARNING launching UNSANDBOXED claude in the devShell at $worktree" >&2
-  # Apply the namespace to the unjailed claude directly (no jail wrapper to
-  # translate CSB_CLAUDE_CONFIG_DIR). Empty (ephemeral/global) -> real ~/.claude.
-  [[ -n "${CSB_CLAUDE_CONFIG_DIR:-}" ]] && export CLAUDE_CONFIG_DIR="$CSB_CLAUDE_CONFIG_DIR"
+
+  # Per-branch HOME/config for the *claude* process only, injected via an `env`
+  # wrapper on the command — NOT exported into csb. csb's own `nix build`/`nix
+  # develop` must keep the real HOME so nix can read ~/.config/nix, its eval cache,
+  # and the ssh keys / tokens needed to fetch CSB_SELF and the repo's flake inputs.
+  # (Redirecting HOME is env hygiene, not containment: the fs is open, so the agent
+  # could still read an absolute /Users/you/.ssh — it only steers ~-relative lookups.)
+  #  - persistent namespace -> HOME=<ns>, CLAUDE_CONFIG_DIR=<ns>/.claude (set
+  #    explicitly so .claude.json lands there too, matching the sandbox layout).
+  #  - -E/--ephemeral        -> a throwaway HOME (leaked into TMPDIR; the OS reaps it).
+  #  - --ns global           -> no override: real HOME + real ~/.claude (the point).
+  # Seed targets follow claude's own .claude.json resolution: $CLAUDE_CONFIG_DIR
+  # when set, else $HOME. --ns global is left untouched (real ~/.claude.json — its
+  # whole contract is that csb never mutates it; it's already logged in anyway).
+  env_overrides=()
+  claude_home=""
+  if [[ -n "${CSB_CLAUDE_CONFIG_DIR:-}" ]]; then
+    claude_home="$(dirname "$CSB_CLAUDE_CONFIG_DIR")"
+    env_overrides=("HOME=$claude_home" "CLAUDE_CONFIG_DIR=$CSB_CLAUDE_CONFIG_DIR")
+    seed_claude_config "$CSB_CLAUDE_CONFIG_DIR/.claude.json" "$worktree"
+    warn_if_no_token
+  elif [[ "$ephemeral" == "true" ]]; then
+    claude_home="$(mktemp -d "${TMPDIR:-/tmp}/csb-home.XXXXXX")"
+    env_overrides=("HOME=$claude_home")
+    seed_claude_config "$claude_home/.claude.json" "$worktree"
+    echo "$PROG: ephemeral HOME: $claude_home" >&2
+    warn_if_no_token
+  fi
+
+  echo "$PROG: WARNING launching claude in the devShell at $worktree" >&2
+  echo "$PROG:   clean env (HOME=${claude_home:-$HOME}); fs and network are NOT restricted" >&2
+
+  # Scrub the environment, re-admit only an allowlist (+ --keep VARs). nix sets
+  # PATH/toolchain from the devShell, so `env` and the absolute $claude_bin resolve.
+  # HOME is kept (real) so the devShell shellHook has one; the `env` wrapper then
+  # overrides HOME for the claude process and its children. SSH_AUTH_SOCK is
+  # deliberately NOT kept — SSH push/fetch stays in your own shell.
+  keep_vars=(HOME USER TERM LANG LC_ALL CLAUDE_CODE_OAUTH_TOKEN
+             GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL)
+  keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
+  keep_args=()
+  for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
+
   claude_bin="$(nix build "${CSB_SELF}#claude" --no-link --print-out-paths)/bin/claude"
-  exec nix develop "$worktree" --command "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"
+  exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
+    --command env "${env_overrides[@]+"${env_overrides[@]}"}" "$claude_bin" \
+      "${claude_args[@]+"${claude_args[@]}"}"
 fi
 
 # --- sandboxed: csb's own generic jail (decoupled from the repo flake) -------
 warn_if_no_token
-
-# Provide git identity to the jail via env (the sandbox forwards GIT_AUTHOR_*/
-# GIT_COMMITTER_*), so claude can commit. Derived from the host's effective
-# git config; left unset if not configured.
-git_name=$(git -C "$repo_root" config user.name 2>/dev/null || true)
-git_email=$(git -C "$repo_root" config user.email 2>/dev/null || true)
-if [[ -n "$git_name" ]]; then export GIT_AUTHOR_NAME="$git_name" GIT_COMMITTER_NAME="$git_name"; fi
-if [[ -n "$git_email" ]]; then export GIT_AUTHOR_EMAIL="$git_email" GIT_COMMITTER_EMAIL="$git_email"; fi
 
 echo "$PROG: launching sandboxed claude in $worktree" >&2
 

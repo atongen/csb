@@ -85,7 +85,7 @@
           # the token value is never written to the world-readable /nix/store —
           # only the literal string "$CLAUDE_CODE_OAUTH_TOKEN" is. Generate one
           # with `claude setup-token` and export it before launching (csb passes
-          # it through). ANTHROPIC_API_KEY is forwarded too if you prefer that.
+          # it through). This is the only auth path the jail supports.
           mkClaudeSandbox =
             { allowedPackages ? [ ]
             , extraDomains ? { }
@@ -142,8 +142,9 @@
               binName = "claude";
               inherit outName;
               # Runtime-expanded "$VAR" references (never baked into the store):
-              #  - OAuth token for auth (only this one by default; an unset
-              #    ANTHROPIC_API_KEY="" could shadow it, so callers add it via env).
+              #  - OAuth token for auth (the only auth path; csb deliberately does
+              #    NOT forward ANTHROPIC_API_KEY — when unset it injects "" into the
+              #    jail, which can shadow the token).
               #  - git identity so claude can commit in the jail; csb populates
               #    these from the host's effective `git config`. No file is bound,
               #    so it's portable (works regardless of where gitconfig lives).

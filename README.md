@@ -41,7 +41,7 @@ export CLAUDE_CODE_OAUTH_TOKEN=…          # or, e.g.: CLAUDE_CODE_OAUTH_TOKEN=
 
 csb forwards it into the sandbox at runtime (never written to the Nix store). The
 token is currently needed on **every** launch (sticky per-namespace token storage
-is planned — see `PLAN.md`). `ANTHROPIC_API_KEY` works too.
+is planned — see `PLAN.md`).
 
 ## Use
 
@@ -49,7 +49,8 @@ is planned — see `PLAN.md`). `ANTHROPIC_API_KEY` works too.
 csb feature/foo                  # worktree for feature/foo (off HEAD) + sandboxed claude
 csb -y feature/foo               # allow-all (--dangerously-skip-permissions)
 csb feature/foo -- --model opus  # everything after -- is passed to claude
-csb --no-sandbox feature/foo     # run claude UNSANDBOXED in the repo's dev shell (full toolchain)
+csb --no-sandbox feature/foo     # run claude in the repo's dev shell (full toolchain; scrubbed env, private HOME)
+csb --no-sandbox -k AWS_PROFILE feature/foo  # ...and also keep AWS_PROFILE in the scrubbed env (repeatable)
 csb --here                       # run in the current dir, no worktree (namespace = current branch)
 csb --ns drip feature/foo        # override the namespace (default is the branch)
 csb -E feature/foo               # ephemeral: throwaway config, no namespace
@@ -68,10 +69,26 @@ tmux is yours to manage (e.g. with a separate `tm`): run `csb` in one pane, edit
   cacert); it does **not** include the repo's toolchain, so it's best for editing,
   reading, search, and git — not running the app. The repo flake isn't consulted.
 - **`--no-sandbox`** — claude run inside the repo's `devShells.default`
-  (`nix develop <worktree> -c claude`): the **full toolchain** and your dev-shell
-  env, unjailed. Needs a `flake.nix` with `devShells.default`. This is the mode for
-  actually running consoles/tests. (Authenticates via your token; on macOS the nix
-  claude may trigger a one-time Keychain-access prompt.)
+  (`nix develop <worktree> -c claude`): the **full toolchain**, with access to the
+  real filesystem and network. Needs a `flake.nix` with `devShells.default`. This is
+  the mode for actually running consoles/tests. It is **not** a jail, but it's not
+  wide open either:
+  - **Scrubbed environment.** `nix develop --ignore-environment` starts from a clean
+    slate; only an allowlist crosses in (`HOME USER TERM LANG LC_ALL`, the OAuth
+    token, and git identity). Add more with repeatable `-k/--keep VAR`.
+    `SSH_AUTH_SOCK` is deliberately *not* kept — SSH push/fetch stays in your own
+    shell, as in the jail.
+  - **Private HOME.** `HOME` and `CLAUDE_CONFIG_DIR` are set for the **claude
+    process** (via an `env` wrapper — csb's own `nix` calls keep your real `HOME`,
+    so flake fetches/caches/ssh still work). `HOME` points at the per-branch
+    `~/.csb/claudes/<ns>`, so the agent can't read `~/.ssh`, `~/.aws`, your real
+    `~/.gitconfig`, shell history, etc. — though note this is env hygiene, not
+    containment: the filesystem is open, so a determined agent could still read an
+    absolute path. Its config lands at `<ns>/.claude` — the **same** dir the sandbox
+    uses for that branch, so history is shared across modes. (`--ns global` keeps
+    your real `HOME`/`~/.claude`; `-E` uses a throwaway HOME.) Caches that normally
+    live in `$HOME` (npm, bundler, …) rebuild inside the per-branch HOME on first
+    run and persist there after.
 
 This split is deliberate: the jail is the safe-but-minimal "editing" mode; full
 capability lives in `--no-sandbox`. (See the M1-vs-M2 discussion in `PLAN.md`.)
@@ -79,17 +96,22 @@ capability lives in `--no-sandbox`. (See the M1-vs-M2 discussion in `PLAN.md`.)
 ## Namespaces
 
 A namespace partitions the agent's claude config (history/sessions/settings).
-**By default the namespace is the branch** (flattened, `/`→`-`), so config is
-deterministic per branch with no hidden state to remember:
+**By default the namespace is the branch** (percent-encoded — `/`→`%2F`, so
+`feature/foo`→`feature%2Ffoo` — an injective mapping, no two branches collide),
+so config is deterministic per branch with no hidden state to remember:
 
 | Invocation | Namespace | Config |
 |---|---|---|
-| `csb feature/foo` | `feature-foo` (from the branch) | persistent `~/.csb/claudes/feature-foo` |
-| `csb --here` (on `feature/foo`) | `feature-foo` (from current HEAD) | persistent, same dir |
+| `csb feature/foo` | `feature%2Ffoo` (from the branch) | persistent `~/.csb/claudes/feature%2Ffoo/.claude` |
+| `csb --here` (on `feature/foo`) | `feature%2Ffoo` (from current HEAD) | persistent, same dir |
 | `csb --here` (detached HEAD) | — | **error: fail fast** |
-| `csb --ns drip feature/foo` | `drip` (explicit override) | persistent `~/.csb/claudes/drip` |
+| `csb --ns drip feature/foo` | `drip` (explicit override) | persistent `~/.csb/claudes/drip/.claude` |
 | `csb -E feature/foo` | none | throwaway (not persisted) |
 | `csb --ns global feature/foo` | global | your **real** `~/.claude` (csb never mutates it) |
+
+The config dir is `<ns>/.claude` (not `<ns>` itself) so that it coincides with
+claude's default `$HOME/.claude` when `--no-sandbox` redirects `HOME` to `<ns>` —
+sandboxed and `--no-sandbox` runs of a branch then share one config/history.
 
 - **(default)** — the namespace is the branch. Reused on every later run for that
   branch; switching branches switches config automatically.
@@ -103,8 +125,10 @@ deterministic per branch with no hidden state to remember:
 
 `csb -d <branch>` removes the worktree **and** its per-branch namespace config
 (stale configs hold session history and the auth they were seeded with, so leaving
-them around is a footprint risk). `-E`/`--ns global` are skipped on delete (nothing
-persisted / it's your real config). Namespaces apply to both sandboxed and
+them around is a footprint risk). Pass the same `--ns` you launched with; without
+it, `-d` only removes the branch-derived namespace (csb keeps no record of how you
+ran, so it can't guess an override). `-E`/`--ns global` are skipped on delete
+(nothing persisted / it's your real config). Namespaces apply to both sandboxed and
 `--no-sandbox` launches.
 
 ## Sandbox posture (hardened)

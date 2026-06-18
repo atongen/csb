@@ -525,12 +525,87 @@ If/when we do this, prefer **B**. Note the cross-namespace exposure is a propert
 of the fixed-parent-bind; truly isolating namespaces from each other (per-ns bind)
 would require giving up runtime namespace switching.
 
+## Seed `.claude.json` in `--no-sandbox` — DONE
+
+Turned out to be required, not just nice-to-have: interactive claude forces a
+login/folder-trust prompt even with `CLAUDE_CODE_OAUTH_TOKEN` in the env until
+`hasCompletedOnboarding` is set. So `--no-sandbox` couldn't authenticate
+non-interactively without the seed.
+
+`seed_claude_config <cfg> <project>` (in `bin/csb`) writes `hasCompletedOnboarding`
++ `projects[$worktree].hasTrustDialogAccepted` host-side before launch — the same
+bypass the jail's `claudeSeeded` wrapper applies, just unwrapped. Details:
+- **Target follows claude's own resolution** — `$CLAUDE_CONFIG_DIR/.claude.json`
+  for a persistent namespace, `$HOME/.claude.json` for `-E` (throwaway HOME).
+- **`--ns global` is never touched** — its contract is that csb leaves the real
+  `~/.claude.json` alone (and it's already logged in). Gated on
+  `CSB_CLAUDE_CONFIG_DIR` being set / non-ephemeral.
+- **jq optional** — a jq merge preserves any existing state; a fresh/empty file is
+  written directly (no jq), so the common new-namespace case never needs jq. Only a
+  merge into an *existing non-seeded* file requires jq, and that path warns if jq is
+  absent.
+- **Trust auto-accept is "louder" here** than in the jail (`--no-sandbox` has full
+  fs/network) — accepted, since launching csb on the worktree is the implicit consent.
+
+## Session log — 2026-06-18 (review cleanups + `--no-sandbox` hardening)
+
+Repo review, then a round of cleanups and a significant `--no-sandbox` rework.
+
+**Cleanups**
+- **`ANTHROPIC_API_KEY` removed.** It was advertised (README + the no-token
+  warning) but never forwarded into the jail, so it couldn't actually authenticate
+  a sandboxed run. Standardized on `CLAUDE_CODE_OAUTH_TOKEN` as the single auth
+  path; the flake comment now records *why* the key isn't forwarded (an unset key
+  would inject `""` and shadow the token).
+- **Branch → dir mapping is now injective.** Replaced the lossy `/`→`-` flatten
+  (`feature/foo` and `feature-foo` collided) with percent-encoding
+  (`encode_branch`: `%`→`%25`, `/`→`%2F`). One-time effect: existing namespace
+  dirs for `/`-branches orphan.
+- **List mode** simplified to a plain pipe `| … || true` (the old `if ! …; then
+  true` was dead — awk exits 0 regardless).
+- **`-n/--no-launch`** now exits before `setup_namespace`, so it no longer creates
+  a stray `~/.csb/claudes` dir.
+- **`-d`/`--ns` note** added to `--help` + README: `-d` already honors `--ns`, but
+  without it falls back to the branch-derived namespace (no stickiness).
+
+**`--no-sandbox` hardening** (was: plain `nix develop -c claude`, full inherited env)
+- **Scrubbed env** — `nix develop --ignore-environment` + an allowlist
+  (`HOME USER TERM LANG LC_ALL CLAUDE_CODE_OAUTH_TOKEN` + git identity), modeled on
+  `~/bin/nix-dev-pure.sh`. `SSH_AUTH_SOCK` intentionally dropped (SSH stays in the
+  human's shell, matching the jail).
+- **`-k/--keep VAR`** — repeatable escape hatch to admit extra vars; warns if used
+  without `--no-sandbox`.
+- **Private per-branch HOME** — `HOME` + `CLAUDE_CONFIG_DIR` are injected for the
+  *claude process only*, via an `env` wrapper on `--command`. Critical subtlety:
+  they must NOT be exported into csb, or csb's own `nix build`/`nix develop` would
+  run with the fake HOME and lose `~/.config/nix`, the eval cache, and the
+  ssh keys/tokens needed to fetch `CSB_SELF` + the repo's flake inputs. `HOME` is
+  kept (real) for the devShell shellHook; the wrapper overrides it for claude.
+  This is env hygiene, not containment — the fs is open, so an absolute
+  `/Users/you/.ssh` is still reachable.
+- **Unified config layout** — `setup_namespace` now points `CLAUDE_CONFIG_DIR` at
+  `<ns>/.claude` (not `<ns>`) in *both* modes, so it coincides with claude's default
+  `$HOME/.claude` under the redirected HOME. Sandbox and `--no-sandbox` runs of a
+  branch share one config/history (incl. `.claude.json`). One-time effect: existing
+  sandbox configs move from `<ns>/` → `<ns>/.claude/` and orphan.
+- **`--ns global`** keeps real HOME + real `~/.claude` (no override); **`-E`** gets
+  a throwaway `mktemp` HOME (leaks into TMPDIR; OS reaps it).
+- Git-identity forwarding lifted into a shared `export_git_identity` helper (both
+  modes; `--no-sandbox` needs it because the private HOME hides `~/.gitconfig`).
+
+- **Host-side onboarding seed for `--no-sandbox`** — `seed_claude_config` writes
+  `hasCompletedOnboarding`/trust before launch (claude otherwise forces a login
+  prompt even with the token in env). See the DONE section above.
+
+Verified: `bash -n` + `shellcheck` clean; array/`dirname` and the seed jq-merge +
+fresh-file paths exercised. Not yet run end-to-end (pending tire-kicking).
+
 ## Remaining features / verification
 
 0. **Branch-default namespacing** — DONE. The namespace defaults to the branch
-   (flattened); `--ns` overrides, `-E/--ephemeral` opts out; the old per-worktree
-   sticky-namespace file is removed; `-d` GCs the namespace config. See
-   "Namespacing model (decided)" above.
+   (now percent-encoded, was flattened); `--ns` overrides, `-E/--ephemeral` opts
+   out; the old per-worktree sticky-namespace file is removed; `-d` GCs the
+   namespace config. See "Namespacing model (decided)" above.
 1. **`global` namespace** — DONE. `--ns global` runs a separate
    `claude-sandboxed-global` variant that binds the real host `~/.claude` +
    `~/.claude.json` and runs `claude` directly (no seed), so csb never mutates the
@@ -545,16 +620,19 @@ would require giving up runtime namespace switching.
    from the local-models follow-up (agent-sandbox strips the net namespace + blocks
    loopback); needs investigation of whether agent-sandbox can permit a specific
    host loopback port, and the isolation trade-off of doing so.
-4. **Linux verification** — TODO (gated on the push below). Exercise the whole flow
+4. **Linux verification** — TODO. Exercise the whole flow
    on `x86_64-linux`: the sandbox build, token-env auth, the onboarding/trust seed,
    git identity, namespaces, `--no-sandbox`-in-devShell, and confirm
    `CLAUDE_CONFIG_DIR` relocation behaves the same (on Linux, file credentials at
    `~/.claude/.credentials.json` also exist, which may make the sticky-token story
    easier than on macOS).
-5. **Push csb + flip `CSB_SELF`** — `CSB_SELF` default is now flipped to
-   `git+ssh://git@git.grandrew.com/atongen/csb.git` (done). Remaining: **push csb
-   to that remote** so it resolves; then Linux verification (#4) can fetch it.
-   For local dev against the working tree, override `CSB_SELF=path:/path/to/csb`.
+5. **Push csb + flip `CSB_SELF`** — DONE. `CSB_SELF` defaults to
+   `git+ssh://git@git.grandrew.com/atongen/csb.git`, and csb **is pushed** to that
+   network-local Gitea remote and resolves. This is the canonical source while csb
+   is in-house — use it (don't fall back to GitHub). For local dev against
+   *uncommitted* working-tree changes, override `CSB_SELF=path:/path/to/csb`; note
+   that only matters for changes to the flake's packages (the orchestrator runs
+   from `~/bin`, and `--no-sandbox` only pulls `#claude`, which is unchanged).
 
 ## Remaining capability work (makes the *sandbox* itself useful — M2)
 
