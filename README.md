@@ -154,6 +154,21 @@ matching **gitignored** files (e.g. local `.env`s, generated config) into a newl
 created worktree; existing files are never overwritten. It's a generic
 worktree-tooling convention (predates csb), not csb-specific.
 
+## `.worktreesetup.sh`
+
+After `.worktreeinclude` is processed, if the worktree contains an executable
+`.worktreesetup.sh`, csb runs it with the branch name as `$1` and the worktree as
+its working directory. It runs on **every** worktree invocation (initial create,
+reuse, and `csb -n`), so write it to be **idempotent**. A non-zero exit aborts
+csb — claude is not launched in a half-set-up worktree.
+
+csb runs the worktree's *own* copy of the script, so each branch can carry its own
+setup logic. The script may be committed (present in every checkout) or gitignored
+and seeded via `.worktreeinclude`. Like the repo's `flake.nix` under
+`--no-sandbox`, it executes repo-controlled code on the host, **unsandboxed** —
+it runs before the jail starts. It does not run in `--here` mode (which, like
+`.worktreeinclude`, skips worktree seeding).
+
 ## What a repo needs
 
 Nothing csb-specific. For `--no-sandbox`, just a standard `flake.nix` exposing

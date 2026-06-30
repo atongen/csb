@@ -29,6 +29,12 @@
 # claude inside the repo's own devShell (full toolchain, unjailed). tmux is
 # managed by you, outside the sandbox — only claude is jailed.
 #
+# Worktree prep (worktree mode, not --here): csb seeds gitignored files matching
+# <repo>/.worktreeinclude, then — if the worktree has an executable
+# .worktreesetup.sh — runs it with the branch name as $1 and the worktree as cwd.
+# It runs every invocation (so write it idempotent) and aborts csb on a non-zero
+# exit. Like the repo's flake, it executes repo-controlled code on the host.
+#
 # Env:
 #   CSB_SELF   flake ref to csb itself (default: the network-local git remote
 #              git+ssh://git@git.grandrew.com/atongen/csb.git). Override for a
@@ -63,8 +69,8 @@ OPTIONS:
                   --ns global uses the real host ~/.claude (csb never mutates it).
   -E, --ephemeral use a throwaway config with no namespace (not persisted).
                   Mutually exclusive with --ns.
-  -n, --no-launch prepare/reuse the worktree (incl. .worktreeinclude) and exit;
-                  prints the worktree path on stdout
+  -n, --no-launch prepare/reuse the worktree (incl. .worktreeinclude and
+                  .worktreesetup.sh) and exit; prints the worktree path on stdout
       --no-sandbox  run claude inside the repo's own devShell (full toolchain;
                   needs a flake.nix with devShells.default). NOT a jail: the fs and
                   network are unrestricted. But the environment is scrubbed
@@ -181,6 +187,33 @@ process_worktreeinclude() {
 
   if (( count > 0 )); then
     echo "$PROG: copied $count file(s) into worktree per .worktreeinclude" >&2
+  fi
+}
+
+# Run <worktree>/.worktreesetup.sh (if present and executable) AFTER
+# .worktreeinclude seeding, on every worktree invocation (incl. reuse and
+# --no-launch). The branch name is passed as $1; the script runs with the
+# worktree as its cwd. It's expected to be idempotent (it runs every launch). A
+# non-zero exit aborts csb — a half-set-up worktree shouldn't launch claude.
+# Running the worktree's OWN copy (not the main checkout's) lets each branch carry
+# its own setup logic and composes with .worktreeinclude, which can seed a
+# gitignored script before this runs. NOTE: like the repo's flake under
+# --no-sandbox, this executes repo-controlled code on the HOST, unsandboxed.
+process_worktreesetup() {
+  local wt_path="$1" branch="$2"
+  local setup="$wt_path/.worktreesetup.sh"
+  [[ -e "$setup" ]] || return 0
+  if [[ ! -x "$setup" ]]; then
+    echo "$PROG: warning: $setup exists but is not executable; skipping" >&2
+    echo "  (chmod +x it to have csb run it)" >&2
+    return 0
+  fi
+  echo "$PROG: running .worktreesetup.sh $branch" >&2
+  local rc=0
+  ( cd "$wt_path" && "$setup" "$branch" ) || rc=$?
+  if (( rc != 0 )); then
+    die ".worktreesetup.sh failed (exit $rc); not launching claude.
+  fix the script (or the worktree) and re-run $PROG"
   fi
 }
 
@@ -437,6 +470,7 @@ else
   [[ -n "$branch" ]] || die "branch name required"
   worktree=$(ensure_worktree "$repo_root" "$branch") || exit 1
   process_worktreeinclude "$repo_root" "$worktree"
+  process_worktreesetup "$worktree" "$branch"
 fi
 # --no-launch is purely a worktree-prep step (the namespace only matters at
 # launch), so exit before setup_namespace — no stray ~/.csb/claudes dir.
