@@ -39,6 +39,8 @@
 #   CSB_SELF   flake ref to csb itself (default: the network-local git remote
 #              git+ssh://git@git.grandrew.com/atongen/csb.git). Override for a
 #              local working tree, e.g. CSB_SELF=path:/path/to/csb
+#   CSB_LATEST if set (non-empty), default -L/--latest on: re-lock the claude-code
+#              input to upstream HEAD each run instead of the committed flake.lock.
 
 set -euo pipefail
 
@@ -80,6 +82,11 @@ OPTIONS:
                   global keeps your real HOME; -E uses a throwaway HOME.
   -k, --keep VAR  (--no-sandbox only) also keep env var VAR across the scrubbed
                   environment. Repeatable.
+  -L, --latest    get the very latest claude: re-lock the claude-code flake input
+                  to its upstream HEAD for this run (bypassing the committed
+                  flake.lock) and refresh nix's flake cache. Trades reproducibility
+                  and a little startup latency for always-newest. Default via
+                  CSB_LATEST=1. Applies to both sandboxed and --no-sandbox modes.
   -d, --delete    delete mode: remove BRANCH's worktree AND its namespace config
                   under ~/.csb/claudes (keeps the branch itself). Pass the same
                   --ns you launched with; without it, -d only removes the
@@ -343,6 +350,9 @@ here="false"
 namespace=""
 ephemeral="false"
 sandbox_attr="claude-sandboxed"
+# Default -L/--latest from CSB_LATEST (a per-invocation -L still forces it on).
+latest="false"
+[[ -n "${CSB_LATEST:-}" ]] && latest="true"
 branch=""
 claude_args=()
 extra_keep=()
@@ -356,6 +366,7 @@ while [[ $# -gt 0 ]]; do
     --here) here="true"; shift ;;
     -N|--ns) [[ $# -ge 2 ]] || die "--ns requires a NAME"; namespace="$2"; shift 2 ;;
     -E|--ephemeral) ephemeral="true"; shift ;;
+    -L|--latest) latest="true"; shift ;;
     -k|--keep)
       [[ $# -ge 2 ]] || die "--keep requires a VAR name"
       [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env var name for --keep: '$2'"
@@ -491,6 +502,18 @@ cd "$worktree"
 # Git identity for the agent's commits (both modes; see the helper).
 export_git_identity
 
+# -L/--latest (Option B): re-lock the claude-code input to its upstream HEAD for
+# this run and refresh nix's flake cache so it re-fetches, instead of using the
+# claude-code rev pinned in CSB_SELF's committed flake.lock. This defeats the lock
+# (and nix's ~1h tarball cache) to give the newest claude at the cost of
+# reproducibility + a fetch/eval on launch. Empty array = use the lock as-is.
+# The input name must match flake.nix's inputs.claude-code.
+nix_latest_args=()
+if [[ "$latest" == "true" ]]; then
+  nix_latest_args=(--override-input claude-code github:sadjow/claude-code-nix --refresh)
+  echo "$PROG: --latest: re-locking claude-code to upstream HEAD (ignoring flake.lock pin)" >&2
+fi
+
 # --- unsandboxed: run a nix claude inside the repo's OWN devShell ------------
 # Full toolchain + the repo's shellHook env, consumed as-is (the repo never
 # imports csb). NOT a jail — the fs and network are open — but the environment is
@@ -542,7 +565,7 @@ if [[ "$no_sandbox" == "true" ]]; then
   keep_args=()
   for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 
-  claude_bin="$(nix build "${CSB_SELF}#claude" --no-link --print-out-paths)/bin/claude"
+  claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" --no-link --print-out-paths)/bin/claude"
   exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
     --command env "${env_overrides[@]+"${env_overrides[@]}"}" "$claude_bin" \
       "${claude_args[@]+"${claude_args[@]}"}"
@@ -553,4 +576,4 @@ warn_if_no_token
 
 echo "$PROG: launching sandboxed claude in $worktree" >&2
 
-exec nix run "${CSB_SELF}#${sandbox_attr}" -- "${claude_args[@]+"${claude_args[@]}"}"
+exec nix run "${CSB_SELF}#${sandbox_attr}" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" -- "${claude_args[@]+"${claude_args[@]}"}"

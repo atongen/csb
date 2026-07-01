@@ -28,6 +28,11 @@ box); `csb` shells out to `nix`.
   to the network-local remote `git+ssh://git@git.grandrew.com/atongen/csb.git`.
   For local development against a working tree, override per-invocation:
   `CSB_SELF=path:/path/to/csb csb …`.
+- **`CSB_LATEST`** — if set (non-empty), defaults `-L/--latest` on: each run
+  re-locks the `claude-code` flake input to its upstream HEAD (and refreshes nix's
+  flake cache) instead of using the rev pinned in `flake.lock`. Trades
+  reproducibility and a little startup latency for always getting the newest
+  claude. Per-invocation `-L` does the same for a single run.
 
 ## Auth
 
@@ -51,6 +56,7 @@ csb -y feature/foo               # allow-all (--dangerously-skip-permissions)
 csb feature/foo -- --model opus  # everything after -- is passed to claude
 csb --no-sandbox feature/foo     # run claude in the repo's dev shell (full toolchain; scrubbed env, private HOME)
 csb --no-sandbox -k AWS_PROFILE feature/foo  # ...and also keep AWS_PROFILE in the scrubbed env (repeatable)
+csb -L feature/foo               # get the very latest claude (re-lock claude-code to upstream HEAD this run)
 csb --here                       # run in the current dir, no worktree (namespace = current branch)
 csb --ns drip feature/foo        # override the namespace (default is the branch)
 csb -E feature/foo               # ephemeral: throwaway config, no namespace
