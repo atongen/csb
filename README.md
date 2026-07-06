@@ -200,7 +200,11 @@ environment variables (Rails dotenv does by default).
 Like `.worktreesetup.sh`, the file is repo-controlled: commit it, seed it via
 `.worktreeinclude`, or — for branch-parameterized values (per-worktree database
 names, redis db numbers) — generate it from `.worktreesetup.sh`, which runs
-before launch and receives the branch name. In `--here` mode an existing
+before launch and receives the branch name. A literal `${HOME}` in a value is
+expanded at injection time to the launch's *effective* home — the namespace
+dir when csb redirects HOME, the real home otherwise. Generators run on the
+host before the namespace is resolved, so this is the only way to anchor a
+value to the sandbox HOME (e.g. a per-namespace cache). In `--here` mode an existing
 `.worktreeenv` in the current directory is honored (setup/seeding are not run).
 
 ## What a repo needs

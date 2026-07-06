@@ -608,13 +608,17 @@ if [[ "$no_sandbox" == "true" ]]; then
   # <worktree>/.worktreeenv (blank and # lines skipped). Injected through the
   # same `env` wrapper as HOME — after the --ignore-environment scrub, inside
   # the devShell, identically for claude and --shell. Repo-controlled like
-  # .worktreesetup.sh, which typically generates it per-branch.
+  # .worktreesetup.sh, which typically generates it per-branch. A literal
+  # ${HOME} in a value expands to the launch's EFFECTIVE home (the namespace
+  # dir when redirected, the real one otherwise) — generators run on the host
+  # before the namespace is resolved, so they can't know this path themselves.
   if [[ -f "$worktree/.worktreeenv" ]]; then
     wte_count=0
+    wte_home="${claude_home:-$HOME}"
     while IFS= read -r wte_line; do
       [[ -z "$wte_line" || "$wte_line" == \#* ]] && continue
       if [[ "$wte_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-        env_overrides+=("$wte_line")
+        env_overrides+=("${wte_line//'${HOME}'/$wte_home}")
         wte_count=$((wte_count + 1))
       else
         echo "$PROG: warning: ignoring malformed .worktreeenv line: $wte_line" >&2
