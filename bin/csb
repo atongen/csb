@@ -69,7 +69,10 @@ OPTIONS:
                   ops). Operates on the live checkout, so less isolated. The
                   namespace comes from the current HEAD branch (detached = error).
   -N, --ns NAME   override the claude namespace (default: the branch, percent-encoded).
-                  Persistent, isolated config under ~/.csb/claudes/NAME.
+                  Persistent, isolated config under ~/.csb/claudes/<repo>/NAME
+                  (namespaces are scoped per repo; 'global' is still reserved).
+                  @NAME is unscoped — one config shared across repos
+                  (~/.csb/claudes/@NAME); -d never auto-removes @-namespaces.
                   --ns global uses the real host ~/.claude (csb never mutates it).
   -E, --ephemeral use a throwaway config with no namespace (not persisted).
                   Mutually exclusive with --ns.
@@ -119,6 +122,19 @@ encode_branch() {
 worktree_path() {
   local repo_root="$1" branch="$2"
   echo "$repo_root/.worktrees/$(encode_branch "$branch")"
+}
+
+# One stable, filesystem-safe identity component for the repo: basename of the
+# physical main-checkout root plus a short hash of its full path. The hash keeps
+# same-named checkouts (forks, copies) apart; resolving worktrees (common dir)
+# and symlinks (pwd -P) first maps every path into the same repo onto one key.
+# Namespaces are scoped by this key so equal branch names in different repos
+# never share — or `-d` — each other's config.
+repo_key() {
+  local root="$1" main phys
+  main=$(dirname "$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)")
+  phys=$(cd "$main" && pwd -P)
+  printf '%s-%x\n' "$(basename "$phys")" "$(printf '%s' "$phys" | cksum | cut -d' ' -f1)"
 }
 
 # In a linked worktree, --git-dir and --git-common-dir differ.
@@ -342,7 +358,17 @@ setup_namespace() {
   # follows CLAUDE_CONFIG_DIR when set). The fixed bind target ~/.csb/claudes is
   # created as a side effect of this mkdir -p.
   sandbox_attr="claude-sandboxed"
-  ns_dir="$CSB_NS_ROOT/$ns"
+  # @NAME (explicit --ns only): deliberately unscoped — one dir shared across
+  # repos, for a common claude home/config. Branch-derived names always stay
+  # under the repo key, so a branch literally named '@x' cannot alias one.
+  if [[ -n "$namespace" && "$namespace" == @* ]]; then
+    ns_dir="$CSB_NS_ROOT/$ns"
+    mkdir -p "$ns_dir/.claude"
+    export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
+    echo "$PROG: namespace: $ns  (persistent, shared across repos: $ns_dir)" >&2
+    return
+  fi
+  ns_dir="$CSB_NS_ROOT/$ns_repo_key/$ns"
   mkdir -p "$ns_dir/.claude"
   export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
   echo "$PROG: namespace: $ns  (persistent: $ns_dir)" >&2
@@ -413,9 +439,10 @@ fi
 
 # Validate the namespace name: named namespaces become a directory under
 # ~/.csb/claudes; 'global' is special (real host ~/.claude, no namespace dir).
+# A leading @ marks a deliberately unscoped (cross-repo shared) namespace.
 if [[ -n "$namespace" ]]; then
-  [[ "$namespace" =~ ^[A-Za-z0-9._-]+$ && "$namespace" != "." && "$namespace" != ".." ]] \
-    || die "invalid namespace '$namespace' (use letters, digits, . _ -)"
+  [[ "$namespace" =~ ^@?[A-Za-z0-9._-]+$ && "$namespace" != "." && "$namespace" != ".." ]] \
+    || die "invalid namespace '$namespace' (use letters, digits, . _ -; optional leading @)"
 fi
 
 if [[ "$yolo" == "true" ]]; then
@@ -430,6 +457,7 @@ fi
 
 git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
 repo_root=$(git rev-parse --show-toplevel)
+ns_repo_key=$(repo_key "$repo_root")
 
 # --- list mode (no branch, launch, not --here) --------------------------------
 
@@ -479,9 +507,14 @@ if [[ "$mode" == "delete" ]]; then
   if [[ "$ephemeral" != "true" ]]; then
     if [[ "$namespace" == "global" ]]; then
       echo "$PROG: namespace 'global' is the real ~/.claude — not removing" >&2
+    elif [[ "$namespace" == @* ]]; then
+      # Shared across repos: its lifecycle must not be a side effect of
+      # deleting one branch's worktree.
+      echo "$PROG: namespace '$namespace' is shared across repos — not removing." >&2
+      echo "  to retire it deliberately: rm -rf $CSB_NS_ROOT/$namespace" >&2
     else
       ns_name="${namespace:-$(encode_branch "$branch")}"
-      ns_dir="$CSB_NS_ROOT/$ns_name"
+      ns_dir="$CSB_NS_ROOT/$ns_repo_key/$ns_name"
       if [[ -d "$ns_dir" ]]; then
         echo "$PROG: removing namespace config $ns_dir"
         rm -rf "$ns_dir"

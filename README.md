@@ -104,14 +104,20 @@ capability lives in `--no-sandbox`. (See the M1-vs-M2 discussion in `PLAN.md`.)
 A namespace partitions the agent's claude config (history/sessions/settings).
 **By default the namespace is the branch** (percent-encoded — `/`→`%2F`, so
 `feature/foo`→`feature%2Ffoo` — an injective mapping, no two branches collide),
-so config is deterministic per branch with no hidden state to remember:
+so config is deterministic per branch with no hidden state to remember.
+**Namespaces are scoped per repo**: they live under
+`~/.csb/claudes/<repo-key>/<ns>`, where `<repo-key>` is the basename of the
+physical main-checkout root plus a short path hash (`drip-4f9a11b2`). Equal
+branch (or `--ns`) names in different repos therefore never share a config —
+and `csb -d` in one repo can never delete another repo's history. Below,
+`<rk>` stands for the current repo's key:
 
 | Invocation | Namespace | Config |
 |---|---|---|
-| `csb feature/foo` | `feature%2Ffoo` (from the branch) | persistent `~/.csb/claudes/feature%2Ffoo/.claude` |
+| `csb feature/foo` | `feature%2Ffoo` (from the branch) | persistent `~/.csb/claudes/<rk>/feature%2Ffoo/.claude` |
 | `csb --here` (on `feature/foo`) | `feature%2Ffoo` (from current HEAD) | persistent, same dir |
 | `csb --here` (detached HEAD) | — | **error: fail fast** |
-| `csb --ns drip feature/foo` | `drip` (explicit override) | persistent `~/.csb/claudes/drip/.claude` |
+| `csb --ns drip feature/foo` | `drip` (explicit override) | persistent `~/.csb/claudes/<rk>/drip/.claude` |
 | `csb -E feature/foo` | none | throwaway (not persisted) |
 | `csb --ns global feature/foo` | global | your **real** `~/.claude` (csb never mutates it) |
 
@@ -124,10 +130,15 @@ sandboxed and `--no-sandbox` runs of a branch then share one config/history.
 - **`-E`, `--ephemeral`** — throwaway config, no namespace. Mutually exclusive with
   `--ns`.
 - **`-N`, `--ns NAME`** — override the default with a named, isolated config under
-  `~/.csb/claudes/NAME`.
+  `~/.csb/claudes/<repo-key>/NAME` (repo-scoped like the default).
+- **`--ns @NAME`** — deliberately **unscoped**: one config at `~/.csb/claudes/@NAME`
+  shared by every repo launched with it (e.g. one claude home for all work repos).
+  Only an explicit `--ns` can be unscoped — branch-derived names always stay under
+  the repo key, so a branch named `@NAME` can't alias it. `-d` never auto-removes
+  an `@`-namespace (shared lifecycle is manual: `rm -rf ~/.csb/claudes/@NAME`).
 - **`--ns global`** — use your **real** host `~/.claude` (full history/config); csb
   never mutates it. Honored only as an explicit `--ns`, so a branch literally named
-  `global` gets a plain `~/.csb/claudes/global` dir, **not** your real config.
+  `global` gets a plain per-repo `global` dir, **not** your real config.
 
 `csb -d <branch>` removes the worktree **and** its per-branch namespace config
 (stale configs hold session history and the auth they were seeded with, so leaving

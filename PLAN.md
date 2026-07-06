@@ -467,6 +467,31 @@ in the git dir):
   history and the auth they were seeded with, so leaving them around is a footprint
   risk. (`-E`/`--ns global` are skipped.)
 
+**Amendment (2026-07): namespaces are repo-scoped.** The original layout put
+every namespace directly under `~/.csb/claudes/<ns>`, so equal branch names in
+*different repos* silently shared one config dir — and, worse, `csb -d BRANCH`
+in one repo `rm -rf`'d another repo's session history. (The model above only
+considered the same-name-within-one-repo collision class; worktrees were
+per-repo by construction, namespaces weren't.) Namespaces now live under
+`~/.csb/claudes/<repo-key>/<ns>` where `<repo-key>` is
+`<basename>-<short path hash>` of the physical main-checkout root (common dir
+resolved, symlinks resolved — every path into one repo maps to one key; the
+hash keeps same-named checkouts apart). Explicit `--ns` names are scoped the
+same way (their observed use was manual repo-grouping, now automatic);
+`--ns global` and `-E` are unchanged. The jail's fixed `~/.csb/claudes` parent
+bind is unaffected (the scoped dirs are inside it). Trade-offs: pre-existing
+namespace dirs are orphaned (one-time `mv` under the repo key preserves them),
+and moving a repo on disk changes its key (path-hash, deliberately — a
+remote-URL key would fail for remote-less repos).
+
+Cross-repo sharing, removed as a silent default, returns as an explicit opt-in:
+`--ns @NAME` is unscoped — `~/.csb/claudes/@NAME`, one config for every repo
+launched with it (e.g. one claude home across all work repos, while worktree/db
+isolation stays per-branch). Only an explicit `--ns` can be unscoped (derived
+names stay under the repo key, so a branch named `@x` can't alias one), and
+`-d` refuses to auto-remove `@`-namespaces — a shared config's lifecycle must
+not be a side effect of deleting one branch's worktree.
+
 Known trade-offs (unchanged from before): the fixed `~/.csb/claudes` parent bind
 means namespaces are **not** isolated from each other (an agent can read sibling
 namespaces — same property as the deferred sticky-token note); and two branches
