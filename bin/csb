@@ -73,6 +73,10 @@ OPTIONS:
                   Mutually exclusive with --ns.
   -n, --no-launch prepare/reuse the worktree (incl. .worktreeinclude and
                   .worktreesetup.sh) and exit; prints the worktree path on stdout
+  -s, --shell     (--no-sandbox only) drop into an interactive bash — or run
+                  ARGS after -- as a command — in the exact environment claude
+                  would get: same worktree, devShell, env scrub, and HOME/config
+                  redirection. For debugging what the agent sees.
       --no-sandbox  run claude inside the repo's own devShell (full toolchain;
                   needs a flake.nix with devShells.default). NOT a jail: the fs and
                   network are unrestricted. But the environment is scrubbed
@@ -188,7 +192,9 @@ process_worktreeinclude() {
     dest="$wt_path/$f"
     [[ -e "$dest" ]] && continue
     mkdir -p "$(dirname "$dest")"
-    cp -p "$src" "$dest"
+    # -R: nested git repos (e.g. bundler git-sourced gems) surface as single
+    # directory entries in ls-files --others output.
+    cp -pR "$src" "$dest"
     count=$((count + 1))
   done < <(git -C "$repo_root" ls-files --others -i --exclude-from="$include_file")
 
@@ -346,6 +352,7 @@ mode="launch"
 yolo="false"
 no_sandbox="false"
 no_launch="false"
+shell="false"
 here="false"
 namespace=""
 ephemeral="false"
@@ -364,6 +371,7 @@ while [[ $# -gt 0 ]]; do
     -y|--yolo) yolo="true"; shift ;;
     -n|--no-launch) no_launch="true"; shift ;;
     --here) here="true"; shift ;;
+    -s|--shell) shell="true"; shift ;;
     -N|--ns) [[ $# -ge 2 ]] || die "--ns requires a NAME"; namespace="$2"; shift 2 ;;
     -E|--ephemeral) ephemeral="true"; shift ;;
     -L|--latest) latest="true"; shift ;;
@@ -395,6 +403,12 @@ if [[ ${#extra_keep[@]} -gt 0 && "$no_sandbox" != "true" ]]; then
   echo "$PROG: warning: --keep has no effect without --no-sandbox (ignored)" >&2
 fi
 
+# --shell replaces the claude invocation inside the devShell; the jail variant
+# hardwires claude, so there is nothing to swap there.
+if [[ "$shell" == "true" && "$no_sandbox" != "true" ]]; then
+  die "--shell requires --no-sandbox (the jail runs claude only)"
+fi
+
 # Validate the namespace name: named namespaces become a directory under
 # ~/.csb/claudes; 'global' is special (real host ~/.claude, no namespace dir).
 if [[ -n "$namespace" ]]; then
@@ -403,7 +417,11 @@ if [[ -n "$namespace" ]]; then
 fi
 
 if [[ "$yolo" == "true" ]]; then
-  claude_args=("--dangerously-skip-permissions" "${claude_args[@]+"${claude_args[@]}"}")
+  if [[ "$shell" == "true" ]]; then
+    echo "$PROG: warning: -y/--yolo has no effect with --shell (ignored)" >&2
+  else
+    claude_args=("--dangerously-skip-permissions" "${claude_args[@]+"${claude_args[@]}"}")
+  fi
 fi
 
 # --- locate repo --------------------------------------------------------------
@@ -559,11 +577,25 @@ if [[ "$no_sandbox" == "true" ]]; then
   # HOME is kept (real) so the devShell shellHook has one; the `env` wrapper then
   # overrides HOME for the claude process and its children. SSH_AUTH_SOCK is
   # deliberately NOT kept — SSH push/fetch stays in your own shell.
+  # __NIXOS_SET_ENVIRONMENT_DONE: on NixOS, an interactive bash (SYS_BASHRC =
+  # /etc/bashrc) re-sources /etc/set-environment when the guard var is missing,
+  # clobbering the devShell PATH. Keeping it is a no-op elsewhere.
   keep_vars=(HOME USER TERM LANG LC_ALL CLAUDE_CODE_OAUTH_TOKEN
-             GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL)
+             GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+             __NIXOS_SET_ENVIRONMENT_DONE)
   keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
   keep_args=()
   for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
+
+  # --shell: same worktree/devShell/scrub/HOME, but exec an interactive bash
+  # (or the args after --) instead of claude. No claude build needed.
+  if [[ "$shell" == "true" ]]; then
+    cmd=(bash)
+    [[ ${#claude_args[@]} -gt 0 ]] && cmd=("${claude_args[@]}")
+    echo "$PROG: shell in the devShell at $worktree (claude's env, no claude)" >&2
+    exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
+      --command env "${env_overrides[@]+"${env_overrides[@]}"}" "${cmd[@]}"
+  fi
 
   claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" --no-link --print-out-paths)/bin/claude"
   exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
