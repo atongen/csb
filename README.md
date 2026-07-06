@@ -175,6 +175,23 @@ and seeded via `.worktreeinclude`. Like the repo's `flake.nix` under
 it runs before the jail starts. It does not run in `--here` mode (which, like
 `.worktreeinclude`, skips worktree seeding).
 
+## `.worktreeenv`
+
+At `--no-sandbox` launch, if the worktree contains `.worktreeenv`, its
+dotenv-style `VAR=value` lines (blank lines and `#` comments skipped, names
+validated) are injected into the scrubbed environment via the same `env`
+wrapper that redirects HOME — so they apply after `--ignore-environment`,
+inside the devShell, identically for claude and `--shell` sessions, without
+touching the `--keep` allowlist. Values win over anything the shellHook or
+dotenv-style loaders would otherwise supply only if those respect existing
+environment variables (Rails dotenv does by default).
+
+Like `.worktreesetup.sh`, the file is repo-controlled: commit it, seed it via
+`.worktreeinclude`, or — for branch-parameterized values (per-worktree database
+names, redis db numbers) — generate it from `.worktreesetup.sh`, which runs
+before launch and receives the branch name. In `--here` mode an existing
+`.worktreeenv` in the current directory is honored (setup/seeding are not run).
+
 ## What a repo needs
 
 Nothing csb-specific. For `--no-sandbox`, just a standard `flake.nix` exposing

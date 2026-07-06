@@ -34,6 +34,8 @@
 # .worktreesetup.sh — runs it with the branch name as $1 and the worktree as cwd.
 # It runs every invocation (so write it idempotent) and aborts csb on a non-zero
 # exit. Like the repo's flake, it executes repo-controlled code on the host.
+# At launch (--no-sandbox), VAR=value lines from <worktree>/.worktreeenv are
+# injected into the scrubbed environment — .worktreesetup.sh can generate it.
 #
 # Env:
 #   CSB_SELF   flake ref to csb itself (default: the network-local git remote
@@ -567,6 +569,32 @@ if [[ "$no_sandbox" == "true" ]]; then
     seed_claude_config "$claude_home/.claude.json" "$worktree"
     echo "$PROG: ephemeral HOME: $claude_home" >&2
     warn_if_no_token
+  fi
+
+  # Repo/branch-scoped env overrides: dotenv-style VAR=value lines from
+  # <worktree>/.worktreeenv (blank and # lines skipped). Injected through the
+  # same `env` wrapper as HOME — after the --ignore-environment scrub, inside
+  # the devShell, identically for claude and --shell. Repo-controlled like
+  # .worktreesetup.sh, which typically generates it per-branch.
+  if [[ -f "$worktree/.worktreeenv" ]]; then
+    wte_count=0
+    while IFS= read -r wte_line; do
+      [[ -z "$wte_line" || "$wte_line" == \#* ]] && continue
+      if [[ "$wte_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        env_overrides+=("$wte_line")
+        wte_count=$((wte_count + 1))
+      else
+        echo "$PROG: warning: ignoring malformed .worktreeenv line: $wte_line" >&2
+      fi
+    done < "$worktree/.worktreeenv"
+    (( wte_count > 0 )) && echo "$PROG: $wte_count env override(s) from .worktreeenv" >&2
+    # Global excludes (core.excludesFile) live under the real HOME, which the
+    # sandbox redirects away — so check ignore status the way sandbox git will
+    # see it, and nudge toward the HOME-independent exclude file.
+    if ! GIT_CONFIG_GLOBAL=/dev/null git -C "$worktree" check-ignore -q -- .worktreeenv 2>/dev/null; then
+      echo "$PROG: note: .worktreeenv is not git-ignored inside the sandbox (global" >&2
+      echo "  excludes are not read there) — add it to <repo>/.git/info/exclude" >&2
+    fi
   fi
 
   echo "$PROG: WARNING launching claude in the devShell at $worktree" >&2
