@@ -2,8 +2,8 @@
   description = "Developer shell";
 
   # A normal, standalone dev flake — no dependency on csb. csb consumes this
-  # repo from the outside: `csb <branch>` runs its own generic sandbox here, and
-  # `csb --no-sandbox <branch>` runs claude inside THIS devShell. Add packages /
+  # repo from the outside: `csb <branch>` runs claude (or a `-s` shell) inside
+  # THIS devShell, behind csb's env scrub and deny-list sandbox. Add packages /
   # overlay / container outputs later following a standard multi-env layout.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
