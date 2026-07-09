@@ -719,6 +719,9 @@ build_deny_wrapper() {
           for p in "${write_roots[@]+"${write_roots[@]}"}"; do
             printf '(allow file-read* (subpath "%s"))\n' "$p"
           done
+          # matching-class read re-allow: a later file* allow does not override an
+          # earlier file-read* deny in seatbelt (the namespace file* allow below).
+          [[ -n "$ns_real" ]] && printf '(allow file-read* (subpath "%s"))\n' "$ns_real"
         fi
         if [[ -n "$ns_real" ]]; then
           printf '(allow file* (subpath "%s"))\n' "$ns_real"

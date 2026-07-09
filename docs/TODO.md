@@ -11,8 +11,13 @@ State as of the last session (all UNCOMMITTED in the working tree):
 - Read deny-list floor expanded (cloud/infra/db creds + REPL/shell histories;
   see README "The read deny list").
 - New `--paranoid` flag (and profile key): flips reads to deny-real-HOME-minus-
-  allowlist. Verified on macOS/seatbelt (profile parses; allowlisted-under-HOME
-  reads, non-allowlisted denied). NOT yet verified on Linux/bwrap.
+  allowlist. Verified end-to-end on macOS/seatbelt: claude logs in, real-home
+  and sibling-namespace reads denied, active-namespace reads allowed. NOT yet
+  verified on Linux/bwrap.
+  * Fixed a seatbelt alias-precedence bug that logged claude out under paranoid:
+    a later `(allow file* ns)` does NOT override an earlier `(deny file-read*
+    real_home)`, so the namespace needed its own `file-read*` re-allow. See
+    docs/PARANOID.md.
 
 Next steps:
 - [ ] first live dogfood run: from the csb main checkout, `csb --here -s -- shellcheck bin/csb`
