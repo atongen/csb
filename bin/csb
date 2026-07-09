@@ -14,6 +14,8 @@
 #                           ~/.gnupg, the real ~/.claude, other namespaces,
 #                           browser profiles, packaging creds, ...), even by
 #                           absolute path. Extend: ~/.config/csb/deny.
+#                           --paranoid inverts this: real HOME is read-deny
+#                           except the write-allow roots.
 #                    WRITES default-deny plus an allow-list (worktree, git
 #                           common dir minus hooks/config, namespace HOME,
 #                           tmp dirs, /dev). Extend: ~/.config/csb/allow-write.
@@ -68,10 +70,15 @@
 #                                  expanded, `#` comments. ADD-ONLY: built-in
 #                                  defaults can never be removed.
 #   ~/.config/csb/allow-write      extra write-allow roots, same format.
+#   ~/.config/csb/home/            template dir seeded (non-overwriting) into the
+#                                  launched HOME each run — user-level files
+#                                  (CLAUDE.md, settings.json, rules/) so
+#                                  in-sandbox claude sees them. Per-profile
+#                                  override: seed_home=. --reseed overwrites.
 #   ~/.config/csb/profiles/<name>  launch profile for -p: KEY=VALUE lines with
 #                                  keys ns, token_cmd, aws_profile, latest,
-#                                  yolo, here, ephemeral, shell, seed_creds,
-#                                  args, keep, setenv.
+#                                  yolo, paranoid, here, ephemeral, shell,
+#                                  seed_creds, seed_home, args, keep, setenv.
 #
 # Env:
 #   CSB_SELF   flake ref to csb itself (default: the network-local git remote
@@ -109,6 +116,11 @@ allow-list (worktree, git dir, namespace HOME, tmp — extend via
 
 OPTIONS:
   -y, --yolo         pass --dangerously-skip-permissions to claude (allow-all)
+      --paranoid     tighten reads: instead of allow-minus-deny-list, make the
+                     real HOME read-DENY except the write-allow roots (worktree,
+                     git dir, namespace HOME, tmp). The redirected HOME keeps
+                     tool caches working; add read paths via ~/.config/csb/
+                     allow-write. Also via a profile's paranoid=true.
       --here         no worktree: run in the current directory (quick ops).
                      Mutually exclusive with BRANCH. The namespace comes from
                      the current HEAD branch (detached = error).
@@ -130,15 +142,24 @@ OPTIONS:
                      sandbox presents your live subscription session instead
                      of a long-lived token. Shares the refresh-token family
                      with native claude. Also via a profile's seed_creds=true.
+      --seed-home DIR
+                     seed the launch HOME (non-overwriting) from template DIR:
+                     user-level files (CLAUDE.md, settings.json, rules/) that
+                     in-sandbox claude should otherwise miss (the real ~/.claude
+                     is denied and HOME is redirected). Default ~/.config/csb/
+                     home; also via a profile's seed_home=.
+      --reseed       when seeding the launch HOME from the template, overwrite
+                     existing files instead of keeping them (default: keep).
   -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
-                     (ns=, token_cmd=, aws_profile=, latest=, yolo=, here=,
-                     ephemeral=, shell=, seed_creds=, args=, keep=, setenv=).
+                     (ns=, token_cmd=, aws_profile=, latest=, yolo=, paranoid=,
+                     here=, ephemeral=, shell=, seed_creds=, seed_home=, args=,
+                     keep=, setenv=).
                      Optional [shared]/[claude]/[shell] sections let one file
                      serve both modes ([claude] applies to claude launches,
                      [shell] under -s; top-of-file lines are shared).
                      Explicit CLI flags beat profile values.
-      --no-yolo, --no-here, --no-shell, --no-ephemeral, --no-latest,
-      --no-seed-creds
+      --no-yolo, --no-paranoid, --no-here, --no-shell, --no-ephemeral,
+      --no-latest, --no-seed-creds
                      negate the corresponding option, overriding a profile
                      (or, for latest, the CSB_LATEST env) default for one run
       --aws PROFILE  fetch short-lived credentials for aws profile PROFILE
@@ -365,6 +386,52 @@ EOF
   fi
 }
 
+# Seed the launch HOME from a template dir so in-sandbox claude sees your
+# user-level files — CLAUDE.md, settings.json, rules/, etc. — that otherwise
+# live under the real ~/.claude (blocked by the deny-list) or elsewhere in the
+# real HOME (hidden by HOME redirection). Copies the template's CONTENTS into
+# the launch HOME, non-overwriting (existing files kept) unless --reseed is set.
+# Runs host-side every launch (idempotent), so a freshly-created namespace is
+# seeded on first use. Template dir: the profile's seed_home=, else
+# ~/.config/csb/home. Narrow BY DESIGN — only what you place in the template is
+# copied, never a blanket real-HOME sweep (which would re-expose exactly what
+# the deny-list protects).
+#   $1 = destination HOME (the namespace or ephemeral dir)
+seed_home_template() {
+  local dest="$1" tmpl explicit="false"
+  if [[ -n "$seed_home" ]]; then tmpl="$seed_home"; explicit="true"; else tmpl="$CSB_CONFIG_DIR/home"; fi
+  if [[ ! -d "$tmpl" ]]; then
+    # A missing DEFAULT dir is the common case (no template configured) — silent.
+    # A configured seed_home that doesn't resolve is likely a typo — say so.
+    [[ "$explicit" == "true" ]] && echo "$PROG: warning: seed_home is not a directory: $tmpl (nothing seeded)" >&2
+    return 0
+  fi
+  mkdir -p "$dest"
+  local count=0 src rel target action
+  # -type f only: reconstruct the tree file-by-file (parents via mkdir -p). cp -p
+  # preserves the executable bit so seeded hooks/scripts stay runnable.
+  while IFS= read -r -d '' src; do
+    rel="${src#"$tmpl"/}"
+    target="$dest/$rel"
+    if [[ -e "$target" ]]; then
+      [[ "$reseed" != "true" ]] && continue   # keep existing (default)
+      action="reseeded (overwrote)"
+    else
+      action="seeded"
+    fi
+    mkdir -p "$(dirname "$target")"
+    cp -p "$src" "$target"
+    echo "$PROG: $action HOME/$rel" >&2
+    count=$((count + 1))
+  done < <(find "$tmpl" -mindepth 1 -type f -print0)
+  # NB: an `if` block (not `(( count > 0 )) && echo`) so the function returns 0
+  # when nothing was copied — under `set -e`, a trailing `&&` that short-circuits
+  # would make this bare call abort csb on every no-op (re)launch.
+  if (( count > 0 )); then
+    echo "$PROG: seeded $count file(s) into HOME from $tmpl" >&2
+  fi
+}
+
 # Resolve the effective claude namespace. Sets the global ns_dir (empty =
 # ephemeral) and exports CSB_CLAUDE_CONFIG_DIR. Precedence:
 #   -E/--ephemeral       -> throwaway config (no namespace)
@@ -459,10 +526,55 @@ build_deny_paths() {
     "$HOME/.gem/credentials"
     "$HOME/.pypirc"
     "$HOME/.m2/settings.xml"
+    # cloud / infra / secret-store credentials
+    "$HOME/.azure"
+    "$HOME/.oci"
+    "$HOME/.vault-token"
+    "$HOME/.terraformrc"
+    "$HOME/.terraform.d"
+    "$HOME/.granted"
+    "$HOME/.databrickscfg"
+    "$HOME/.databrickscfg.bak"
+    "$HOME/.databricks"
+    "$HOME/.config/doctl"
+    "$HOME/.config/fly"
+    "$HOME/.config/rclone"
+    "$HOME/.config/op"
+    "$HOME/.config/configstore"
+    "$HOME/.config/github-copilot"
+    "$HOME/.gemini"
+    "$HOME/.mc"
+    "$HOME/.minio"
+    "$HOME/.s3cfg"
+    "$HOME/.boto"
+    "$HOME/.pgpass"
+    "$HOME/.my.cnf"
+    "$HOME/.claude.json.backup"
+    # REPL / shell / editor history (can capture typed secrets)
+    "$HOME/.python_history"
+    "$HOME/.node_repl_history"
+    "$HOME/.irb_history"
+    "$HOME/.rdbg_history"
+    "$HOME/.pry_history"
+    "$HOME/.rediscli_history"
+    "$HOME/.mysql_history"
+    "$HOME/.psql_history"
+    "$HOME/.psql_history.d"
+    "$HOME/.sqlite_history"
+    "$HOME/.scala_history"
+    "$HOME/.scala_history_jline3"
+    "$HOME/.dotty_history"
+    "$HOME/.utop-history"
+    "$HOME/.ammonite"
+    "$HOME/.hivehistory"
+    "$HOME/.lesshst"
+    "$HOME/.viminfo"
+    "$HOME/.local/share/fish/fish_history"
+    "$HOME/.local/share/nvim/shada"
   )
   # NOT in the floor (may be needed for in-sandbox installs against private
-  # registries): ~/.npmrc, ~/.bundle/config — add them to ~/.config/csb/deny
-  # if your repos don't need them.
+  # registries): ~/.npmrc, ~/.bundle/config, ~/.yarnrc — add them to
+  # ~/.config/csb/deny if your repos don't need them.
   if [[ "$(uname -s)" == "Darwin" ]]; then
     raw+=(
       "$HOME/Library/Keychains"
@@ -470,6 +582,7 @@ build_deny_paths() {
       "$HOME/Library/Safari"
       "$HOME/Library/Application Support/Google/Chrome"
       "$HOME/Library/Application Support/Firefox"
+      "$HOME/.zsh_sessions"
     )
   else
     raw+=(
@@ -571,7 +684,8 @@ build_deny_wrapper() {
   deny_wrapper=()
   build_deny_paths
   build_write_roots
-  local ns_real="" gc_real="" hooks_deny="" config_deny=""
+  local ns_real="" gc_real="" hooks_deny="" config_deny="" real_home
+  real_home=$(realpath "$HOME")
   if [[ -n "$ns_dir" ]]; then
     ns_real=$(realpath "$ns_dir")
   fi
@@ -595,6 +709,14 @@ build_deny_wrapper() {
         for p in "${deny_files[@]+"${deny_files[@]}"}"; do
           printf '(deny file* (literal "%s"))\n' "$p"
         done
+        # PARANOID reads: deny everything under the real HOME, then re-allow the
+        # write roots (and the namespace, below) so the devShell still resolves.
+        if [[ "$paranoid" == "true" ]]; then
+          printf '(deny file-read* (subpath "%s"))\n' "$real_home"
+          for p in "${write_roots[@]+"${write_roots[@]}"}"; do
+            printf '(allow file-read* (subpath "%s"))\n' "$p"
+          done
+        fi
         if [[ -n "$ns_real" ]]; then
           printf '(allow file* (subpath "%s"))\n' "$ns_real"
         fi
@@ -621,6 +743,9 @@ build_deny_wrapper() {
       bwrap_bin="$(nix build "$CSB_SELF#bwrap" --no-link --print-out-paths)/bin/bwrap"
       deny_wrapper=("$bwrap_bin" --ro-bind / / --dev-bind /dev /dev --proc /proc
                     --unshare-pid --die-with-parent)
+      # PARANOID reads: blank the real HOME; the write-root binds below (and the
+      # namespace bind) re-expose exactly what the devShell needs to read.
+      [[ "$paranoid" == "true" ]] && deny_wrapper+=(--tmpfs "$real_home")
       # WRITE policy: rw-bind the allowed roots over the read-only root.
       for p in "${write_roots[@]+"${write_roots[@]}"}"; do
         deny_wrapper+=(--bind "$p" "$p")
@@ -721,9 +846,14 @@ apply_profile_line() {
     aws_profile) p_aws="$val" ;;
     latest)      profile_bool latest    "$val" "$f:$lineno"; p_latest="$val" ;;
     yolo)        profile_bool yolo      "$val" "$f:$lineno"; p_yolo="$val" ;;
+    paranoid)    profile_bool paranoid  "$val" "$f:$lineno"; p_paranoid="$val" ;;
     here)        profile_bool here      "$val" "$f:$lineno"; p_here="$val" ;;
     ephemeral)   profile_bool ephemeral "$val" "$f:$lineno"; p_ephemeral="$val" ;;
     seed_creds)  profile_bool seed_creds "$val" "$f:$lineno"; p_seed_creds="$val" ;;
+    seed_home)
+      # shellcheck disable=SC2088  # a LITERAL leading ~/ is the config syntax
+      case "$val" in "~/"*) val="$HOME/${val#\~/}" ;; esac
+      p_seed_home="$val" ;;
     args)        p_args="$val" ;;
     keep)        p_keep+=" $val" ;;
     setenv)
@@ -731,7 +861,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, aws_profile, latest, yolo, here, ephemeral, shell, seed_creds, args, keep, setenv)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, aws_profile, latest, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, args, keep, setenv)" ;;
   esac
 }
 
@@ -745,6 +875,8 @@ apply_profile_line() {
 #   aws_profile=P    as --aws
 #   latest=true      as -L/--latest      (true|false)
 #   yolo=true        as -y/--yolo        (true|false)
+#   paranoid=true    as --paranoid       (true|false; reads default-deny under
+#                                         the real HOME, allowlist re-allows)
 #   here=true        as --here           (true|false; an explicit BRANCH wins,
 #                                         with a warning)
 #   ephemeral=true   as -E/--ephemeral   (true|false; excludes ns= in the same
@@ -754,6 +886,11 @@ apply_profile_line() {
 #   seed_creds=true  as --seed-creds     (true|false; seed the host claude
 #                                         session into the launch config;
 #                                         skipped in -s shell mode)
+#   seed_home=DIR    as --seed-home; template dir copied (non-overwriting) into
+#                    the launch HOME each run; default ~/.config/csb/home. Put
+#                    user-level files here (CLAUDE.md, settings.json, rules/) so
+#                    in-sandbox claude sees them. A leading ~/ expands to the
+#                    HOST home. --reseed overwrites existing files.
 #   args=WORD...     as the ARGS after -- (whitespace-split, no quoting; the
 #                    shell command in -s mode, extra claude args otherwise).
 #                    A leading ~/ or a literal ${HOME} in a word expands to the
@@ -772,8 +909,8 @@ apply_profile_line() {
 load_profile() {
   local f="$CSB_CONFIG_DIR/profiles/$profile_name" line lineno=0 section="shared"
   [[ -f "$f" ]] || die "profile not found: $f"
-  local p_ns="" p_aws="" p_latest="" p_yolo="" p_here="" p_ephemeral="" \
-        p_seed_creds="" p_args="" p_keep="" p_mode_shell="" v entry
+  local p_ns="" p_aws="" p_latest="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
+        p_seed_creds="" p_seed_home="" p_args="" p_keep="" p_mode_shell="" v entry
   local -a keep_list=() shared_lines=() claude_lines=() shell_lines=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     lineno=$((lineno + 1))
@@ -837,6 +974,9 @@ load_profile() {
   if [[ -n "$p_yolo" && "$yolo_cli" != "true" ]]; then
     yolo="$p_yolo"
   fi
+  if [[ -n "$p_paranoid" && "$paranoid_cli" != "true" ]]; then
+    paranoid="$p_paranoid"
+  fi
   if [[ -n "$p_here" && "$here_cli" != "true" ]]; then
     if [[ "$p_here" == "true" && -n "$branch" ]]; then
       echo "$PROG: warning: profile here=true overridden by BRANCH '$branch' (worktree mode)" >&2
@@ -846,6 +986,11 @@ load_profile() {
   fi
   if [[ -n "$p_seed_creds" && "$seed_creds_cli" != "true" ]]; then
     seed_creds="$p_seed_creds"
+  fi
+  # emptiness-guarded like ns/aws_profile: an explicit --seed-home (non-empty)
+  # beats the profile value.
+  if [[ -n "$p_seed_home" && -z "$seed_home" ]]; then
+    seed_home="$p_seed_home"
   fi
   if [[ -n "$p_args" && "$claude_args_cli" != "true" ]]; then
     local -a args_words=()
@@ -927,6 +1072,7 @@ token_cmd=""
 # Booleans a profile can default: each tracks whether the CLI set it (*_cli),
 # in either direction (-X / --no-X) — CLI beats profile beats env default.
 yolo="false";       yolo_cli="false"
+paranoid="false";   paranoid_cli="false"
 shell="false";      shell_cli="false"
 here="false";       here_cli="false"
 ephemeral="false";  ephemeral_cli="false"
@@ -934,7 +1080,9 @@ seed_creds="false"; seed_creds_cli="false"
 latest="false";     latest_cli="false"
 [[ -n "${CSB_LATEST:-}" ]] && latest="true"
 claude_args_cli="false"
+reseed="false"      # --reseed: overwrite existing files when seeding the HOME
 cfg_tmpdir=""
+seed_home=""        # --seed-home / profile seed_home=; empty -> ~/.config/csb/home
 branch=""
 claude_args=()
 extra_keep=()
@@ -948,6 +1096,8 @@ while [[ $# -gt 0 ]]; do
     -d|--delete) mode="delete"; shift ;;
     -y|--yolo) yolo="true"; yolo_cli="true"; shift ;;
     --no-yolo) yolo="false"; yolo_cli="true"; shift ;;
+    --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
+    --no-paranoid) paranoid="false"; paranoid_cli="true"; shift ;;
     -n|--no-launch) no_launch="true"; shift ;;
     --here) here="true"; here_cli="true"; shift ;;
     --no-here) here="false"; here_cli="true"; shift ;;
@@ -960,6 +1110,8 @@ while [[ $# -gt 0 ]]; do
     --no-latest) latest="false"; latest_cli="true"; shift ;;
     --seed-creds) seed_creds="true"; seed_creds_cli="true"; shift ;;
     --no-seed-creds) seed_creds="false"; seed_creds_cli="true"; shift ;;
+    --seed-home) [[ $# -ge 2 ]] || die "--seed-home requires a DIR"; seed_home="$2"; shift 2 ;;
+    --reseed) reseed="true"; shift ;;
     -k|--keep)
       [[ $# -ge 2 ]] || die "--keep requires a VAR name"
       [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env var name for --keep: '$2'"
@@ -1123,6 +1275,23 @@ fi
 [[ -f "$worktree/flake.nix" ]] || die "$PROG runs inside the repo's devShell, but there is no flake.nix at $worktree
   the repo needs its own flake.nix with devShells.default (nix flake init -t $CSB_SELF)"
 
+# flake.nix exists but may lack a devShell for this system. nix flakes ignore
+# UNTRACKED files, so a brand-new flake.nix that hasn't been `git add`ed is
+# invisible here (and to nix develop). Eval it to turn nix develop's cryptic
+# 'does not provide attribute' into real guidance.
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)              csb_system="aarch64-darwin" ;;
+  Darwin-x86_64)             csb_system="x86_64-darwin" ;;
+  Linux-x86_64)              csb_system="x86_64-linux" ;;
+  Linux-aarch64|Linux-arm64) csb_system="aarch64-linux" ;;
+  *)                         csb_system="" ;;
+esac
+if [[ -n "$csb_system" ]] && \
+   ! nix eval "$worktree#devShells.$csb_system.default.name" >/dev/null 2>&1; then
+  die "flake.nix at $worktree has no devShells.$csb_system.default that $PROG can enter
+  add one (nix flake init -t $CSB_SELF); if it is new, 'git add' it -- nix ignores untracked files"
+fi
+
 setup_namespace "$worktree"
 
 cd "$worktree"
@@ -1155,13 +1324,18 @@ env_overrides=()
 if [[ -n "${CSB_CLAUDE_CONFIG_DIR:-}" ]]; then
   claude_home="$(dirname "$CSB_CLAUDE_CONFIG_DIR")"
   env_overrides=("HOME=$claude_home" "CLAUDE_CONFIG_DIR=$CSB_CLAUDE_CONFIG_DIR")
-  seed_claude_config "$CSB_CLAUDE_CONFIG_DIR/.claude.json" "$worktree"
+  claude_json="$CSB_CLAUDE_CONFIG_DIR/.claude.json"
 else
   claude_home="$(mktemp -d "${cfg_tmpdir:-${TMPDIR:-/tmp}}/csb-home.XXXXXX")"
   env_overrides=("HOME=$claude_home")
-  seed_claude_config "$claude_home/.claude.json" "$worktree"
+  claude_json="$claude_home/.claude.json"
   echo "$PROG: ephemeral HOME: $claude_home" >&2
 fi
+# Seed user-level files into the launch HOME from the template dir, BEFORE the
+# onboarding seed below so a template-provided .claude.json is merged (via jq),
+# not overwritten.
+seed_home_template "$claude_home"
+seed_claude_config "$claude_json" "$worktree"
 if [[ -n "$cfg_tmpdir" ]]; then
   env_overrides+=("TMPDIR=$cfg_tmpdir")
 fi

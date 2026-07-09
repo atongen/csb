@@ -14,6 +14,9 @@ toolchain), behind three layers:
      `~/.gnupg`, the real `~/.claude`, other namespaces, browser profiles,
      packaging credentials — blocked **even by absolute path**. Extend via
      `~/.config/csb/deny` (add-only; the built-in floor can't be removed).
+     `--paranoid` inverts this to a whitelist: the real HOME becomes read-deny
+     except the write-allow roots (see below), so only paths csb explicitly
+     grants are readable.
    - **writes**: default-deny plus an allow-list — the worktree, the repo's git
      dir (minus `hooks/` and `config`), the namespace HOME, tmp dirs, `/dev`.
      Extend via `~/.config/csb/allow-write`. This blocks the persistence
@@ -41,9 +44,11 @@ flake; the repo never imports csb.
 ## Install
 
 ```sh
-./install.sh                 # copies bin/csb into ~/bin
-# or: BIN_DIR=~/.local/bin ./install.sh
+make install                 # copies bin/csb into ~/bin
+# or: make install BIN_DIR=~/.local/bin
 ```
+
+`make help` lists the other targets.
 
 Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
 box); `csb` shells out to `nix`. `--aws` additionally needs the `aws` CLI on the
@@ -181,23 +186,34 @@ unwinnable. The two real moves, in order of leverage:
 Built-in defaults (`$HOME`-relative; missing paths are skipped at launch):
 
 ```
-~/.ssh              ~/.aws               ~/.gnupg
-~/.password-store   ~/.claude            ~/.claude.json
-~/.csb/claudes      (the active namespace is re-allowed)
-~/.netrc            ~/.config/gh         ~/.config/gcloud
-~/.kube             ~/.docker            ~/.gitconfig
-~/.config/git       ~/.bash_history      ~/.zsh_history
-~/.cargo/credentials{,.toml}             ~/.gem/credentials
-~/.pypirc           ~/.m2/settings.xml
+secrets / keys   ~/.ssh  ~/.aws  ~/.gnupg  ~/.password-store  ~/.netrc
+                 ~/.azure  ~/.oci  ~/.vault-token  ~/.granted
+claude           ~/.claude  ~/.claude.json{,.backup}
+                 ~/.csb/claudes  (the active namespace is re-allowed)
+cloud / infra    ~/.config/{gh,gcloud,doctl,fly,rclone,op,configstore,git,
+                 github-copilot}  ~/.kube  ~/.docker  ~/.gemini
+                 ~/.terraformrc  ~/.terraform.d  ~/.databrickscfg{,.bak}
+                 ~/.databricks  ~/.mc  ~/.minio  ~/.s3cfg  ~/.boto
+packaging creds  ~/.cargo/credentials{,.toml}  ~/.gem/credentials  ~/.pypirc
+                 ~/.m2/settings.xml
+db creds         ~/.pgpass  ~/.my.cnf
+git / vcs        ~/.gitconfig  ~/.config/git
+shell / REPL     ~/.bash_history  ~/.zsh_history  ~/.python_history
+history          ~/.node_repl_history  ~/.irb_history  ~/.rdbg_history
+                 ~/.pry_history  ~/.rediscli_history  ~/.mysql_history
+                 ~/.psql_history{,.d}  ~/.sqlite_history  ~/.scala_history{,_jline3}
+                 ~/.dotty_history  ~/.utop-history  ~/.ammonite  ~/.hivehistory
+                 ~/.lesshst  ~/.viminfo  ~/.local/share/{nvim/shada,fish/fish_history}
 macOS: ~/Library/Keychains  ~/Library/Cookies  ~/Library/Safari
-       ~/Library/Application Support/{Google/Chrome,Firefox}
+       ~/Library/Application Support/{Google/Chrome,Firefox}  ~/.zsh_sessions
 Linux: ~/.local/share/keyrings  ~/.mozilla
        ~/.config/{google-chrome,chromium}
 ```
 
 Deliberately **not** in the floor (in-sandbox installs against private
-registries may need them): `~/.npmrc`, `~/.bundle/config`. Add them to your
-personal deny file if your repos don't.
+registries may need them): `~/.npmrc`, `~/.bundle/config`, `~/.yarnrc`. Add
+them to your personal deny file if your repos don't. Or use `--paranoid`, which
+denies the whole real HOME by default (see below).
 
 Add your own in `${XDG_CONFIG_HOME:-~/.config}/csb/deny` — one path per line,
 leading `~/` expanded, `#` comments and blank lines ignored. **Add-only**: the
@@ -227,6 +243,24 @@ and same add-only/parse-error rules as the deny file. Expected fallout:
 `git config` writes and hook installation fail inside the sandbox; tools that
 write caches to absolute paths outside `$HOME` need an `allow-write` entry.
 
+### `--paranoid`: whitelist reads
+
+The default read policy is a blacklist (the floor above): everything is
+readable except the listed secrets. `--paranoid` flips it to a whitelist — the
+**real HOME** is read-denied wholesale, and only the write-allow roots (the
+worktree, git dir, namespace HOME, tmp) are re-allowed for reading. Paths
+outside HOME (`/nix`, `/etc`, `/usr`, ...) stay readable so the devShell works.
+
+Because the launched process's `HOME` is redirected to the namespace dir, tool
+caches and config (`~/.cache`, `~/.config/...` *as the process sees them*) land
+under that re-allowed namespace and keep working — so `--paranoid` is rarely
+disruptive in practice. When something does need to read a specific real-HOME
+path, add it to `allow-write` (write-allow roots are read-allowed too).
+
+Enable per run with `--paranoid` (negate with `--no-paranoid`), or per context
+with `paranoid=true` in a profile. There is no env/global toggle — profiles are
+the vehicle for a persistent default.
+
 ### Machine config
 
 `${XDG_CONFIG_HOME:-~/.config}/csb/config` — `KEY=VALUE` lines:
@@ -251,12 +285,19 @@ aws_profile=drip-primary/Admin            # as --aws (optional)
 latest=true                               # as -L/--latest; beats the CSB_LATEST
                                           # env default, loses to an explicit -L
 yolo=true                                 # as -y/--yolo (allow-all)
+paranoid=true                             # as --paranoid: reads default-deny under
+                                          # the real HOME, allowlist re-allows
 here=true                                 # as --here; an explicit BRANCH argument
                                           # wins (with a warning)
 ephemeral=true                            # as -E; excludes ns= in the same profile
 shell=true                                # as -s/--shell
 seed_creds=true                           # as --seed-creds: seed the host claude
                                           # session into the launch config
+seed_home=~/.config/csb/home              # as --seed-home: template dir copied
+                                          # (non-overwriting) into the launch HOME
+                                          # each run so in-sandbox claude sees your
+                                          # CLAUDE.md/settings.json/rules; leading
+                                          # ~/ is the HOST home; --reseed overwrites
 args=bash --rcfile ~/.config/my.bashrc    # the ARGS after --: the command in -s
                                           # mode, extra claude args otherwise.
                                           # Whitespace-split, no quoting. A
@@ -396,6 +437,35 @@ them around is a footprint risk). Pass the same `--ns` you launched with; withou
 it, `-d` only removes the branch-derived namespace (csb keeps no record of how you
 ran, so it can't guess an override).
 
+## Seeding the sandbox HOME
+
+Inside the sandbox, claude runs with a redirected `HOME` (the namespace dir) and
+the real `~/.claude` is denied — so your **user-level** files (`~/.claude/CLAUDE.md`,
+`settings.json`, `rules/`) are invisible. To carry them in, put copies in a
+template dir and csb seeds them into the launch HOME on **every** launch, so
+freshly-created namespaces get them on first use:
+
+```
+~/.config/csb/home/          # the default template dir
+├── .claude/
+│   ├── CLAUDE.md            # your user memory, now visible in-sandbox
+│   ├── settings.json
+│   └── rules/…
+└── …                        # anything else you want under the sandbox HOME
+```
+
+The template's contents are copied into the launch HOME **non-overwriting** —
+existing files (including ones claude wrote itself) are kept. Point at a different
+dir with `--seed-home DIR` or a profile's `seed_home=`; force overwrites with
+`--reseed`. This is deliberately a **template you curate**, not a sweep of your
+real `$HOME` — only what you place here crosses into the sandbox, so it never
+re-exposes what the deny-list protects. A template-provided `.claude.json` is
+merged with csb's onboarding seed rather than clobbered.
+
+For **project-level** instructions, you usually don't need this at all: a
+`CLAUDE.md` at the worktree root is read directly (the worktree is always
+readable), and a gitignored one can ride in via `.worktreeinclude` (below).
+
 ## `.worktreeinclude`
 
 If the repo root has a `.worktreeinclude` (same syntax as `.gitignore`), csb copies
@@ -444,7 +514,14 @@ in the current directory is honored (setup/seeding are not run).
 
 Nothing csb-specific — just a standard `flake.nix` exposing `devShells.default`
 (the repo's full toolchain). `nix flake init -t <csb>` scaffolds a minimal
-standalone dev flake to start from.
+standalone dev flake to start from. If `flake.nix` is missing, or present but
+without a `devShells.default` for your system, csb fails fast with guidance
+before launching. nix ignores untracked files, so `git add` a brand-new
+`flake.nix` before running.
+
+csb dogfoods itself: its own `flake.nix` exposes a `devShells.default` (git +
+shellcheck), so `csb --here` (or `csb <branch>`) runs claude on the csb repo
+like any other. See `docs/TODO.md` for current dogfooding state and next steps.
 
 ## Files
 
@@ -452,7 +529,7 @@ standalone dev flake to start from.
 bin/csb                    the orchestrator (worktree + deny-list + launch)
 flake.nix                  packages {csb, claude, bwrap (linux)} + apps + template
 templates/repo/            scaffold: a standalone dev-shell flake
-install.sh                 copy bin/csb into ~/bin
+Makefile                   install, lint, and build targets (make help)
 docs/PLAN-002.md           the current design (single mode, deny-list, profiles, --aws)
 ```
 
