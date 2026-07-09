@@ -589,6 +589,20 @@ build_deny_wrapper() {
   build_write_roots
   local ns_real="" gc_real="" hooks_deny="" config_deny="" real_home
   real_home=$(realpath "$HOME")
+  # Extra --paranoid read-deny roots (config paranoid_deny=), canonicalized and
+  # existence-checked like the deny-list; the write-root re-allows below reopen
+  # the active worktree on top (later rule wins), so a broad root like /Volumes
+  # never locks the agent out of its own repo.
+  local -a paranoid_deny_roots=()
+  if [[ "$paranoid" == "true" ]]; then
+    local pdp pdr
+    for pdp in "${cfg_paranoid_deny[@]+"${cfg_paranoid_deny[@]}"}"; do
+      [[ -e "$pdp" ]] || continue
+      pdr=$(realpath "$pdp")
+      [[ "$pdr" == *'"'* ]] && die "paranoid_deny path contains a double quote (unsupported): $pdr"
+      paranoid_deny_roots+=("$pdr")
+    done
+  fi
   if [[ -n "$ns_dir" ]]; then
     ns_real=$(realpath "$ns_dir")
   fi
@@ -616,6 +630,9 @@ build_deny_wrapper() {
         # write roots (and the namespace, below) so the devShell still resolves.
         if [[ "$paranoid" == "true" ]]; then
           printf '(deny file-read* (subpath "%s"))\n' "$real_home"
+          for p in "${paranoid_deny_roots[@]+"${paranoid_deny_roots[@]}"}"; do
+            printf '(deny file-read* (subpath "%s"))\n' "$p"
+          done
           for p in "${write_roots[@]+"${write_roots[@]}"}"; do
             printf '(allow file-read* (subpath "%s"))\n' "$p"
           done
@@ -652,6 +669,9 @@ build_deny_wrapper() {
       # PARANOID reads: blank the real HOME; the write-root binds below (and the
       # namespace bind) re-expose exactly what the devShell needs to read.
       [[ "$paranoid" == "true" ]] && deny_wrapper+=(--tmpfs "$real_home")
+      for p in "${paranoid_deny_roots[@]+"${paranoid_deny_roots[@]}"}"; do
+        deny_wrapper+=(--tmpfs "$p")
+      done
       # WRITE policy: rw-bind the allowed roots over the read-only root.
       for p in "${write_roots[@]+"${write_roots[@]}"}"; do
         deny_wrapper+=(--bind "$p" "$p")
@@ -680,30 +700,49 @@ build_deny_wrapper() {
 # --- machine config / profiles / aws ----------------------------------------------
 
 # Machine-level config: $CSB_CONFIG_DIR/config, KEY=VALUE lines ('#' comments).
+# A gitignored config.local overlay is read last so one committed config can be
+# shared across hosts: scalar values win, list values (paranoid_deny) accumulate.
 # Recognized keys (anything else is an error):
-#   tmpdir=PATH   tmp dir for the launched process (its TMPDIR), the ephemeral
-#                 HOME, and a write-allow root — e.g. a scratch device.
+#   tmpdir=PATH         tmp dir for the launched process (its TMPDIR), the
+#                       ephemeral HOME, and a write-allow root — e.g. a scratch
+#                       device.
+#   paranoid_deny=PATH  under --paranoid, additionally read-deny this root (the
+#                       write roots are re-allowed on top). Repeatable. For trees
+#                       that live outside the real HOME — e.g. /Volumes on macOS.
 load_config() {
-  local f="$CSB_CONFIG_DIR/config" line key val lineno=0
-  [[ -f "$f" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    lineno=$((lineno + 1))
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    [[ "$line" == *=* ]] || die "config $f:$lineno: expected KEY=VALUE: '$line'"
-    key="${line%%=*}"
-    val="${line#*=}"
-    case "$key" in
-      tmpdir)
-        # shellcheck disable=SC2088  # a LITERAL leading ~/ is the config syntax
-        case "$val" in
-          "~/"*) val="$HOME/${val#\~/}" ;;
-        esac
-        [[ -d "$val" ]] || die "config $f:$lineno: tmpdir does not exist: '$val'"
-        cfg_tmpdir=$(realpath "$val")
-        ;;
-      *) die "config $f:$lineno: unknown key '$key' (tmpdir)" ;;
-    esac
-  done < "$f"
+  local f line key val lineno fidx
+  for fidx in 0 1; do
+    [[ "$fidx" == 0 ]] && f="$CSB_CONFIG_DIR/config" || f="$CSB_CONFIG_DIR/config.local"
+    [[ -f "$f" ]] || continue
+    lineno=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      lineno=$((lineno + 1))
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      [[ "$line" == *=* ]] || die "config $f:$lineno: expected KEY=VALUE: '$line'"
+      key="${line%%=*}"
+      val="${line#*=}"
+      case "$key" in
+        tmpdir)
+          # shellcheck disable=SC2088  # a LITERAL leading ~/ is the config syntax
+          case "$val" in
+            "~/"*) val="$HOME/${val#\~/}" ;;
+          esac
+          [[ -d "$val" ]] || die "config $f:$lineno: tmpdir does not exist: '$val'"
+          cfg_tmpdir=$(realpath "$val")
+          ;;
+        paranoid_deny)
+          # shellcheck disable=SC2088  # a LITERAL leading ~/ is the config syntax
+          case "$val" in
+            "~/"*) val="$HOME/${val#\~/}" ;;
+            /*)    ;;
+            *)     die "config $f:$lineno: paranoid_deny must be an absolute or ~/ path: '$val'" ;;
+          esac
+          cfg_paranoid_deny+=("$val")
+          ;;
+        *) die "config $f:$lineno: unknown key '$key' (tmpdir, paranoid_deny)" ;;
+      esac
+    done < "$f"
+  done
 }
 
 # Seed the launch config with the HOST's native claude session credential (macOS
@@ -982,6 +1021,7 @@ latest="false";     latest_cli="false"
 claude_args_cli="false"
 reseed="false"      # --reseed: overwrite existing files when seeding the HOME
 cfg_tmpdir=""
+cfg_paranoid_deny=()  # config paranoid_deny=: extra --paranoid read-deny roots
 seed_home=""        # --seed-home / profile seed_home=; empty -> ~/.config/csb/home
 branch=""
 claude_args=()

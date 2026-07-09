@@ -380,14 +380,26 @@ rarely disruptive. When something needs a specific real-HOME path, add it to
 (`--paranoid` / negate `--no-paranoid`) or per context via a profile's
 `paranoid=true`; there is no global toggle.
 
+The deny is scoped to the real HOME, so a source tree that lives *outside* HOME
+stays readable -- e.g. a `~/src -> /Volumes/src` symlink resolves to a path that
+paranoid never fences. Wall such trees off with `paranoid_deny=` (below); the
+write-allow roots are re-allowed on top, so the active worktree stays readable.
+
 ### Machine config
 
-`${XDG_CONFIG_HOME:-~/.config}/csb/config` -- `KEY=VALUE` lines:
+`${XDG_CONFIG_HOME:-~/.config}/csb/config` -- `KEY=VALUE` lines. A gitignored
+`config.local` alongside it is read last (scalar values win, list values
+accumulate), so one committed `config` can be shared across hosts with
+host-specific overrides layered on top -- the same pattern as profile `.local`
+overlays:
 
 ```
-tmpdir=/scratch/tmp   # tmp dir for the launched process: its TMPDIR, the
-                      # ephemeral -E HOMEs, and a write-allow root. For machines
-                      # with a scratch device.
+tmpdir=/scratch/tmp     # tmp dir for the launched process: its TMPDIR, the
+                        # ephemeral -E HOMEs, and a write-allow root. For
+                        # machines with a scratch device.
+paranoid_deny=/Volumes  # under --paranoid, also read-deny this root (write
+                        # roots are re-allowed on top). Repeatable. For trees
+                        # outside the real HOME that the HOME-scoped deny misses.
 ```
 
 ## Threat model
