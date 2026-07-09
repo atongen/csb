@@ -320,6 +320,22 @@ bare `csb -p NAME` then launches instead of listing worktrees; plain `csb`
 always lists. A failing (or empty-output) `token_cmd` aborts the launch before
 any worktree/namespace side effects.
 
+**Host-specific overlay.** A profile `NAME` can have a sibling
+`~/.config/csb/profiles/NAME.local` that is layered on top of `NAME` after it is
+read: same syntax and sections, but its scalar values win and its `keep=` /
+`setenv=` accumulate on top. This lets you commit portable profiles to a
+dotfiles repo while keeping host-specific values (an `aws_profile=`, a
+`token_cmd=` path, a `seed_home=`) in the uncommitted, gitignored `.local`.
+Precedence is base → `.local` → explicit CLI flags (CLI still wins). For
+example, commit `profiles/drip` with the portable defaults and gitignore
+`profiles/*.local`, then per host:
+
+```
+# ~/.config/csb/profiles/drip.local   (gitignored, per-host)
+aws_profile=drip-primary/AdminOnThisBox
+seed_home=~/dotfiles/csb-home
+```
+
 Profiles replace wrapper shell functions. The old
 
 ```bash

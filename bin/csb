@@ -79,6 +79,8 @@
 #                                  keys ns, token_cmd, aws_profile, latest,
 #                                  yolo, paranoid, here, ephemeral, shell,
 #                                  seed_creds, seed_home, args, keep, setenv.
+#                                  A gitignored <name>.local overlays it with
+#                                  host-specific values (its values win).
 #
 # Env:
 #   CSB_SELF   flake ref to csb itself (default: the network-local git remote
@@ -157,7 +159,8 @@ OPTIONS:
                      Optional [shared]/[claude]/[shell] sections let one file
                      serve both modes ([claude] applies to claude launches,
                      [shell] under -s; top-of-file lines are shared).
-                     Explicit CLI flags beat profile values.
+                     A gitignored NAME.local is layered on top for host-specific
+                     values (its values win). Explicit CLI flags beat both.
       --no-yolo, --no-paranoid, --no-here, --no-shell, --no-ephemeral,
       --no-latest, --no-seed-creds
                      negate the corresponding option, overriding a profile
@@ -906,56 +909,90 @@ apply_profile_line() {
 # beats the shared section's shell=), then shared lines apply, then the active
 # section's lines — so a section value overrides a shared one for scalar keys,
 # while keep=/setenv= accumulate across both.
+#
+# OVERLAY: an optional, gitignored ~/.config/csb/profiles/<name>.local is read
+# right after the committed <name> and layered on top — its scalar values win,
+# its keep=/setenv= accumulate. This lets you commit portable profiles to a
+# dotfiles repo while keeping host-specific values (aws_profile, token_cmd
+# paths, seed_home, ...) in the uncommitted .local. Explicit CLI flags still
+# beat both. The .local uses the exact same syntax/sections as the base.
 load_profile() {
-  local f="$CSB_CONFIG_DIR/profiles/$profile_name" line lineno=0 section="shared"
-  [[ -f "$f" ]] || die "profile not found: $f"
+  local base="$CSB_CONFIG_DIR/profiles/$profile_name"
+  local override="$base.local"
+  [[ -f "$base" ]] || die "profile not found: $base"
   local p_ns="" p_aws="" p_latest="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
         p_seed_creds="" p_seed_home="" p_args="" p_keep="" p_mode_shell="" v entry
   local -a keep_list=() shared_lines=() claude_lines=() shell_lines=()
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    lineno=$((lineno + 1))
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    case "$line" in
-      "[shared]") section="shared"; continue ;;
-      "[claude]") section="claude"; continue ;;
-      "[shell]")  section="shell";  continue ;;
-      "["*) die "profile $f:$lineno: unknown section '$line' (use [shared], [claude], or [shell])" ;;
-    esac
-    [[ "$line" == *=* ]] || die "profile $f:$lineno: expected KEY=VALUE: '$line'"
-    if [[ "$line" == shell=* ]]; then
-      [[ "$section" == "shared" ]] \
-        || die "profile $f:$lineno: shell= is only valid in the shared section (it selects which section applies)"
-      profile_bool shell "${line#shell=}" "$f:$lineno"
-      p_mode_shell="${line#shell=}"
-      continue
-    fi
-    case "$section" in
-      shared) shared_lines+=("$lineno:$line") ;;
-      claude) claude_lines+=("$lineno:$line") ;;
-      shell)  shell_lines+=("$lineno:$line") ;;
-    esac
-  done < "$f"
+
+  # Read the committed base profile, then the optional gitignored <name>.local
+  # overlay, into per-section buckets. Each entry is tagged with its source-file
+  # index (0=base, 1=override) so parse errors point at the right file — neither
+  # the index nor the lineno can contain ':', so the splits below are safe even
+  # though the line value can. The override is read (and dispatched) LAST so its
+  # scalar values win and its keep=/setenv= accumulate on top of the base.
+  local pf line lineno section fidx
+  for fidx in 0 1; do
+    [[ "$fidx" == 0 ]] && pf="$base" || pf="$override"
+    [[ -f "$pf" ]] || continue
+    lineno=0; section="shared"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      lineno=$((lineno + 1))
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      case "$line" in
+        "[shared]") section="shared"; continue ;;
+        "[claude]") section="claude"; continue ;;
+        "[shell]")  section="shell";  continue ;;
+        "["*) die "profile $pf:$lineno: unknown section '$line' (use [shared], [claude], or [shell])" ;;
+      esac
+      [[ "$line" == *=* ]] || die "profile $pf:$lineno: expected KEY=VALUE: '$line'"
+      if [[ "$line" == shell=* ]]; then
+        [[ "$section" == "shared" ]] \
+          || die "profile $pf:$lineno: shell= is only valid in the shared section (it selects which section applies)"
+        profile_bool shell "${line#shell=}" "$pf:$lineno"
+        p_mode_shell="${line#shell=}"
+        continue
+      fi
+      case "$section" in
+        shared) shared_lines+=("$fidx:$lineno:$line") ;;
+        claude) claude_lines+=("$fidx:$lineno:$line") ;;
+        shell)  shell_lines+=("$fidx:$lineno:$line") ;;
+      esac
+    done < "$pf"
+  done
 
   # Resolve the mode before dispatching lines: CLI beats the profile default.
   if [[ -n "$p_mode_shell" && "$shell_cli" != "true" ]]; then
     shell="$p_mode_shell"
   fi
 
-  for entry in "${shared_lines[@]+"${shared_lines[@]}"}"; do
-    apply_profile_line "$f" "${entry%%:*}" "${entry#*:}"
+  # Dispatch base fully (shared then the active mode section), then the override
+  # fully — so an override value beats a base value even across sections, while
+  # an explicit CLI flag still beats both in the application step below.
+  local src rest
+  for fidx in 0 1; do
+    [[ "$fidx" == 0 ]] && src="$base" || src="$override"
+    for entry in "${shared_lines[@]+"${shared_lines[@]}"}"; do
+      [[ "${entry%%:*}" == "$fidx" ]] || continue
+      rest="${entry#*:}"
+      apply_profile_line "$src" "${rest%%:*}" "${rest#*:}"
+    done
+    if [[ "$shell" == "true" ]]; then
+      for entry in "${shell_lines[@]+"${shell_lines[@]}"}"; do
+        [[ "${entry%%:*}" == "$fidx" ]] || continue
+        rest="${entry#*:}"
+        apply_profile_line "$src" "${rest%%:*}" "${rest#*:}"
+      done
+    else
+      for entry in "${claude_lines[@]+"${claude_lines[@]}"}"; do
+        [[ "${entry%%:*}" == "$fidx" ]] || continue
+        rest="${entry#*:}"
+        apply_profile_line "$src" "${rest%%:*}" "${rest#*:}"
+      done
+    fi
   done
-  if [[ "$shell" == "true" ]]; then
-    for entry in "${shell_lines[@]+"${shell_lines[@]}"}"; do
-      apply_profile_line "$f" "${entry%%:*}" "${entry#*:}"
-    done
-  else
-    for entry in "${claude_lines[@]+"${claude_lines[@]}"}"; do
-      apply_profile_line "$f" "${entry%%:*}" "${entry#*:}"
-    done
-  fi
 
   if [[ -n "$p_ns" && "$p_ephemeral" == "true" ]]; then
-    die "profile $f: ns and ephemeral=true are mutually exclusive"
+    die "profile $profile_name: ns and ephemeral=true are mutually exclusive"
   fi
   # ephemeral before ns: an applied ephemeral=true suppresses nothing (the two
   # can't coexist in one profile), but an explicit --ns must suppress it.
@@ -1008,10 +1045,14 @@ load_profile() {
   fi
   read -ra keep_list <<< "$p_keep"
   for v in "${keep_list[@]+"${keep_list[@]}"}"; do
-    [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "profile $f: invalid keep var name: '$v'"
+    [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "profile $profile_name: invalid keep var name: '$v'"
     extra_keep+=("$v")
   done
-  echo "$PROG: profile: $profile_name" >&2
+  if [[ -f "$override" ]]; then
+    echo "$PROG: profile: $profile_name (+ $profile_name.local)" >&2
+  else
+    echo "$PROG: profile: $profile_name" >&2
+  fi
 }
 
 # Run the profile's token_cmd host-side; stdout becomes CLAUDE_CODE_OAUTH_TOKEN
