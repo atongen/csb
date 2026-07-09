@@ -1,97 +1,20 @@
 #!/usr/bin/env bash
 #
-# csb (claude sandbox)
+# csb (claude sandbox) -- run Claude Code (or a shell) in a per-branch git
+# worktree, inside the repo's own nix devShell, behind an env scrub, a private
+# HOME, and a filesystem sandbox: deny-list reads + a write allow-list (seatbelt
+# on macOS, bubblewrap on Linux). Network and host services stay open by design.
 #
-# Runs Claude Code — or a shell — in a per-branch git worktree, inside the
-# repo's own nix devShell, behind three layers:
+# Usage: csb --help    Design, threat model, and config: README.md and docs/.
 #
-#   1. env scrub     nix develop --ignore-environment + a small allowlist
-#                    (extend with -k/--keep or a profile's keep=)
-#   2. private HOME  HOME redirected to the per-namespace ~/.csb/claudes/<ns>
-#                    (or a throwaway dir with -E) for the launched process only
-#   3. fs sandbox    seatbelt (sandbox-exec) on macOS, bubblewrap on Linux:
-#                    READS  default-allow minus a deny-list (~/.ssh, ~/.aws,
-#                           ~/.gnupg, the real ~/.claude, other namespaces,
-#                           browser profiles, packaging creds, ...), even by
-#                           absolute path. Extend: ~/.config/csb/deny.
-#                           --paranoid inverts this: real HOME is read-deny
-#                           except the write-allow roots.
-#                    WRITES default-deny plus an allow-list (worktree, git
-#                           common dir minus hooks/config, namespace HOME,
-#                           tmp dirs, /dev). Extend: ~/.config/csb/allow-write.
-#                    On Linux the process also gets its own PID namespace
-#                    (--unshare-pid): other processes are invisible.
-#
-# Network and host services stay OPEN by design (claude must reach local
-# db/redis/etc for testing). The fs sandbox shrinks what can be read/written;
-# it is not an egress firewall — anything readable is exfiltratable.
-#
-#   csb [BRANCH]            ensure a worktree for BRANCH (off current HEAD) and
-#                           launch claude with the worktree as cwd
-#   csb -y [BRANCH]         ...with --dangerously-skip-permissions (allow-all)
-#   csb --here              launch in the current dir, no worktree (quick ops)
-#   csb -s [BRANCH]         interactive bash instead of claude — same env
-#   csb -n BRANCH           prepare/reuse the worktree only; don't launch
-#   csb --ns NAME [BRANCH]  override the claude namespace (default: the branch)
-#   csb -E [BRANCH]         ephemeral (throwaway) config, no namespace
-#   csb -p NAME [BRANCH]    load defaults (ns/token_cmd/aws/keep/setenv) from a profile
-#   csb --aws PROFILE ...   inject short-lived aws role credentials
-#   csb [BRANCH] -- ARGS    pass ARGS to claude (with -s: run ARGS as the command)
-#   csb -d BRANCH           remove the worktree for BRANCH AND its namespace config
-#                           (the branch itself is NOT deleted)
-#   csb                     list existing csb worktrees
-#
-# Namespaces partition claude's config (history/sessions/settings). By default
-# the namespace IS the branch (percent-encoded): `csb feature/foo` uses a
-# persistent config under ~/.csb/claudes/<repo-key>/feature%2Ffoo, reused on
-# every later run for that branch. --ns NAME overrides the default; --ns @NAME
-# is shared across repos; -E/--ephemeral opts out entirely. Every run is
-# namespaced (or ephemeral) — the real ~/.claude is always denied, and 'global'
-# is a reserved name. In --here mode the branch is taken from the current
-# HEAD (a detached HEAD is an error — pass --ns or -E).
-#
-# The repo needs its own flake.nix with devShells.default (full toolchain);
-# the claude binary comes from csb's OWN flake, so the repo never imports csb.
-#
-# Worktree prep (worktree mode, not --here): csb seeds gitignored files matching
-# <repo>/.worktreeinclude, then — if the worktree has an executable
-# .worktreesetup.sh — runs it with the branch name as $1 and the worktree as cwd.
-# It runs every invocation (so write it idempotent) and aborts csb on a non-zero
-# exit. TRUST MODEL: all nix eval/build/develop and the setup script run on the
-# HOST, unsandboxed, exactly as before — only the final claude/bash process is
-# wrapped by the deny-list. At launch, VAR=value lines from
-# <worktree>/.worktreeenv are injected into the scrubbed environment —
-# .worktreesetup.sh can generate it.
-#
-# Config (XDG_CONFIG_HOME honored; default ~/.config):
-#   ~/.config/csb/config           machine config: tmpdir=PATH (scratch device
-#                                  for the launched TMPDIR + ephemeral HOMEs)
-#   ~/.config/csb/deny             extra read-deny paths, one per line, `~/`
-#                                  expanded, `#` comments. ADD-ONLY: built-in
-#                                  defaults can never be removed.
-#   ~/.config/csb/allow-write      extra write-allow roots, same format.
-#   ~/.config/csb/home/            template dir seeded (non-overwriting) into the
-#                                  launched HOME each run — user-level files
-#                                  (CLAUDE.md, settings.json, rules/) so
-#                                  in-sandbox claude sees them. Per-profile
-#                                  override: seed_home=. --reseed overwrites.
-#   ~/.config/csb/profiles/<name>  launch profile for -p: KEY=VALUE lines with
-#                                  keys ns, token_cmd, aws_profile, latest,
-#                                  yolo, paranoid, here, ephemeral, shell,
-#                                  seed_creds, seed_home, args, keep, setenv.
-#                                  A gitignored <name>.local overlays it with
-#                                  host-specific values (its values win).
-#
-# Env:
-#   CSB_SELF   flake ref to csb itself (default: the network-local git remote
-#              git+ssh://git@git.grandrew.com/atongen/csb.git). Override for a
-#              local working tree, e.g. CSB_SELF=path:/path/to/csb
-#   CSB_LATEST if set (non-empty), default -L/--latest on: re-lock the claude-code
-#              input to upstream HEAD each run instead of the committed flake.lock.
+# Env: CSB_SELF   flake ref csb pulls the claude binary from (default: the
+#                 self-hosted remote; override with CSB_SELF=path:/path/to/csb).
+#      CSB_LATEST non-empty defaults -L/--latest on.
 
 set -euo pipefail
 
 PROG=$(basename "$0")
+CSB_VERSION="0.1.0"
 
 # csb supplies the claude binary from its own flake (so repos stay decoupled).
 # Default: the network-local remote. For local dev against a working tree,
@@ -103,6 +26,8 @@ CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"
 
 usage() {
   cat <<EOF
+$PROG $CSB_VERSION -- claude sandbox
+
 USAGE:
   $PROG [OPTIONS] BRANCH [-- ARGS...]     worktree for BRANCH + claude in the devShell
   $PROG [OPTIONS] --here [-- ARGS...]     launch in the current dir (no worktree)
@@ -130,7 +55,7 @@ OPTIONS:
                      percent-encoded). Persistent, isolated config under
                      ~/.csb/claudes/<repo-key>/NAME. @NAME is unscoped — one
                      config shared across repos (~/.csb/claudes/@NAME); -d
-                     never auto-removes @-namespaces. 'global' is reserved.
+                     never auto-removes @-namespaces.
   -E, --ephemeral    throwaway config/HOME, no namespace (not persisted).
                      Mutually exclusive with --ns.
   -s, --shell        drop into an interactive bash — or run ARGS after -- as a
@@ -182,6 +107,7 @@ OPTIONS:
                      Pass the same --ns you launched with; without it, -d only
                      removes the branch-derived namespace.
   -h, --help         show this help
+  -V, --version      print the version and exit
 EOF
 }
 
@@ -189,10 +115,8 @@ die() { echo "$PROG: $*" >&2; exit 1; }
 
 # --- git / worktree helpers ---------------------------------------------------
 
-# Map a branch name to one filesystem-safe path component, injectively:
-# percent-encode the only chars that could collide (`%` first, then `/`). So
-# `feature/foo` -> `feature%2Ffoo` while `feature-foo` maps to itself — the two
-# can no longer share a dir (the old `/`->`-` flatten sent both to `feature-foo`).
+# Percent-encode a branch into one filesystem-safe path component, injectively
+# (% first, then /): feature/foo -> feature%2Ffoo, so no two branches collide.
 encode_branch() {
   local s="$1"
   s="${s//%/%25}"
@@ -205,12 +129,10 @@ worktree_path() {
   echo "$repo_root/.worktrees/$(encode_branch "$branch")"
 }
 
-# One stable, filesystem-safe identity component for the repo: basename of the
-# physical main-checkout root plus a short hash of its full path. The hash keeps
-# same-named checkouts (forks, copies) apart; resolving worktrees (common dir)
-# and symlinks (pwd -P) first maps every path into the same repo onto one key.
-# Namespaces are scoped by this key so equal branch names in different repos
-# never share — or `-d` — each other's config.
+# Stable, filesystem-safe repo identity: basename of the physical main-checkout
+# root + a short hash of its full path (keeps same-named checkouts apart).
+# Resolving the common dir + pwd -P maps every path into a repo onto one key, so
+# namespaces scoped by it never share (or -d) config across repos.
 repo_key() {
   local root="$1" main phys
   main=$(dirname "$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)")
@@ -302,16 +224,11 @@ process_worktreeinclude() {
   fi
 }
 
-# Run <worktree>/.worktreesetup.sh (if present and executable) AFTER
-# .worktreeinclude seeding, on every worktree invocation (incl. reuse and
-# --no-launch). The branch name is passed as $1; the script runs with the
-# worktree as its cwd. It's expected to be idempotent (it runs every launch). A
-# non-zero exit aborts csb — a half-set-up worktree shouldn't launch claude.
-# Running the worktree's OWN copy (not the main checkout's) lets each branch carry
-# its own setup logic and composes with .worktreeinclude, which can seed a
-# gitignored script before this runs. NOTE: like the repo's flake, this executes
-# repo-controlled code on the HOST, unsandboxed — the deny-list wraps only the
-# final claude/bash process.
+# Run <worktree>/.worktreesetup.sh (present + executable) after .worktreeinclude
+# seeding, every worktree invocation; $1 is the branch, cwd is the worktree.
+# Idempotent by contract; a non-zero exit aborts csb. Runs the worktree's own
+# copy, on the HOST unsandboxed like the repo's flake (the deny-list wraps only
+# the final claude/bash process).
 process_worktreesetup() {
   local wt_path="$1" branch="$2"
   local setup="$wt_path/.worktreesetup.sh"
@@ -355,12 +272,10 @@ export_git_identity() {
 }
 
 # Seed an onboarding-complete + folder-trusted .claude.json so interactive claude
-# starts straight from CLAUDE_CODE_OAUTH_TOKEN instead of forcing a login/trust
-# prompt (it does so even with the token in the env until onboarding is marked
-# done). Host-side, into the namespace/throwaway config — never the real
-# ~/.claude.json. Idempotent; a jq merge preserves any existing state, and a
-# fresh file is written directly so the common case (new namespace) needs no jq.
-#   $1 = path to the .claude.json to seed; $2 = project (cwd) key to trust
+# starts from CLAUDE_CODE_OAUTH_TOKEN without a login/trust prompt. Host-side,
+# into the namespace/throwaway config (never the real ~/.claude.json). Idempotent:
+# a jq merge preserves existing state; a fresh file is written directly (no jq).
+#   $1 = .claude.json to seed; $2 = project (cwd) key to trust
 seed_claude_config() {
   local cfg="$1" proj="$2" base tmp
   mkdir -p "$(dirname "$cfg")"
@@ -389,16 +304,12 @@ EOF
   fi
 }
 
-# Seed the launch HOME from a template dir so in-sandbox claude sees your
-# user-level files — CLAUDE.md, settings.json, rules/, etc. — that otherwise
-# live under the real ~/.claude (blocked by the deny-list) or elsewhere in the
-# real HOME (hidden by HOME redirection). Copies the template's CONTENTS into
-# the launch HOME, non-overwriting (existing files kept) unless --reseed is set.
-# Runs host-side every launch (idempotent), so a freshly-created namespace is
-# seeded on first use. Template dir: the profile's seed_home=, else
-# ~/.config/csb/home. Narrow BY DESIGN — only what you place in the template is
-# copied, never a blanket real-HOME sweep (which would re-expose exactly what
-# the deny-list protects).
+# Seed the launch HOME from a template dir (profile seed_home=, else
+# ~/.config/csb/home) so in-sandbox claude sees user-level files (CLAUDE.md,
+# settings.json, rules/) otherwise hidden by the deny-list + HOME redirection.
+# Copies the template's contents non-overwriting (--reseed overwrites), every
+# launch. Only what you place in the template crosses in -- never a real-HOME
+# sweep, so it can't re-expose what the deny-list protects.
 #   $1 = destination HOME (the namespace or ephemeral dir)
 seed_home_template() {
   local dest="$1" tmpl explicit="false"
@@ -442,8 +353,7 @@ seed_home_template() {
 #                           (@NAME: unscoped ~/.csb/claudes/@NAME)
 #   default              -> persistent ~/.csb/claudes/<repo-key>/<branch>
 # There is no sticky state: the default is derived from the branch every run, so
-# `csb BRANCH` is deterministic without remembering anything. 'global' is a
-# reserved name that errors at validation — every run is namespaced.
+# `csb BRANCH` is deterministic without remembering anything.
 setup_namespace() {
   local worktree="$1" ns cur_branch
   ns_dir=""
@@ -467,13 +377,10 @@ setup_namespace() {
     ns=$(encode_branch "$branch")
   fi
 
-  # The config dir is <ns>/.claude — not <ns> itself — so it coincides with
-  # claude's default $HOME/.claude when csb redirects HOME to <ns> (.claude.json
-  # follows CLAUDE_CONFIG_DIR when set). The fixed ~/.csb/claudes parent is
-  # created as a side effect of this mkdir -p.
-  # @NAME (explicit --ns only): deliberately unscoped — one dir shared across
-  # repos, for a common claude home/config. Branch-derived names always stay
-  # under the repo key, so a branch literally named '@x' cannot alias one.
+  # HOME redirects to <ns>, so the config dir is <ns>/.claude (coincides with
+  # claude's default $HOME/.claude). @NAME (explicit --ns only) is unscoped --
+  # one dir shared across repos; branch-derived names stay under the repo key,
+  # so a branch literally named '@x' cannot alias one.
   if [[ -n "$namespace" && "$namespace" == @* ]]; then
     ns_dir="$CSB_NS_ROOT/$ns"
     mkdir -p "$ns_dir/.claude"
@@ -488,18 +395,11 @@ setup_namespace() {
 }
 
 # --- deny-list / write policy -----------------------------------------------------
-# Two filesystem policies for the launched process (and its children):
-#   READS:  default-allow with a deny-list of sensitive paths (built-in floor +
-#           add-only ~/.config/csb/deny), blocked even by absolute path. The
-#           active namespace dir is re-allowed under the denied ~/.csb/claudes
-#           parent; ephemeral HOMEs live under the tmp dir (not under any denied
-#           path) so they need no re-allow.
-#   WRITES: default-deny with an allow-list of roots — the worktree, the repo's
-#           git common dir (minus hooks/ and config, which are host code-execution
-#           vectors), the active namespace HOME, tmp dirs, /dev — plus add-only
-#           ~/.config/csb/allow-write. This blocks persistence/escalation targets
-#           (~/.zshrc, ~/bin, LaunchAgents, other checkouts) that a read deny-list
-#           can't cover.
+# Two filesystem policies for the launched process (see README for rationale):
+#   READS:  default-allow minus a deny-list (built-in floor + add-only
+#           ~/.config/csb/deny); the active namespace is re-allowed.
+#   WRITES: default-deny plus an allow-list (worktree, git common dir minus
+#           hooks/config, namespace HOME, tmp, /dev; + ~/.config/csb/allow-write).
 
 # Populate the global arrays deny_dirs / deny_files: built-in defaults + the
 # user config, canonicalized (realpath — seatbelt matches resolved paths;
@@ -806,14 +706,11 @@ load_config() {
   done < "$f"
 }
 
-# Seed the launch config dir with the HOST's native claude session credential
-# (macOS: keychain item; linux: the real ~/.claude/.credentials.json, which the
-# sandbox itself can't read). The sandbox then presents the same live
-# subscription session as native claude — long-lived setup-tokens carry
-# entitlements from mint time and can lag new model tiers. Runs host-side,
-# every launch (keeps the copy fresh); the secret is never echoed. Note: the
-# sandbox and native claude share one refresh-token family — occasional mutual
-# re-login prompts are possible.
+# Seed the launch config with the HOST's native claude session credential (macOS
+# keychain / linux ~/.claude/.credentials.json) so the sandbox presents the same
+# live subscription session as native claude. Host-side, every launch; the
+# secret is never echoed. Sandbox and native share one refresh-token family, so
+# occasional mutual re-login prompts are possible.
 seed_credentials() {
   local dir="$1" blob src
   mkdir -p "$dir"
@@ -871,54 +768,13 @@ apply_profile_line() {
   esac
 }
 
-# Parse ~/.config/csb/profiles/$profile_name and apply it as DEFAULTS: explicit
-# CLI flags win — booleans track whether the CLI touched them (*_cli), so the
-# --no-* flags can override a profile's true as well (and a profile's latest=
-# beats the CSB_LATEST env default). Recognized keys (anything else is an error):
-#   ns=NAME          as --ns
-#   token_cmd=CMD    run host-side via bash -c; stdout -> CLAUDE_CODE_OAUTH_TOKEN
-#                    (skipped in -s shell mode: no claude, no credential dance)
-#   aws_profile=P    as --aws
-#   latest=true      as -L/--latest      (true|false)
-#   yolo=true        as -y/--yolo        (true|false)
-#   paranoid=true    as --paranoid       (true|false; reads default-deny under
-#                                         the real HOME, allowlist re-allows)
-#   here=true        as --here           (true|false; an explicit BRANCH wins,
-#                                         with a warning)
-#   ephemeral=true   as -E/--ephemeral   (true|false; excludes ns= in the same
-#                                         profile; an explicit --ns wins)
-#   shell=true       as -s/--shell       (true|false; shared section only —
-#                                         sets the default mode)
-#   seed_creds=true  as --seed-creds     (true|false; seed the host claude
-#                                         session into the launch config;
-#                                         skipped in -s shell mode)
-#   seed_home=DIR    as --seed-home; template dir copied (non-overwriting) into
-#                    the launch HOME each run; default ~/.config/csb/home. Put
-#                    user-level files here (CLAUDE.md, settings.json, rules/) so
-#                    in-sandbox claude sees them. A leading ~/ expands to the
-#                    HOST home. --reseed overwrites existing files.
-#   args=WORD...     as the ARGS after -- (whitespace-split, no quoting; the
-#                    shell command in -s mode, extra claude args otherwise).
-#                    A leading ~/ or a literal ${HOME} in a word expands to the
-#                    HOST home — args reference host-visible files (rcfiles,
-#                    scripts), so this stays portable across macOS/Linux homes.
-#                    (Contrast .worktreeenv, whose ${HOME} is the SANDBOX home.)
-#   keep=V1 V2 ...   space-separated, appended to --keep
-#   setenv=VAR=val   repeatable; appended to the launched env (post-scrub)
-#
-# SECTIONS: one profile file can serve both modes. Lines before any section
-# header — or under [shared] — always apply; [claude] applies only when claude
-# launches, [shell] only under -s. The mode is resolved first (CLI -s/--no-shell
-# beats the shared section's shell=), then shared lines apply, then the active
-# section's lines — so a section value overrides a shared one for scalar keys,
-# while keep=/setenv= accumulate across both.
-#
-# OVERLAY: an optional, gitignored ~/.config/csb/profiles/<name>.local is read
-# right after the committed <name> and layered on top — its scalar values win,
-# its keep=/setenv= accumulate. This lets you commit portable profiles to a
-# dotfiles repo while keeping host-specific values (aws_profile, token_cmd
-# paths, seed_home, ...) in the uncommitted .local. Explicit CLI flags still
-# beat both. The .local uses the exact same syntax/sections as the base.
+# Parse ~/.config/csb/profiles/$profile_name and apply it as DEFAULTS -- explicit
+# CLI flags win. Keys and sections are documented in the README (Profiles).
+# Booleans track whether the CLI touched them (*_cli) so --no-* can override a
+# profile's true (and a profile latest= beats the CSB_LATEST default). An
+# optional gitignored <name>.local overlay is read last: its scalar values win,
+# its keep=/setenv= accumulate. Sections [shared]/[claude]/[shell] let one file
+# serve both modes; the mode is resolved before lines are dispatched.
 load_profile() {
   local base="$CSB_CONFIG_DIR/profiles/$profile_name"
   local override="$base.local"
@@ -1137,6 +993,7 @@ ns_dir=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
+    -V|--version) echo "$PROG $CSB_VERSION"; exit 0 ;;
     -d|--delete) mode="delete"; shift ;;
     -y|--yolo) yolo="true"; yolo_cli="true"; shift ;;
     --no-yolo) yolo="false"; yolo_cli="true"; shift ;;
@@ -1194,13 +1051,8 @@ fi
 
 # Validate the namespace name: named namespaces become a directory under
 # ~/.csb/claudes. A leading @ marks a deliberately unscoped (cross-repo shared)
-# namespace. 'global' is reserved; a branch literally named "global" is fine
-# (derived names are never special).
+# namespace.
 if [[ -n "$namespace" ]]; then
-  if [[ "$namespace" == "global" ]]; then
-    die "'global' is a reserved namespace name; every run is namespaced.
-  Use --ns NAME (or --ns @NAME shared across repos), or -E for a throwaway config."
-  fi
   [[ "$namespace" =~ ^@?[A-Za-z0-9._-]+$ && "$namespace" != "." && "$namespace" != ".." ]] \
     || die "invalid namespace '$namespace' (use letters, digits, . _ -; optional leading @)"
 fi

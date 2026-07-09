@@ -1,0 +1,9 @@
+# csb per-branch worktrees (repo root only)
+/.worktrees/
+# per-namespace claude configs / local claude settings (repo root only;
+# NOT templates/home/.claude, which is a shipped seed skeleton)
+/.claude/
+# keep the shipped seed skeleton even if a global excludes ignores .claude
+!/templates/home/.claude/
+# nix build output
+result
