@@ -1388,6 +1388,15 @@ keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
 keep_args=()
 for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 
+# Append /usr/bin to PATH at launch so bare-name lookups resolve system-only
+# tools (pbcopy/pbpaste, osascript). Those are already exec'able by absolute
+# path under the allow-default profile, so this affects name resolution only,
+# not the sandbox boundary. Appended LAST so the devShell's GNU tools keep
+# priority over macOS BSD ones. nix owns PATH and `env` can't append, so mutate
+# it in a shim that execs the real command on.
+# shellcheck disable=SC2016  # $PATH/$@ must expand at shim runtime, not here
+path_shim=(bash -c 'export PATH="${PATH:+$PATH:}/usr/bin"; exec "$@"' csb-path-shim)
+
 # --shell: same worktree/devShell/scrub/HOME/deny-list, but exec an interactive
 # bash (or the args after --) instead of claude. No claude build needed.
 if [[ "$shell" == "true" ]]; then
@@ -1396,10 +1405,10 @@ if [[ "$shell" == "true" ]]; then
   echo "$PROG: shell in the devShell at $worktree (claude's env, no claude)" >&2
   exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
     --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
-      "${deny_wrapper[@]}" "${cmd[@]}"
+      "${deny_wrapper[@]}" "${path_shim[@]}" "${cmd[@]}"
 fi
 
 claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" --no-link --print-out-paths)/bin/claude"
 exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
   --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
-    "${deny_wrapper[@]}" "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"
+    "${deny_wrapper[@]}" "${path_shim[@]}" "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"
