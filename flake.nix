@@ -69,6 +69,20 @@
               export BASH_COMPLETION="${pkgs.bash-completion}/share/bash-completion/bash_completion"
             '';
           };
+
+          # Generic devShell csb falls back to when a consuming repo has no
+          # devShells.default of its own -- a language-agnostic toolset for the
+          # agent (gnu tools shadow macOS's BSD /usr/bin variants; plus common
+          # search/JSON/network staples). Repos wanting a project toolchain add
+          # their own devShells.default (nix flake init -t <csb>).
+          fallback = pkgs.mkShell {
+            packages = with pkgs; [
+              git
+              coreutils gnused gnugrep gawk findutils gnutar   # gnu toolset
+              ripgrep jq curl                                  # agent staples
+              fd less diffutils tree gzip                      # convenience
+            ];
+          };
         });
 
       apps = forAllSystems (system: {

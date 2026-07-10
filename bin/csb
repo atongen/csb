@@ -1252,13 +1252,12 @@ if [[ "$no_launch" == "true" ]]; then
   exit 0
 fi
 
-[[ -f "$worktree/flake.nix" ]] || die "$PROG runs inside the repo's devShell, but there is no flake.nix at $worktree
-  the repo needs its own flake.nix with devShells.default (nix flake init -t $CSB_SELF)"
-
-# flake.nix exists but may lack a devShell for this system. nix flakes ignore
-# UNTRACKED files, so a brand-new flake.nix that hasn't been `git add`ed is
-# invisible here (and to nix develop). Eval it to turn nix develop's cryptic
-# 'does not provide attribute' into real guidance.
+# csb runs inside a devShell. Prefer the repo's own flake devShell; if the repo
+# has none for this system, fall back to a generic devShell from csb's own flake
+# so the sandbox can still run against repos that don't ship a flake. nix flakes
+# ignore UNTRACKED files, so a brand-new flake.nix that hasn't been `git add`ed
+# is invisible to nix develop -- the eval below treats that as "no devShell" and
+# falls back too.
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)              csb_system="aarch64-darwin" ;;
   Darwin-x86_64)             csb_system="x86_64-darwin" ;;
@@ -1266,10 +1265,13 @@ case "$(uname -s)-$(uname -m)" in
   Linux-aarch64|Linux-arm64) csb_system="aarch64-linux" ;;
   *)                         csb_system="" ;;
 esac
-if [[ -n "$csb_system" ]] && \
-   ! nix eval "$worktree#devShells.$csb_system.default.name" >/dev/null 2>&1; then
-  die "flake.nix at $worktree has no devShells.$csb_system.default that $PROG can enter
-  add one (nix flake init -t $CSB_SELF); if it is new, 'git add' it -- nix ignores untracked files"
+devshell_ref="$worktree"
+if [[ ! -f "$worktree/flake.nix" ]] || \
+   { [[ -n "$csb_system" ]] && \
+     ! nix eval "$worktree#devShells.$csb_system.default.name" >/dev/null 2>&1; }; then
+  devshell_ref="$CSB_SELF#fallback"
+  echo "$PROG: no repo devShell at $worktree -- using csb's generic fallback devShell" >&2
+  echo "$PROG: add devShells.default for a project toolchain (nix flake init -t $CSB_SELF; git add flake.nix)" >&2
 fi
 
 setup_namespace "$worktree"
@@ -1403,12 +1405,12 @@ if [[ "$shell" == "true" ]]; then
   cmd=(bash)
   [[ ${#claude_args[@]} -gt 0 ]] && cmd=("${claude_args[@]}")
   echo "$PROG: shell in the devShell at $worktree (claude's env, no claude)" >&2
-  exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
+  exec nix develop "$devshell_ref" --ignore-environment "${keep_args[@]}" \
     --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
       "${deny_wrapper[@]}" "${path_shim[@]}" "${cmd[@]}"
 fi
 
 claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" --no-link --print-out-paths)/bin/claude"
-exec nix develop "$worktree" --ignore-environment "${keep_args[@]}" \
+exec nix develop "$devshell_ref" --ignore-environment "${keep_args[@]}" \
   --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
     "${deny_wrapper[@]}" "${path_shim[@]}" "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"

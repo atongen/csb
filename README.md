@@ -509,17 +509,19 @@ order of leverage:
 
 ## What a repo needs
 
-Nothing csb-specific -- just a standard `flake.nix` exposing `devShells.default`
-(the repo's full toolchain). Scaffold a minimal standalone dev flake with:
+Nothing. If the repo has no `flake.nix` (or one without a `devShells.default`
+for your system), csb falls back to a generic devShell from its own flake so the
+sandbox still runs, logging a note on launch. nix ignores untracked files, so a
+brand-new `flake.nix` counts as absent until you `git add` it -- csb falls back
+in that case too.
+
+For a project-specific toolchain, expose a standard `flake.nix` with
+`devShells.default` (the repo's full toolchain); csb prefers it over the
+fallback. Scaffold a minimal standalone dev flake with:
 
 ```sh
 nix flake init -t git+ssh://git@git.grandrew.com/atongen/csb.git
 ```
-
-If `flake.nix` is missing, or present but without a
-`devShells.default` for your system, csb fails fast with guidance before
-launching. nix ignores untracked files, so `git add` a brand-new `flake.nix`
-before running.
 
 csb dogfoods itself: its own `flake.nix` exposes a `devShells.default` (git +
 shellcheck), so `csb --here` runs claude on the csb repo like any other.
