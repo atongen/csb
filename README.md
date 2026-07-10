@@ -385,6 +385,57 @@ stays readable -- e.g. a `~/src -> /Volumes/src` symlink resolves to a path that
 paranoid never fences. Wall such trees off with `paranoid_deny=` (below); the
 write-allow roots are re-allowed on top, so the active worktree stays readable.
 
+### `--paranoid`: ancestor traversal and what it leaks
+
+A re-allowed subtree usually sits *below* a denied root -- the worktree beneath
+the real HOME (when repos live under `$HOME`) or beneath a `paranoid_deny=` root
+(when the code tree lives outside `$HOME`, e.g. on a separate volume), and the
+namespace beneath the denied `~/.csb/claudes`. Reaching it means traversing the
+denied ancestor directories in between, which per-component path resolution does
+constantly: canonicalizing a path `lstat`s every component, and a directory glob
+`opendir`s each -- so a fully denied ancestor makes the operation fail with
+`EPERM` even though the target file is allowed. csb re-allows just enough of the ancestor
+chain (each ancestor by `literal`, up to the first one under no deny root) for
+traversal to pass through. Two chains get two levels of access:
+
+- **worktree / write-root chain**: ancestors are made *listable* (`opendir`),
+  because tools routinely scan upward for a project root or config file.
+- **namespace / HOME chain**: ancestors are `lstat`-only (**not** listable), so
+  your home directory and other namespaces cannot be enumerated.
+
+#### paranoid guarantee (and its bound)
+
+`--paranoid` guarantees the sandbox **cannot read file *contents* outside the
+allow-list**. It does **not** hide the *existence and entry names* of the
+directories on the worktree's own ancestor path. Concretely, for a worktree at
+`<root>/<org>/<repo>`, the sandbox can `ls` `<root>` and `<root>/<org>` and the
+other directories up the chain -- learning the names of neighbouring entries
+(sibling repos, orgs, mount points) -- but **cannot open any file inside a
+sibling, nor list a sibling's own contents**. Names/structure along the one
+ancestor path leak; data never does.
+
+This is a deliberate, bounded weakening (chosen so ancestor-scanning tools work
+under `--paranoid` without a per-syscall exception for each one). If your threat
+model requires that even the *names* of neighbouring repos stay hidden, run those
+tools without `--paranoid` -- the read deny-list still blocks every credential --
+and reserve `--paranoid` for when sibling-*data* isolation is the point.
+
+**Platform asymmetry.** On Linux the sandbox binds the worktree over a tmpfs, so
+its ancestors appear *empty* -- traversal works and no sibling names leak. macOS
+seatbelt cannot present a directory as empty (only allow or deny), so restoring
+traversal necessarily exposes the real ancestor listings. The name leak is
+therefore macOS-only.
+
+**What leaks depends on where the code lives.** The listing follows the
+worktree's *physical* ancestor chain. If repos live under `$HOME`, that chain
+runs through your home directory, so its entry names -- including which dotfiles
+and credential *directories* exist -- become listable (contents still denied). If
+the code tree instead lives outside `$HOME` (e.g. on a separate volume fenced
+with `paranoid_deny=`), only the code-tree names leak and `$HOME` is reached
+solely via the metadata-only namespace chain, so it stays un-listable. A symlink
+out of `$HOME` resolves to its physical target, so it is the physical location,
+not the symlinked path, that determines what leaks.
+
 ### Machine config
 
 `${XDG_CONFIG_HOME:-~/.config}/csb/config` -- `KEY=VALUE` lines. A gitignored
@@ -427,6 +478,11 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   anticipate) is readable. A read allow-list would close this but breaks
   interactive toolchains pervasively; `--paranoid` is the opt-in whitelist escape
   hatch. Add paths to `~/.config/csb/deny` as you find them.
+- **paranoid leaks ancestor names (macOS).** To let path-walking tools reach a
+  worktree nested under a denied root, `--paranoid` makes the worktree's ancestor
+  directories listable -- so sibling volume/host/org/repo *names* on that one path
+  are visible, though sibling *contents* stay denied. Bounded by design; see
+  [`--paranoid`: ancestor traversal and what it leaks](#--paranoid-ancestor-traversal-and-what-it-leaks).
 - **Host-side trust.** All `nix` eval/build/develop, the repo's
   `flake.nix`/`shellHook`, and `.worktreesetup.sh` run on the host,
   **unsandboxed**. Only the final claude/bash process is wrapped. Don't point csb

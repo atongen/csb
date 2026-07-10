@@ -1,5 +1,9 @@
 # TODO
 
+## misc
+
+- [ ] allow copy&paste from within a sandbox
+
 ## Resume here (dogfooding csb-on-csb)
 
 State as of the last session (all UNCOMMITTED in the working tree):

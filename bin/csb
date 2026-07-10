@@ -576,6 +576,34 @@ build_write_roots() {
   done
 }
 
+# macOS seatbelt: re-allow traversal of the DENIED ancestor directories of $1,
+# walking parent-ward and stopping at the first ancestor under no deny root
+# (above that they are already reachable). A subtree re-allowed beneath a denied
+# root is unreachable otherwise: per-component path resolution -- canonicalizing a
+# path lstats every component, a directory glob opendirs each -- hits the first
+# denied ancestor and fails with EPERM even when the target itself is allowed.
+# $2 is the seatbelt op class granted on each ancestor: default file-read-metadata
+# (lstat only), or file-read* to also permit opendir/listing (needed by tools
+# that scan ancestors upward for a project root or config). `literal` scopes each
+# allow to exactly that ancestor dir, so siblings under it stay denied -- listing
+# an ancestor leaks only its immediate entry NAMES, never their contents (see
+# README, "paranoid guarantee"). Reads the caller's deny_subpaths array (bash
+# dynamic scope); emitted AFTER the deny rules so the later allow wins. Repeated
+# allows across roots are idempotent in seatbelt.
+emit_ancestor_metadata() {
+  local p d under class="${2:-file-read-metadata}"
+  p=$(dirname "$1")
+  while [[ "$p" != "/" ]]; do
+    under="false"
+    for d in "${deny_subpaths[@]+"${deny_subpaths[@]}"}"; do
+      if [[ "$p" == "$d" || "$p" == "$d"/* ]]; then under="true"; break; fi
+    done
+    [[ "$under" == "true" ]] || break
+    printf '(allow %s (literal "%s"))\n' "$class" "$p"
+    p=$(dirname "$p")
+  done
+}
+
 # Assemble the global deny_wrapper argv that wraps the innermost command:
 #   darwin -> (/usr/bin/sandbox-exec -f <generated profile>)
 #   linux  -> (<store bwrap> --ro-bind / / ... --)
@@ -611,6 +639,16 @@ build_deny_wrapper() {
   [[ -d "$gc_real/hooks" ]] && hooks_deny="$gc_real/hooks"
   [[ -f "$gc_real/config" ]] && config_deny="$gc_real/config"
 
+  # Deny roots whose interior a per-component path resolver must still traverse
+  # (metadata-only) to reach a re-allowed subtree beneath them: the dir-form
+  # deny-list always, plus the real HOME and paranoid_deny roots under
+  # --paranoid. Consumed by emit_ancestor_metadata (macOS seatbelt only; Linux
+  # bwrap materializes the ancestors as tmpfs dirs when it binds the subtree).
+  local -a deny_subpaths=("${deny_dirs[@]+"${deny_dirs[@]}"}")
+  if [[ "$paranoid" == "true" ]]; then
+    deny_subpaths+=("$real_home" "${paranoid_deny_roots[@]+"${paranoid_deny_roots[@]}"}")
+  fi
+
   case "$(uname -s)" in
     Darwin)
       local profile p
@@ -635,13 +673,19 @@ build_deny_wrapper() {
           done
           for p in "${write_roots[@]+"${write_roots[@]}"}"; do
             printf '(allow file-read* (subpath "%s"))\n' "$p"
+            # List (not just stat) the write-root's denied ancestors so upward
+            # ancestor scans resolve; leaks ancestor entry NAMES only (README).
+            emit_ancestor_metadata "$p" 'file-read*'
           done
           # matching-class read re-allow: a later file* allow does not override an
           # earlier file-read* deny in seatbelt (the namespace file* allow below).
           [[ -n "$ns_real" ]] && printf '(allow file-read* (subpath "%s"))\n' "$ns_real"
         fi
+        # The active namespace is re-allowed under the denied ~/.csb/claudes
+        # parent in BOTH modes, so restore ancestor traversal unconditionally.
         if [[ -n "$ns_real" ]]; then
           printf '(allow file* (subpath "%s"))\n' "$ns_real"
+          emit_ancestor_metadata "$ns_real"
         fi
         # WRITE policy: allow-list.
         echo "(deny file-write*)"
