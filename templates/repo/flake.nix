@@ -21,6 +21,7 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               git
+              jq  # lets a seeded claude statusline parse the session JSON
               # <-- add your toolchain here (ruby, nodejs, cargo, …) and any
               #     native-build/runtime deps + lib-path env in a shellHook.
             ];

@@ -77,10 +77,15 @@ OPTIONS:
                      home; also via a profile's seed_home=.
       --reseed       when seeding the launch HOME from the template, overwrite
                      existing files instead of keeping them (default: keep).
+      --accent COLOR tint the statusline repo name so profiles are tellable at
+                     a glance (e.g. personal vs work). COLOR is a name (red,
+                     green, yellow, blue, magenta, cyan, white, gray, or a
+                     bright-* variant) or raw ANSI SGR params (38;5;208).
+                     Also via a profile's accent=.
   -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
                      (ns=, token_cmd=, aws_profile=, latest=, yolo=, paranoid=,
-                     here=, ephemeral=, shell=, seed_creds=, seed_home=, args=,
-                     keep=, setenv=).
+                     here=, ephemeral=, shell=, seed_creds=, seed_home=, accent=,
+                     args=, keep=, setenv=).
                      Optional [shared]/[claude]/[shell] sections let one file
                      serve both modes ([claude] applies to claude launches,
                      [shell] under -s; top-of-file lines are shared).
@@ -359,6 +364,7 @@ setup_namespace() {
   ns_dir=""
 
   if [[ "$ephemeral" == "true" ]]; then
+    csb_ephemeral="true"
     export CSB_CLAUDE_CONFIG_DIR=""
     echo "$PROG: namespace: ephemeral  (throwaway config)" >&2
     return
@@ -376,6 +382,7 @@ setup_namespace() {
   else
     ns=$(encode_branch "$branch")
   fi
+  csb_ns="$ns"
 
   # HOME redirects to <ns>, so the config dir is <ns>/.claude (coincides with
   # claude's default $HOME/.claude). @NAME (explicit --ns only) is unscoped --
@@ -840,6 +847,7 @@ apply_profile_line() {
       # shellcheck disable=SC2088  # a LITERAL leading ~/ is the config syntax
       case "$val" in "~/"*) val="$HOME/${val#\~/}" ;; esac
       p_seed_home="$val" ;;
+    accent)      p_accent="$val" ;;
     args)        p_args="$val" ;;
     keep)        p_keep+=" $val" ;;
     setenv)
@@ -847,7 +855,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, aws_profile, latest, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, args, keep, setenv)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, aws_profile, latest, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv)" ;;
   esac
 }
 
@@ -863,7 +871,7 @@ load_profile() {
   local override="$base.local"
   [[ -f "$base" ]] || die "profile not found: $base"
   local p_ns="" p_aws="" p_latest="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
-        p_seed_creds="" p_seed_home="" p_args="" p_keep="" p_mode_shell="" v entry
+        p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" p_mode_shell="" v entry
   local -a keep_list=() shared_lines=() claude_lines=() shell_lines=()
 
   # Read the committed base profile, then the optional gitignored <name>.local
@@ -971,6 +979,9 @@ load_profile() {
   if [[ -n "$p_seed_home" && -z "$seed_home" ]]; then
     seed_home="$p_seed_home"
   fi
+  if [[ -n "$p_accent" && "$accent_cli" != "true" ]]; then
+    accent="$p_accent"
+  fi
   if [[ -n "$p_args" && "$claude_args_cli" != "true" ]]; then
     local -a args_words=()
     local w
@@ -1067,12 +1078,15 @@ reseed="false"      # --reseed: overwrite existing files when seeding the HOME
 cfg_tmpdir=""
 cfg_paranoid_deny=()  # config paranoid_deny=: extra --paranoid read-deny roots
 seed_home=""        # --seed-home / profile seed_home=; empty -> ~/.config/csb/home
+accent="";          accent_cli="false"  # --accent / profile accent=; statusline tint
 branch=""
 claude_args=()
 extra_keep=()
 profile_setenv=()
 aws_env=()
 ns_dir=""
+csb_ns=""            # resolved namespace name (empty for ephemeral)
+csb_ephemeral="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1096,6 +1110,8 @@ while [[ $# -gt 0 ]]; do
     --seed-creds) seed_creds="true"; seed_creds_cli="true"; shift ;;
     --no-seed-creds) seed_creds="false"; seed_creds_cli="true"; shift ;;
     --seed-home) [[ $# -ge 2 ]] || die "--seed-home requires a DIR"; seed_home="$2"; shift 2 ;;
+    --accent) [[ $# -ge 2 ]] || die "--accent requires a COLOR"; accent="$2"; accent_cli="true"; shift 2 ;;
+    --no-accent) accent=""; accent_cli="true"; shift ;;
     --reseed) reseed="true"; shift ;;
     -k|--keep)
       [[ $# -ge 2 ]] || die "--keep requires a VAR name"
@@ -1139,6 +1155,20 @@ fi
 if [[ -n "$namespace" ]]; then
   [[ "$namespace" =~ ^@?[A-Za-z0-9._-]+$ && "$namespace" != "." && "$namespace" != ".." ]] \
     || die "invalid namespace '$namespace' (use letters, digits, . _ -; optional leading @)"
+fi
+
+# Accent: a statusline tint, passed through as CSB_ACCENT. Accept a known color
+# name or a raw ANSI SGR parameter string (38;5;208), nothing else -- so no
+# arbitrary bytes reach the escape sequence the statusline builds, and an unknown
+# name fails here instead of silently not tinting. The name set mirrors the map
+# in templates/home/.claude/statusline.sh.
+if [[ -n "$accent" ]]; then
+  case "$accent" in
+    black|red|green|yellow|blue|magenta|cyan|white|gray|grey|\
+    bright-red|bright-green|bright-yellow|bright-blue|bright-magenta|bright-cyan|bright-white) ;;
+    *) [[ "$accent" =~ ^[0-9]+(;[0-9]+)*$ ]] \
+         || die "invalid --accent '$accent' (a color name like magenta, or ANSI SGR params like 38;5;208)" ;;
+  esac
 fi
 
 if [[ "$yolo" == "true" ]]; then
@@ -1367,6 +1397,20 @@ fi
 # the repo file when both set a var — later `env` args win).
 env_overrides+=("${profile_setenv[@]+"${profile_setenv[@]}"}")
 env_overrides+=("${aws_env[@]+"${aws_env[@]}"}")
+
+# csb's own launch state, for the sandboxed process to surface (a statusline
+# script, a prompt): these csb concepts have no representation in claude's env
+# or status JSON. Authoritative, so appended last (they win a name collision).
+csb_mode="worktree"; [[ "$here" == "true" ]] && csb_mode="here"
+env_overrides+=(
+  "CSB_PROFILE=$profile_name"
+  "CSB_NS=$csb_ns"
+  "CSB_EPHEMERAL=$csb_ephemeral"
+  "CSB_MODE=$csb_mode"
+  "CSB_YOLO=$yolo"
+  "CSB_PARANOID=$paranoid"
+  "CSB_ACCENT=$accent"
+)
 
 # The deny-list wraps the innermost command only; nix eval/build/develop above
 # and below run host-side with the real HOME, unrestricted.

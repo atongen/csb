@@ -5,7 +5,7 @@
 #
 #   make install                      # copy bin/csb into ~/bin
 #   make install BIN_DIR=~/.local/bin # ...or elsewhere
-#   make check                        # shellcheck bin/csb
+#   make check                        # shellcheck the shell scripts
 #
 # `check`/`build` prefer a tool already on PATH and fall back to csb's own
 # devShell (nix develop), so they work with only Nix installed.
@@ -36,11 +36,13 @@ uninstall: ## Remove csb from BIN_DIR
 	@rm -f "$(DEST)"
 	@echo "uninstall: removed $(DEST)"
 
-check: ## Lint bin/csb with shellcheck
+SHELLSCRIPTS := bin/csb templates/home/.claude/statusline.sh
+
+check: ## Lint the shell scripts with shellcheck
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck bin/csb; \
+		shellcheck $(SHELLSCRIPTS); \
 	else \
-		nix develop --command shellcheck bin/csb; \
+		nix develop --command shellcheck $(SHELLSCRIPTS); \
 	fi
 	@echo "check: shellcheck clean"
 

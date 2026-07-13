@@ -55,6 +55,7 @@
               pkgs.git
               pkgs.neovim            # editor for interactive shell work
               pkgs.shellcheck
+              pkgs.jq                # statusline template parses claude's session JSON
               pkgs.bashInteractive   # `complete`/readline — mkShell's default bash lacks progcomp
               pkgs.bash-completion   # programmable Tab completion (git, etc.)
             ];
