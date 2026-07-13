@@ -10,6 +10,9 @@
 # Env: CSB_SELF   flake ref csb pulls the claude binary from (default: the
 #                 self-hosted remote; override with CSB_SELF=path:/path/to/csb).
 #      CSB_LATEST non-empty defaults -L/--latest on.
+#      CSB_LATEST_TTL seconds to reuse a cached upstream claude-code rev under
+#                 -L/--latest before re-checking (default 86400 = daily; 0 =
+#                 check every run).
 
 set -euo pipefail
 
@@ -23,6 +26,7 @@ CSB_SELF="${CSB_SELF:-git+ssh://git@git.grandrew.com/atongen/csb.git}"
 
 CSB_NS_ROOT="$HOME/.csb/claudes"
 CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"
+CSB_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/csb"
 
 usage() {
   cat <<EOF
@@ -103,10 +107,11 @@ OPTIONS:
   -n, --no-launch    prepare/reuse the worktree (incl. .worktreeinclude and
                      .worktreesetup.sh) and exit; prints the worktree path
   -L, --latest       get the very latest claude: re-lock the claude-code flake
-                     input to its upstream HEAD for this run (bypassing the
-                     committed flake.lock) and refresh nix's flake cache.
-                     Trades reproducibility for always-newest. Default via
-                     CSB_LATEST=1.
+                     input to its upstream HEAD (bypassing the committed
+                     flake.lock). The upstream rev is checked at most once per
+                     CSB_LATEST_TTL seconds (default daily) and cached, then
+                     pinned so the rest of the day is fully cached. Trades
+                     reproducibility for always-newest. Default via CSB_LATEST=1.
   -d, --delete       delete mode: remove BRANCH's worktree AND its namespace
                      config under ~/.csb/claudes (keeps the branch itself).
                      Pass the same --ns you launched with; without it, -d only
@@ -117,6 +122,33 @@ EOF
 }
 
 die() { echo "$PROG: $*" >&2; exit 1; }
+
+# --- --latest upstream rev cache ----------------------------------------------
+
+CSB_CLAUDE_FLAKE="github:sadjow/claude-code-nix"
+
+# Resolve claude-code's upstream HEAD commit, re-checking at most once per
+# CSB_LATEST_TTL seconds (0 = every run) and caching <epoch> <sha> in
+# CSB_CACHE_DIR. Pinning the override to this concrete rev keeps subsequent
+# same-day launches fully cached (no fetch) and reproducible within the window.
+latest_claude_rev() {
+  local cache="$CSB_CACHE_DIR/latest-claude-rev" \
+        ttl="${CSB_LATEST_TTL:-86400}" now stamp sha
+  now="$(date +%s)"
+  if [[ "$ttl" -gt 0 && -f "$cache" ]]; then
+    read -r stamp sha <"$cache" || true
+    if [[ "$stamp" =~ ^[0-9]+$ && -n "$sha" && $((now - stamp)) -lt "$ttl" ]]; then
+      echo "$PROG: --latest: using cached upstream rev ${sha:0:12}" >&2
+      echo "$sha"; return
+    fi
+  fi
+  sha="$(git ls-remote "https://github.com/${CSB_CLAUDE_FLAKE#github:}" HEAD | cut -f1)"
+  [[ -n "$sha" ]] || die "--latest: could not resolve upstream HEAD of $CSB_CLAUDE_FLAKE"
+  mkdir -p "$CSB_CACHE_DIR"
+  printf '%s %s\n' "$now" "$sha" >"$cache"
+  echo "$PROG: --latest: checked upstream HEAD -> ${sha:0:12}" >&2
+  echo "$sha"
+}
 
 # --- git / worktree helpers ---------------------------------------------------
 
@@ -1311,16 +1343,16 @@ cd "$worktree"
 # Git identity for the agent's commits (see the helper).
 export_git_identity
 
-# -L/--latest: re-lock the claude-code input to its upstream HEAD for this run
-# and refresh nix's flake cache so it re-fetches, instead of using the
-# claude-code rev pinned in CSB_SELF's committed flake.lock. This defeats the
-# lock (and nix's ~1h tarball cache) to give the newest claude at the cost of
-# reproducibility + a fetch/eval on launch. Empty array = use the lock as-is.
+# -L/--latest: re-lock the claude-code input to a concrete upstream rev (checked
+# at most once per CSB_LATEST_TTL, see latest_claude_rev), instead of the rev
+# pinned in CSB_SELF's committed flake.lock. This defeats the lock to give the
+# newest claude at the cost of reproducibility; pinning a concrete rev keeps
+# nix's fetch cached across same-day launches. Empty array = use the lock as-is.
 # The input name must match flake.nix's inputs.claude-code.
 nix_latest_args=()
 if [[ "$latest" == "true" ]]; then
-  nix_latest_args=(--override-input claude-code github:sadjow/claude-code-nix --refresh)
-  echo "$PROG: --latest: re-locking claude-code to upstream HEAD (ignoring flake.lock pin)" >&2
+  claude_rev="$(latest_claude_rev)"
+  nix_latest_args=(--override-input claude-code "$CSB_CLAUDE_FLAKE/$claude_rev")
 fi
 
 # Per-namespace HOME/config for the *launched* process only, injected via an

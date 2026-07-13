@@ -124,30 +124,18 @@ fi
 
 # --- right: claude runtime ----------------------------------------------------
 right="${CYAN}${MODEL:-?}${RESET}"
-[ -n "$CTX" ]  && right="$right | $(pct_color "$CTX")ctx ${CTX}%${RESET}"
-[ -n "$COST" ] && right="$right | $(printf '$%.2f' "$COST" 2>/dev/null || printf '$?.??')"
+[ -n "$CTX" ]  && right="$right $(pct_color "$CTX")ctx:${CTX}%${RESET}"
+[ -n "$COST" ] && right="$right $(printf '$%.2f' "$COST" 2>/dev/null || printf '$?.??')"
 rl=""
-if [ -n "$RL5" ]; then i=$(printf '%.0f' "$RL5"); rl="$(pct_color "$i")5h ${i}%${RESET}"; fi
-if [ -n "$RL7" ]; then i=$(printf '%.0f' "$RL7"); rl="${rl:+$rl }$(pct_color "$i")7d ${i}%${RESET}"; fi
-[ -n "$rl" ] && right="$right | $rl"
+if [ -n "$RL5" ]; then i=$(printf '%.0f' "$RL5"); rl="$(pct_color "$i")5h:${i}%${RESET}"; fi
+if [ -n "$RL7" ]; then i=$(printf '%.0f' "$RL7"); rl="${rl:+$rl }$(pct_color "$i")7d:${i}%${RESET}"; fi
+[ -n "$rl" ] && right="$right $rl"
 
-# --- one row: identity left, runtime right-aligned to COLUMNS -----------------
-# Claude Code sets COLUMNS to the terminal width (v2.1.153+). Measure the
-# VISIBLE width (color codes stripped) so the pad lands the runtime at the right
-# edge; fall back to a space-joined single row when the width is unknown or too
-# narrow to right-align without overlap.
-vislen() {
-  local esc plain
-  esc=$(printf '\033')
-  plain=$(printf '%b' "$1" | sed "s/${esc}\[[0-9;]*m//g")
-  printf '%s' "${#plain}"
-}
-cols="${COLUMNS:-0}"
-lw=$(vislen "$left")
-rw=$(vislen "$right")
-if [ "$cols" -gt 0 ] && [ $((lw + rw + 1)) -le "$cols" ]; then
-  printf -v gap '%*s' "$((cols - lw - rw))" ''
-  printf '%b\n' "${left}${gap}${right}"
-else
-  printf '%b\n' "${left}  ${right}"
-fi
+# --- one row: identity, then runtime, joined by a pipe ------------------------
+# Space-delimits fields within each group; a pipe separates the two groups. No
+# right-alignment: the only width signal available to a statusline subprocess is
+# COLUMNS, and when it overstates the pane (stale on first render, and never
+# corrected in API-OAuth-token sessions) a right-aligned runtime block is padded
+# past the true edge and truncated to a fragment. A fixed join stays fully
+# visible regardless of what COLUMNS reports.
+printf '%b\n' "${left} | ${right}"
