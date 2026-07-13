@@ -13,6 +13,8 @@
 #      CSB_LATEST_TTL seconds to reuse a cached upstream claude-code rev under
 #                 -L/--latest before re-checking (default 86400 = daily; 0 =
 #                 check every run).
+#      CSB_VERBOSE non-empty defaults -v/--verbose on (launches are otherwise
+#                 quiet: routine status + nix progress suppressed).
 
 set -euo pipefail
 
@@ -87,18 +89,19 @@ OPTIONS:
                      bright-* variant) or raw ANSI SGR params (38;5;208).
                      Also via a profile's accent=.
   -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
-                     (ns=, token_cmd=, aws_profile=, latest=, yolo=, paranoid=,
-                     here=, ephemeral=, shell=, seed_creds=, seed_home=, accent=,
-                     args=, keep=, setenv=).
+                     (ns=, token_cmd=, aws_profile=, latest=, verbose=, yolo=,
+                     paranoid=, here=, ephemeral=, shell=, seed_creds=,
+                     seed_home=, accent=, args=, keep=, setenv=).
                      Optional [shared]/[claude]/[shell] sections let one file
                      serve both modes ([claude] applies to claude launches,
                      [shell] under -s; top-of-file lines are shared).
                      A gitignored NAME.local is layered on top for host-specific
                      values (its values win). Explicit CLI flags beat both.
       --no-yolo, --no-paranoid, --no-here, --no-shell, --no-ephemeral,
-      --no-latest, --no-seed-creds
+      --no-latest, --no-verbose, --no-seed-creds
                      negate the corresponding option, overriding a profile
-                     (or, for latest, the CSB_LATEST env) default for one run
+                     (or, for latest/verbose, the CSB_LATEST/CSB_VERBOSE env)
+                     default for one run
       --aws PROFILE  fetch short-lived credentials for aws profile PROFILE
                      host-side (aws configure export-credentials, with an sso
                      device-code login fallback) and inject them into the
@@ -116,12 +119,21 @@ OPTIONS:
                      config under ~/.csb/claudes (keeps the branch itself).
                      Pass the same --ns you launched with; without it, -d only
                      removes the branch-derived namespace.
+  -v, --verbose      restore csb's routine status narration and nix's own build
+                     output (evaluating/downloading progress). Launches are quiet
+                     by default; warnings and errors always print. Default via
+                     CSB_VERBOSE=1.
   -h, --help         show this help
   -V, --version      print the version and exit
 EOF
 }
 
 die() { echo "$PROG: $*" >&2; exit 1; }
+
+# Verbose-only narration. Launches are quiet by default (routine status lines and
+# nix's own progress are suppressed); -v/--verbose (or CSB_VERBOSE) restores them.
+# Warnings, errors (die), and command results always print regardless.
+vecho() { if [[ "$verbose" == "true" ]]; then echo "$@" >&2; fi; }
 
 # --- --latest upstream rev cache ----------------------------------------------
 
@@ -138,7 +150,7 @@ latest_claude_rev() {
   if [[ "$ttl" -gt 0 && -f "$cache" ]]; then
     read -r stamp sha <"$cache" || true
     if [[ "$stamp" =~ ^[0-9]+$ && -n "$sha" && $((now - stamp)) -lt "$ttl" ]]; then
-      echo "$PROG: --latest: using cached upstream rev ${sha:0:12}" >&2
+      vecho "$PROG: --latest: using cached upstream rev ${sha:0:12}"
       echo "$sha"; return
     fi
   fi
@@ -146,7 +158,7 @@ latest_claude_rev() {
   [[ -n "$sha" ]] || die "--latest: could not resolve upstream HEAD of $CSB_CLAUDE_FLAKE"
   mkdir -p "$CSB_CACHE_DIR"
   printf '%s %s\n' "$now" "$sha" >"$cache"
-  echo "$PROG: --latest: checked upstream HEAD -> ${sha:0:12}" >&2
+  vecho "$PROG: --latest: checked upstream HEAD -> ${sha:0:12}"
   echo "$sha"
 }
 
@@ -257,7 +269,7 @@ process_worktreeinclude() {
   done < <(git -C "$repo_root" ls-files --others -i --exclude-from="$include_file")
 
   if (( count > 0 )); then
-    echo "$PROG: copied $count file(s) into worktree per .worktreeinclude" >&2
+    vecho "$PROG: copied $count file(s) into worktree per .worktreeinclude"
   fi
 }
 
@@ -275,7 +287,7 @@ process_worktreesetup() {
     echo "  (chmod +x it to have csb run it)" >&2
     return 0
   fi
-  echo "$PROG: running .worktreesetup.sh $branch" >&2
+  vecho "$PROG: running .worktreesetup.sh $branch"
   local rc=0
   ( cd "$wt_path" && "$setup" "$branch" ) || rc=$?
   if (( rc != 0 )); then
@@ -372,14 +384,14 @@ seed_home_template() {
     fi
     mkdir -p "$(dirname "$target")"
     cp -p "$src" "$target"
-    echo "$PROG: $action HOME/$rel" >&2
+    vecho "$PROG: $action HOME/$rel"
     count=$((count + 1))
   done < <(find "$tmpl" -mindepth 1 -type f -print0)
   # NB: an `if` block (not `(( count > 0 )) && echo`) so the function returns 0
   # when nothing was copied — under `set -e`, a trailing `&&` that short-circuits
   # would make this bare call abort csb on every no-op (re)launch.
   if (( count > 0 )); then
-    echo "$PROG: seeded $count file(s) into HOME from $tmpl" >&2
+    vecho "$PROG: seeded $count file(s) into HOME from $tmpl"
   fi
 }
 
@@ -398,7 +410,7 @@ setup_namespace() {
   if [[ "$ephemeral" == "true" ]]; then
     csb_ephemeral="true"
     export CSB_CLAUDE_CONFIG_DIR=""
-    echo "$PROG: namespace: ephemeral  (throwaway config)" >&2
+    vecho "$PROG: namespace: ephemeral  (throwaway config)"
     return
   fi
 
@@ -424,13 +436,13 @@ setup_namespace() {
     ns_dir="$CSB_NS_ROOT/$ns"
     mkdir -p "$ns_dir/.claude"
     export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
-    echo "$PROG: namespace: $ns  (persistent, shared across repos: $ns_dir)" >&2
+    vecho "$PROG: namespace: $ns  (persistent, shared across repos: $ns_dir)"
     return
   fi
   ns_dir="$CSB_NS_ROOT/$ns_repo_key/$ns"
   mkdir -p "$ns_dir/.claude"
   export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
-  echo "$PROG: namespace: $ns  (persistent: $ns_dir)" >&2
+  vecho "$PROG: namespace: $ns  (persistent: $ns_dir)"
 }
 
 # --- deny-list / write policy -----------------------------------------------------
@@ -746,7 +758,7 @@ build_deny_wrapper() {
       # processes are invisible and unsignalable. No --unshare-net /
       # --unshare-ipc: open host access is a requirement.
       local bwrap_bin p
-      bwrap_bin="$(nix build "$CSB_SELF#bwrap" --no-link --print-out-paths)/bin/bwrap"
+      bwrap_bin="$(nix build "$CSB_SELF#bwrap" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/bwrap"
       deny_wrapper=("$bwrap_bin" --ro-bind / / --dev-bind /dev /dev --proc /proc
                     --unshare-pid --die-with-parent)
       # PARANOID reads: blank the real HOME; the write-root binds below (and the
@@ -848,7 +860,7 @@ seed_credentials() {
     (umask 077; cp "$src" "$dir/.credentials.json")
     chmod 600 "$dir/.credentials.json"
   fi
-  echo "$PROG: seeded host session credentials into the launch config" >&2
+  vecho "$PROG: seeded host session credentials into the launch config"
 }
 
 # Validate a true|false profile value.
@@ -870,6 +882,7 @@ apply_profile_line() {
     token_cmd)   token_cmd="$val" ;;
     aws_profile) p_aws="$val" ;;
     latest)      profile_bool latest    "$val" "$f:$lineno"; p_latest="$val" ;;
+    verbose)     profile_bool verbose   "$val" "$f:$lineno"; p_verbose="$val" ;;
     yolo)        profile_bool yolo      "$val" "$f:$lineno"; p_yolo="$val" ;;
     paranoid)    profile_bool paranoid  "$val" "$f:$lineno"; p_paranoid="$val" ;;
     here)        profile_bool here      "$val" "$f:$lineno"; p_here="$val" ;;
@@ -887,7 +900,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, aws_profile, latest, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, aws_profile, latest, verbose, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv)" ;;
   esac
 }
 
@@ -902,7 +915,7 @@ load_profile() {
   local base="$CSB_CONFIG_DIR/profiles/$profile_name"
   local override="$base.local"
   [[ -f "$base" ]] || die "profile not found: $base"
-  local p_ns="" p_aws="" p_latest="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
+  local p_ns="" p_aws="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
         p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" p_mode_shell="" v entry
   local -a keep_list=() shared_lines=() claude_lines=() shell_lines=()
 
@@ -990,6 +1003,9 @@ load_profile() {
   if [[ -n "$p_latest" && "$latest_cli" != "true" ]]; then
     latest="$p_latest"
   fi
+  if [[ -n "$p_verbose" && "$verbose_cli" != "true" ]]; then
+    verbose="$p_verbose"
+  fi
   if [[ -n "$p_yolo" && "$yolo_cli" != "true" ]]; then
     yolo="$p_yolo"
   fi
@@ -1034,9 +1050,9 @@ load_profile() {
     extra_keep+=("$v")
   done
   if [[ -f "$override" ]]; then
-    echo "$PROG: profile: $profile_name (+ $profile_name.local)" >&2
+    vecho "$PROG: profile: $profile_name (+ $profile_name.local)"
   else
-    echo "$PROG: profile: $profile_name" >&2
+    vecho "$PROG: profile: $profile_name"
   fi
 }
 
@@ -1084,7 +1100,7 @@ fetch_aws_creds() {
   fi
   # Role creds live ~1h and do NOT refresh inside a running session; make
   # staleness visible at launch.
-  echo "$PROG: aws credentials for '$aws_profile'${expiry:+ (expire: $expiry)}" >&2
+  vecho "$PROG: aws credentials for '$aws_profile'${expiry:+ (expire: $expiry)}"
 }
 
 # --- argument parsing -----------------------------------------------------------
@@ -1105,6 +1121,8 @@ ephemeral="false";  ephemeral_cli="false"
 seed_creds="false"; seed_creds_cli="false"
 latest="false";     latest_cli="false"
 [[ -n "${CSB_LATEST:-}" ]] && latest="true"
+verbose="false";   verbose_cli="false"
+[[ -n "${CSB_VERBOSE:-}" ]] && verbose="true"
 claude_args_cli="false"
 reseed="false"      # --reseed: overwrite existing files when seeding the HOME
 cfg_tmpdir=""
@@ -1139,6 +1157,8 @@ while [[ $# -gt 0 ]]; do
     --no-ephemeral) ephemeral="false"; ephemeral_cli="true"; shift ;;
     -L|--latest) latest="true"; latest_cli="true"; shift ;;
     --no-latest) latest="false"; latest_cli="true"; shift ;;
+    -v|--verbose) verbose="true"; verbose_cli="true"; shift ;;
+    --no-verbose) verbose="false"; verbose_cli="true"; shift ;;
     --seed-creds) seed_creds="true"; seed_creds_cli="true"; shift ;;
     --no-seed-creds) seed_creds="false"; seed_creds_cli="true"; shift ;;
     --seed-home) [[ $# -ge 2 ]] || die "--seed-home requires a DIR"; seed_home="$2"; shift 2 ;;
@@ -1180,6 +1200,11 @@ load_config
 if [[ -n "$profile_name" ]]; then
   load_profile
 fi
+
+# Quiet nix's own progress/eval output unless verbose. Computed AFTER the profile
+# load so a profile verbose= (or -v/CSB_VERBOSE) governs it. Expanded into every
+# host-side nix build/develop below via the safe empty-array pattern.
+nix_quiet=(); [[ "$verbose" == "true" ]] || nix_quiet=(--quiet)
 
 # Validate the namespace name: named namespaces become a directory under
 # ~/.csb/claudes. A leading @ marks a deliberately unscoped (cross-repo shared)
@@ -1373,7 +1398,7 @@ else
   claude_home="$(mktemp -d "${cfg_tmpdir:-${TMPDIR:-/tmp}}/csb-home.XXXXXX")"
   env_overrides=("HOME=$claude_home")
   claude_json="$claude_home/.claude.json"
-  echo "$PROG: ephemeral HOME: $claude_home" >&2
+  vecho "$PROG: ephemeral HOME: $claude_home"
 fi
 # Seed user-level files into the launch HOME from the template dir, BEFORE the
 # onboarding seed below so a template-provided .claude.json is merged (via jq),
@@ -1415,7 +1440,7 @@ if [[ -f "$worktree/.worktreeenv" ]]; then
       echo "$PROG: warning: ignoring malformed .worktreeenv line: $wte_line" >&2
     fi
   done < "$worktree/.worktreeenv"
-  (( wte_count > 0 )) && echo "$PROG: $wte_count env override(s) from .worktreeenv" >&2
+  (( wte_count > 0 )) && vecho "$PROG: $wte_count env override(s) from .worktreeenv"
   # Global excludes (core.excludesFile) live under the real HOME, which csb
   # redirects away — so check ignore status the way sandboxed git will see it,
   # and nudge toward the HOME-independent exclude file.
@@ -1448,8 +1473,8 @@ env_overrides+=(
 # and below run host-side with the real HOME, unrestricted.
 build_deny_wrapper
 
-echo "$PROG: launching in the devShell at $worktree" >&2
-echo "$PROG:   scrubbed env, HOME=$claude_home, fs deny-list on; network OPEN" >&2
+vecho "$PROG: launching in the devShell at $worktree"
+vecho "$PROG:   scrubbed env, HOME=$claude_home, fs deny-list on; network OPEN"
 
 # Scrub the environment, re-admit only an allowlist (+ --keep VARs). nix sets
 # PATH/toolchain from the devShell, so `env` and the absolute paths resolve.
@@ -1480,13 +1505,13 @@ path_shim=(bash -c 'export PATH="${PATH:+$PATH:}/usr/bin"; exec "$@"' csb-path-s
 if [[ "$shell" == "true" ]]; then
   cmd=(bash)
   [[ ${#claude_args[@]} -gt 0 ]] && cmd=("${claude_args[@]}")
-  echo "$PROG: shell in the devShell at $worktree (claude's env, no claude)" >&2
-  exec nix develop "$devshell_ref" --ignore-environment "${keep_args[@]}" \
+  vecho "$PROG: shell in the devShell at $worktree (claude's env, no claude)"
+  exec nix develop "$devshell_ref" "${nix_quiet[@]+"${nix_quiet[@]}"}" --ignore-environment "${keep_args[@]}" \
     --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
       "${deny_wrapper[@]}" "${path_shim[@]}" "${cmd[@]}"
 fi
 
-claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" --no-link --print-out-paths)/bin/claude"
-exec nix develop "$devshell_ref" --ignore-environment "${keep_args[@]}" \
+claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/claude"
+exec nix develop "$devshell_ref" "${nix_quiet[@]+"${nix_quiet[@]}"}" --ignore-environment "${keep_args[@]}" \
   --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
     "${deny_wrapper[@]}" "${path_shim[@]}" "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"

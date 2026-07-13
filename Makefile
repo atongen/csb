@@ -13,8 +13,12 @@
 BIN_DIR ?= $(HOME)/bin
 DEST    := $(BIN_DIR)/csb
 
+# Flake ref csb pulls the claude binary from; mirrors bin/csb's CSB_SELF default.
+# Override to refresh a different remote: make refresh CSB_SELF=path:/path/to/csb
+CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
+
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check build update
+.PHONY: help install uninstall check build update refresh
 
 help: ## Show this help
 	@echo "csb — targets (override BIN_DIR to change the install location):"
@@ -52,4 +56,8 @@ build: ## Build the csb package from the flake (nix build .#csb)
 
 update: ## Re-pin claude-code to its latest upstream in flake.lock
 	@nix flake update claude-code
-	@echo "update: claude-code re-pinned in flake.lock — review & commit it"
+	@echo "update: claude-code re-pinned in flake.lock - review & commit it"
+
+refresh: ## Re-fetch CSB_SELF so --latest stops diffing against a stale flake cache
+	@nix flake metadata "$(CSB_SELF)" --refresh >/dev/null
+	@echo "refresh: re-fetched $(CSB_SELF)"
