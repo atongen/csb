@@ -250,20 +250,36 @@ repo-controlled and run/inject **host-side, unsandboxed** -- see the
 worktree; existing files are never overwritten. A generic worktree-tooling
 convention, not csb-specific.
 
-**`.worktreesetup.sh`** (in the worktree, executable) -- run after
-`.worktreeinclude` with the branch name as `$1` and the worktree as cwd, on
-**every** invocation (create, reuse, `csb -n`), so write it **idempotent**. A
-non-zero exit aborts csb. csb runs the worktree's *own* copy, so each branch can
-carry its own setup. It can generate `.worktreeenv` for branch-parameterized
-values:
+**`.worktreesetup.sh`** (in the worktree, executable) -- a library of shell
+functions that csb **sources** (cwd = worktree) and dispatches by name; the
+branch is passed as `$1`. Define either or both:
+
+- **`up`** -- provisioning. Runs after `.worktreeinclude` on **every**
+  invocation (create, reuse, `csb -n`), so write it **idempotent**. A non-zero
+  exit aborts csb. It can generate `.worktreeenv` for branch-parameterized values.
+- **`down`** -- teardown. Runs on `csb -d`/`--delete`, *before* the worktree is
+  removed, so it can release whatever `up` provisioned. A non-zero exit only
+  warns; the delete still proceeds. `down` gets only the branch (delete does not
+  load `.worktreeenv`), so re-derive any state from it exactly as `up` did.
+
+csb sources the worktree's *own* copy in a subshell (so a stray `set -e`/`exit`
+can't escape into csb), so each branch can carry its own setup. Top-level code
+runs at source time on both paths -- keep the real work inside the functions.
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-branch="$1"
-db="myapp_$(printf '%s' "$branch" | tr -c 'a-z0-9' _)"   # per-branch database
-createdb "$db" 2>/dev/null || true
-printf 'DATABASE_URL=postgres://localhost/%s\n' "$db" > .worktreeenv
+
+db() { printf 'myapp_%s' "$(printf '%s' "$1" | tr -c 'a-z0-9' _)"; }
+
+up() {                                  # provision: per-branch database
+  createdb "$(db "$1")" 2>/dev/null || true
+  printf 'DATABASE_URL=postgres://localhost/%s\n' "$(db "$1")" > .worktreeenv
+}
+
+down() {                                # teardown: drop it on --delete
+  dropdb --if-exists "$(db "$1")"
+}
 ```
 
 **`.worktreeenv`** (in the worktree, dotenv-style) -- `VAR=value` lines (blank

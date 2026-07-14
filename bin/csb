@@ -110,7 +110,8 @@ OPTIONS:
                      CSB_LATEST_TTL seconds (default daily) and cached, then
                      pinned so the rest of the day is fully cached. Trades
                      reproducibility for always-newest. Default via CSB_LATEST=1.
-  -d, --delete       delete mode: remove BRANCH's worktree AND its namespace
+  -d, --delete       delete mode: run .worktreesetup.sh's 'down' teardown (if
+                     any), then remove BRANCH's worktree AND its namespace
                      config under ~/.csb/claudes (keeps the branch itself).
                      Pass the same --ns you launched with; without it, -d only
                      removes the branch-derived namespace.
@@ -268,13 +269,17 @@ process_worktreeinclude() {
   fi
 }
 
-# Run <worktree>/.worktreesetup.sh (present + executable) after .worktreeinclude
-# seeding, every worktree invocation; $1 is the branch, cwd is the worktree.
-# Idempotent by contract; a non-zero exit aborts csb. Runs the worktree's own
-# copy, on the HOST unsandboxed like the repo's flake (the deny-list wraps only
-# the final claude/bash process).
-process_worktreesetup() {
-  local wt_path="$1" branch="$2"
+# Source <worktree>/.worktreesetup.sh (present + executable) and dispatch to its
+# up/down functions. $1 is the action (up|down), $2 the worktree, $3 the branch.
+# `up` provisions (after .worktreeinclude, on every launch/create/reuse/-n);
+# `down` tears down on --delete, before the worktree is removed. Both receive the
+# branch as $1; either may be absent. The script is sourced+called in a subshell
+# so its `set -e`/`exit` can't leak into csb, on the HOST unsandboxed like the
+# repo's flake (the deny-list wraps only the final claude/bash process). `up` is
+# idempotent by contract and a non-zero exit aborts csb; `down` failures only
+# warn, so --delete still completes.
+run_worktreesetup() {
+  local action="$1" wt_path="$2" branch="$3"
   local setup="$wt_path/.worktreesetup.sh"
   [[ -e "$setup" ]] || return 0
   if [[ ! -x "$setup" ]]; then
@@ -282,12 +287,22 @@ process_worktreesetup() {
     echo "  (chmod +x it to have csb run it)" >&2
     return 0
   fi
-  vecho "$PROG: running .worktreesetup.sh $branch"
   local rc=0
-  ( cd "$wt_path" && "$setup" "$branch" ) || rc=$?
+  (
+    cd "$wt_path" || exit 1
+    # shellcheck source=/dev/null
+    source "$setup" "$branch" || exit $?
+    if declare -F "$action" >/dev/null 2>&1; then
+      vecho "$PROG: .worktreesetup.sh $action $branch"
+      "$action" "$branch"
+    fi
+  ) || rc=$?
   if (( rc != 0 )); then
-    die ".worktreesetup.sh failed (exit $rc); not launching claude.
+    if [[ "$action" == "up" ]]; then
+      die ".worktreesetup.sh up failed (exit $rc); not launching claude.
   fix the script (or the worktree) and re-run $PROG"
+    fi
+    echo "$PROG: warning: .worktreesetup.sh down failed (exit $rc); continuing with delete" >&2
   fi
 }
 
@@ -1233,6 +1248,7 @@ if [[ "$mode" == "delete" ]]; then
   if [[ -z "$wt_path" ]]; then
     echo "$PROG: no worktree for '$branch'"
   elif [[ -d "$wt_path" ]]; then
+    run_worktreesetup down "$wt_path" "$branch"
     echo "$PROG: removing worktree $wt_path"
     if ! git -C "$repo_root" worktree remove "$wt_path"; then
       echo "$PROG: worktree remove failed (uncommitted or untracked files?)" >&2
@@ -1276,7 +1292,7 @@ else
   [[ -n "$branch" ]] || die "branch name required"
   worktree=$(ensure_worktree "$repo_root" "$branch") || exit 1
   process_worktreeinclude "$repo_root" "$worktree"
-  process_worktreesetup "$worktree" "$branch"
+  run_worktreesetup up "$worktree" "$branch"
 fi
 # --no-launch is purely a worktree-prep step (the namespace only matters at
 # launch), so exit before setup_namespace — no stray ~/.csb/claudes dir.
@@ -1374,7 +1390,7 @@ fi
 # <worktree>/.worktreeenv (blank and # lines skipped). Injected through the
 # same `env` wrapper as HOME — after the --ignore-environment scrub, inside
 # the devShell, identically for claude and --shell. Repo-controlled like
-# .worktreesetup.sh, which typically generates it per-branch. A literal
+# .worktreesetup.sh, whose `up` typically generates it per-branch. A literal
 # ${HOME} in a value expands to the launch's EFFECTIVE home (the namespace
 # dir when redirected, the real one otherwise) — generators run on the host
 # before the namespace is resolved, so they can't know this path themselves.

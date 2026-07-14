@@ -2,7 +2,8 @@
 
 ## misc
 
-- [ ] allow copy&paste from within a sandbox
+- [X] claude statusline script should include token use count
+- [X] allow copy&paste from within a sandbox
 
 ## Resume here (dogfooding csb-on-csb)
 
@@ -25,7 +26,7 @@ State as of the last session (all UNCOMMITTED in the working tree):
     docs/PARANOID.md.
 
 Next steps:
-- [ ] first live dogfood run: from the csb main checkout, `csb --here -s -- shellcheck bin/csb`
+- [X] first live dogfood run: from the csb main checkout, `csb --here -s -- shellcheck bin/csb`
       (shell mode, no claude needed) should enter the devShell and pass; then
       `csb --here` to confirm claude launches. nix ignores UNTRACKED files, so
       `git add flake.nix` before the run if not yet staged.

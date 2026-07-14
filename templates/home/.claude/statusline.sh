@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# csb statusline: claude runtime (model, context, cost, rate limits) on one row,
+# csb statusline: claude runtime (model, context+tokens, cost, rate limits) on one row,
 # csb sandbox state (repo, worktree/here, namespace, yolo, paranoid) on another.
 # Seeded into the sandbox HOME as ~/.claude/statusline.sh by csb's seed_home
 # template; wired via ~/.claude/settings.json (statusLine.command).
@@ -28,6 +28,14 @@ pct_color() {
   if   [ "$1" -ge 90 ]; then printf '%s' "$RED"
   elif [ "$1" -ge 70 ]; then printf '%s' "$YELLOW"
   else printf '%s' "$GREEN"; fi
+}
+
+# humanize an integer token count: 68234 -> 68k, 1500000 -> 1.5M
+humanize_tokens() {
+  local n="$1"
+  if   [ "$n" -ge 1000000 ]; then printf '%d.%dM' $((n / 1000000)) $(((n % 1000000) / 100000))
+  elif [ "$n" -ge 1000 ];    then printf '%dk' $((n / 1000))
+  else printf '%d' "$n"; fi
 }
 
 # --- accent (CSB_ACCENT: a per-profile tint so personal/work are tellable) ----
@@ -64,7 +72,7 @@ if command -v jq >/dev/null 2>&1; then
   # Join on the unit separator (0x1f), not a tab: `read` treats tab as IFS
   # whitespace and collapses runs of it, which would drop empty fields (absent
   # rate limits) and shift every field after them.
-  IFS=$'\037' read -r MODEL CTX COST RL5 RL7 REPO WT <<EOF
+  IFS=$'\037' read -r MODEL CTX COST RL5 RL7 REPO WT TOKIN TOKMAX <<EOF
 $(printf '%s' "$input" | jq -r '[
     (.model.display_name // "?"),
     ((.context_window.used_percentage // 0) | floor | tostring),
@@ -72,12 +80,14 @@ $(printf '%s' "$input" | jq -r '[
     ((.rate_limits.five_hour.used_percentage // "") | tostring),
     ((.rate_limits.seven_day.used_percentage // "") | tostring),
     (.workspace.repo.name // ""),
-    (.workspace.git_worktree // "")
+    (.workspace.git_worktree // ""),
+    ((.context_window.total_input_tokens // 0) | tostring),
+    ((.context_window.context_window_size // 0) | tostring)
   ] | join("")')
 EOF
 else
   MODEL=$(printf '%s' "$input" | grep -o '"display_name":"[^"]*"' | head -1 | cut -d'"' -f4)
-  CTX=""; COST=""; RL5=""; RL7=""; REPO=""; WT=""
+  CTX=""; COST=""; RL5=""; RL7=""; REPO=""; WT=""; TOKIN=""; TOKMAX=""
 fi
 [ -n "$REPO" ] || REPO=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
 BRANCH=$(git branch --show-current 2>/dev/null || true)
@@ -124,7 +134,17 @@ fi
 
 # --- right: claude runtime ----------------------------------------------------
 right="${CYAN}${MODEL:-?}${RESET}"
-[ -n "$CTX" ]  && right="$right $(pct_color "$CTX")ctx:${CTX}%${RESET}"
+if [ -n "$CTX" ]; then
+  right="$right $(pct_color "$CTX")ctx:${CTX}%${RESET}"
+  # token count next to the pct: current context / window size, both humanized.
+  # 0 or missing (older claude lacks the field) -> pct alone.
+  case "${TOKIN:-}" in
+    ''|0|*[!0-9]*) ;;
+    *) tok=$(humanize_tokens "$TOKIN")
+       case "${TOKMAX:-}" in ''|0|*[!0-9]*) ;; *) tok="$tok/$(humanize_tokens "$TOKMAX")" ;; esac
+       right="$right $tok" ;;
+  esac
+fi
 [ -n "$COST" ] && right="$right $(printf '$%.2f' "$COST" 2>/dev/null || printf '$?.??')"
 rl=""
 if [ -n "$RL5" ]; then i=$(printf '%.0f' "$RL5"); rl="$(pct_color "$i")5h:${i}%${RESET}"; fi
