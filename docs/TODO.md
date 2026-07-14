@@ -51,9 +51,12 @@ Next steps:
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch
       when the blacklist feels insufficient.
-- [ ] future --aws upgrade path (out of scope for plan-002): host-side
+- [x] ~~future --aws upgrade path (out of scope for plan-002): host-side
       credential broker + AWS_CONTAINER_CREDENTIALS_FULL_URI, viable because
-      sandbox networking is open — would fix the no-refresh-in-session caveat.
+      sandbox networking is open — would fix the no-refresh-in-session caveat.~~
+      DROPPED (2026-07-14): the whole `--aws`/`aws_profile=` credential-injection
+      feature was removed from bin/csb and the README (no ongoing need). See the
+      removal note in docs/PLAN-002.md phase 3. `~/.aws` stays in the deny-list.
 - [ ] hardening for the untrusted-instruction threat model (single layer +
       open egress is the exposure; see README "Hardening"). Highest leverage:
       a second boundary — separate unprivileged OS user, or a lightweight VM

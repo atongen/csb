@@ -89,7 +89,7 @@ OPTIONS:
                      bright-* variant) or raw ANSI SGR params (38;5;208).
                      Also via a profile's accent=.
   -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
-                     (ns=, token_cmd=, aws_profile=, latest=, verbose=, yolo=,
+                     (ns=, token_cmd=, latest=, verbose=, yolo=,
                      paranoid=, here=, ephemeral=, shell=, seed_creds=,
                      seed_home=, accent=, args=, keep=, setenv=).
                      Optional [shared]/[claude]/[shell] sections let one file
@@ -97,16 +97,11 @@ OPTIONS:
                      [shell] under -s; top-of-file lines are shared).
                      A gitignored NAME.local is layered on top for host-specific
                      values (its values win). Explicit CLI flags beat both.
-      --no-yolo, --no-paranoid, --no-here, --no-shell, --no-ephemeral,
-      --no-latest, --no-verbose, --no-seed-creds
+      --no-yolo (--yodo), --no-paranoid, --no-here, --no-shell,
+      --no-ephemeral, --no-latest, --no-verbose, --no-seed-creds
                      negate the corresponding option, overriding a profile
                      (or, for latest/verbose, the CSB_LATEST/CSB_VERBOSE env)
                      default for one run
-      --aws PROFILE  fetch short-lived credentials for aws profile PROFILE
-                     host-side (aws configure export-credentials, with an sso
-                     device-code login fallback) and inject them into the
-                     launched environment. Creds do NOT refresh inside a
-                     running session — re-launch to refresh.
   -n, --no-launch    prepare/reuse the worktree (incl. .worktreeinclude and
                      .worktreesetup.sh) and exit; prints the worktree path
   -L, --latest       get the very latest claude: re-lock the claude-code flake
@@ -792,7 +787,7 @@ build_deny_wrapper() {
   esac
 }
 
-# --- machine config / profiles / aws ----------------------------------------------
+# --- machine config / profiles ----------------------------------------------------
 
 # Machine-level config: $CSB_CONFIG_DIR/config, KEY=VALUE lines ('#' comments).
 # A gitignored config.local overlay is read last so one committed config can be
@@ -880,7 +875,6 @@ apply_profile_line() {
   case "$key" in
     ns)          p_ns="$val" ;;
     token_cmd)   token_cmd="$val" ;;
-    aws_profile) p_aws="$val" ;;
     latest)      profile_bool latest    "$val" "$f:$lineno"; p_latest="$val" ;;
     verbose)     profile_bool verbose   "$val" "$f:$lineno"; p_verbose="$val" ;;
     yolo)        profile_bool yolo      "$val" "$f:$lineno"; p_yolo="$val" ;;
@@ -900,7 +894,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, aws_profile, latest, verbose, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv)" ;;
   esac
 }
 
@@ -915,7 +909,7 @@ load_profile() {
   local base="$CSB_CONFIG_DIR/profiles/$profile_name"
   local override="$base.local"
   [[ -f "$base" ]] || die "profile not found: $base"
-  local p_ns="" p_aws="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
+  local p_ns="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
         p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" p_mode_shell="" v entry
   local -a keep_list=() shared_lines=() claude_lines=() shell_lines=()
 
@@ -997,9 +991,6 @@ load_profile() {
   if [[ -n "$p_ns" && -z "$namespace" && "$ephemeral" != "true" ]]; then
     namespace="$p_ns"
   fi
-  if [[ -n "$p_aws" && -z "$aws_profile" ]]; then
-    aws_profile="$p_aws"
-  fi
   if [[ -n "$p_latest" && "$latest_cli" != "true" ]]; then
     latest="$p_latest"
   fi
@@ -1022,7 +1013,7 @@ load_profile() {
   if [[ -n "$p_seed_creds" && "$seed_creds_cli" != "true" ]]; then
     seed_creds="$p_seed_creds"
   fi
-  # emptiness-guarded like ns/aws_profile: an explicit --seed-home (non-empty)
+  # emptiness-guarded like ns: an explicit --seed-home (non-empty)
   # beats the profile value.
   if [[ -n "$p_seed_home" && -z "$seed_home" ]]; then
     seed_home="$p_seed_home"
@@ -1067,49 +1058,12 @@ run_token_cmd() {
   export CLAUDE_CODE_OAUTH_TOKEN="$tok"
 }
 
-# Fetch short-lived role credentials for $aws_profile host-side and stage them
-# for the launched environment (env overrides, NOT --keep: the values must not
-# need to preexist in the caller's env). Requires the aws CLI on the HOST only.
-fetch_aws_creds() {
-  aws_env=()
-  [[ -n "$aws_profile" ]] || return 0
-  command -v aws >/dev/null 2>&1 || die "--aws requires the aws CLI on the host"
-  local creds
-  if ! creds=$(aws configure export-credentials --profile "$aws_profile" --format env 2>/dev/null); then
-    echo "$PROG: no valid credentials for '$aws_profile'; trying sso device-code login" >&2
-    aws sso login --profile "$aws_profile" --use-device-code \
-      || die "aws sso login --profile '$aws_profile' failed"
-    creds=$(aws configure export-credentials --profile "$aws_profile" --format env) \
-      || die "aws configure export-credentials failed for '$aws_profile' after login"
-  fi
-  local line kv expiry="" region
-  while IFS= read -r line; do
-    kv="${line#export }"
-    case "$kv" in
-      AWS_ACCESS_KEY_ID=*|AWS_SECRET_ACCESS_KEY=*|AWS_SESSION_TOKEN=*)
-        aws_env+=("$kv") ;;
-      AWS_CREDENTIAL_EXPIRATION=*)
-        aws_env+=("$kv"); expiry="${kv#*=}" ;;
-    esac
-  done <<< "$creds"
-  [[ ${#aws_env[@]} -gt 0 ]] || die "no credentials parsed from aws export-credentials for '$aws_profile'"
-  # export-credentials does not emit the region; inject it when configured.
-  region=$(aws configure get region --profile "$aws_profile" 2>/dev/null || true)
-  if [[ -n "$region" ]]; then
-    aws_env+=("AWS_REGION=$region")
-  fi
-  # Role creds live ~1h and do NOT refresh inside a running session; make
-  # staleness visible at launch.
-  vecho "$PROG: aws credentials for '$aws_profile'${expiry:+ (expire: $expiry)}"
-}
-
 # --- argument parsing -----------------------------------------------------------
 
 mode="launch"
 no_launch="false"
 namespace=""
 profile_name=""
-aws_profile=""
 token_cmd=""
 # Booleans a profile can default: each tracks whether the CLI set it (*_cli),
 # in either direction (-X / --no-X) — CLI beats profile beats env default.
@@ -1133,7 +1087,6 @@ branch=""
 claude_args=()
 extra_keep=()
 profile_setenv=()
-aws_env=()
 ns_dir=""
 csb_ns=""            # resolved namespace name (empty for ephemeral)
 csb_ephemeral="false"
@@ -1144,7 +1097,7 @@ while [[ $# -gt 0 ]]; do
     -V|--version) echo "$PROG $CSB_VERSION"; exit 0 ;;
     -d|--delete) mode="delete"; shift ;;
     -y|--yolo) yolo="true"; yolo_cli="true"; shift ;;
-    --no-yolo) yolo="false"; yolo_cli="true"; shift ;;
+    --no-yolo|--yodo) yolo="false"; yolo_cli="true"; shift ;;
     --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
     --no-paranoid) paranoid="false"; paranoid_cli="true"; shift ;;
     -n|--no-launch) no_launch="true"; shift ;;
@@ -1170,7 +1123,6 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env var name for --keep: '$2'"
       extra_keep+=("$2"); shift 2 ;;
     -p|--profile) [[ $# -ge 2 ]] || die "--profile requires a NAME"; profile_name="$2"; shift 2 ;;
-    --aws) [[ $# -ge 2 ]] || die "--aws requires an aws PROFILE name"; aws_profile="$2"; shift 2 ;;
     --no-sandbox) die "--no-sandbox was removed: the devShell launch is the only mode; drop the flag" ;;
     --) shift; claude_args+=("$@"); claude_args_cli="true"; break ;;
     -*) usage >&2; die "unknown option: $1" ;;
@@ -1237,13 +1189,12 @@ if [[ "$yolo" == "true" ]]; then
 fi
 
 # Host-side credential work, before any worktree/namespace side effects (a
-# token_cmd or aws failure must abort a clean launch, not a half-prepared one).
+# token_cmd failure must abort a clean launch, not a half-prepared one).
 # Skipped for delete/list/prepare-only invocations, which launch nothing; the
 # -s shell skips token_cmd too (it runs no claude — no reason to touch the
-# password store), but keeps --aws (useful in a shell).
-if [[ "$mode" == "launch" && "$no_launch" != "true" ]]; then
-  [[ "$shell" == "true" ]] || run_token_cmd
-  fetch_aws_creds
+# password store).
+if [[ "$mode" == "launch" && "$no_launch" != "true" && "$shell" != "true" ]]; then
+  run_token_cmd
 fi
 
 # --- locate repo ----------------------------------------------------------------
@@ -1450,10 +1401,9 @@ if [[ -f "$worktree/.worktreeenv" ]]; then
   fi
 fi
 
-# Profile setenv= and --aws credentials, after .worktreeenv (user config beats
-# the repo file when both set a var — later `env` args win).
+# Profile setenv=, after .worktreeenv (user config beats the repo file when both
+# set a var — later `env` args win).
 env_overrides+=("${profile_setenv[@]+"${profile_setenv[@]}"}")
-env_overrides+=("${aws_env[@]+"${aws_env[@]}"}")
 
 # csb's own launch state, for the sandboxed process to surface (a statusline
 # script, a prompt): these csb concepts have no representation in claude's env

@@ -38,8 +38,7 @@ csb feature/foo                  # worktree for feature/foo + claude in the devS
 ```
 
 Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
-box); `csb` shells out to `nix`. `--aws` additionally needs the `aws` CLI on the
-host (only there -- the devShell needs nothing).
+box); `csb` shells out to `nix`.
 
 Two environment variables tune where csb gets things:
 
@@ -61,8 +60,7 @@ csb feature/foo -- --model opus  # everything after -- is passed to claude
 csb --here                       # run in the current dir, no worktree (namespace = current branch)
 csb -s feature/foo               # interactive shell instead of claude (exact same env)
 csb -s -E --here -- cat ~/.ssh/config   # run a command in the agent's env (this one fails: denied)
-csb -p work feature/foo          # profile: ns/token/aws/keeps/env from ~/.config/csb/profiles/work
-csb --aws work-primary/Admin feature/foo   # inject short-lived aws role creds
+csb -p work feature/foo          # profile: ns/token/keeps/env from ~/.config/csb/profiles/work
 csb -k AWS_PROFILE feature/foo   # also keep AWS_PROFILE across the env scrub (repeatable)
 csb -L feature/foo               # newest claude (re-lock claude-code to upstream HEAD this run)
 csb --ns work feature/foo        # override the namespace (default is the branch)
@@ -151,7 +149,6 @@ negating `--no-*` flags. Launch with `-p/--profile NAME`. Recognized keys
 ns=@work                                  # as --ns
 token_cmd=pass work/claude/token          # run host-side via bash -c;
                                           # stdout -> CLAUDE_CODE_OAUTH_TOKEN (never echoed)
-aws_profile=work-primary/Admin            # as --aws
 latest=true                               # as -L/--latest; beats CSB_LATEST, loses to explicit -L
 yolo=true                                 # as -y/--yolo (allow-all)
 paranoid=true                             # as --paranoid (whitelist reads; see below)
@@ -195,13 +192,13 @@ into the rcfile'd shell in the current dir -- one file, one flag.
 **Host-specific overlay.** A profile `NAME` can have a sibling, gitignored
 `NAME.local` layered on top after it is read: same syntax/sections, but its
 scalar values win and its `keep=`/`setenv=` accumulate. Commit portable profiles
-to a dotfiles repo; keep host-specific values (an `aws_profile=`, a `token_cmd=`
-path, a `seed_home=`) in the uncommitted `.local`. Precedence: base -> `.local`
+to a dotfiles repo; keep host-specific values (a `token_cmd=` path, a
+`seed_home=`) in the uncommitted `.local`. Precedence: base -> `.local`
 -> explicit CLI flags.
 
 ```
 # ~/.config/csb/profiles/work.local   (gitignored, per-host)
-aws_profile=work-primary/AdminOnThisBox
+token_cmd=pass work/claude/token-on-this-box
 seed_home=~/dotfiles/csb-home
 ```
 
@@ -285,25 +282,6 @@ when both set a var. A literal `${HOME}` in a value expands to the launch's
 to anchor a value to the sandbox HOME, since generators run before the namespace
 is resolved. In `--here` mode an existing `.worktreeenv` is honored, but setup
 and seeding are not run.
-
-## `--aws PROFILE`
-
-Injects short-lived role credentials for an aws profile into the launched
-environment (also via a profile's `aws_profile=`):
-
-- Host-side `aws configure export-credentials --format env`, with an
-  `aws sso login --use-device-code` fallback when creds are missing/expired.
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` /
-  `AWS_CREDENTIAL_EXPIRATION` are injected as env overrides (not `--keep`: they
-  need not preexist in your shell), plus `AWS_REGION` when configured.
-- The credential expiry is printed at launch so staleness is visible.
-- **Caveat:** role creds live ~1h and do **not** refresh inside a running
-  session -- re-launch csb to refresh. The real `~/.aws` stays denied throughout.
-
-```sh
-csb --aws work-primary/Admin -s -E --here -- aws sts get-caller-identity  # the role
-csb --aws work-primary/Admin -s -E --here -- cat "$HOME/.aws/config"      # denied
-```
 
 ## Filesystem sandbox
 
@@ -534,7 +512,7 @@ flake.nix                  packages {csb, claude, bwrap (linux)} + apps + templa
 templates/repo/            scaffold: a standalone dev-shell flake for a consuming repo
 templates/home/            starter seed-home skeleton (copy to ~/.config/csb/home)
 Makefile                   install, lint, and build targets (make help)
-docs/PLAN-002.md           the implemented design (single mode, deny-list, profiles, --aws)
+docs/PLAN-002.md           the implemented design (single mode, deny-list, profiles)
 docs/PLAN-003.md           roadmap: VM second boundary (not implemented)
 docs/TODO.md               current state and next steps
 ```
