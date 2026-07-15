@@ -39,6 +39,7 @@ USAGE:
   $PROG [OPTIONS] --here [-- ARGS...]     launch in the current dir (no worktree)
   $PROG -n BRANCH                         prepare BRANCH's worktree, don't launch
   $PROG -d BRANCH                         remove BRANCH's worktree (keeps the branch)
+  $PROG --list-ns | --prune-ns            list / prune namespace configs
   $PROG                                   list csb worktrees
 
 Claude (or the -s shell) runs inside the repo's devShell with a scrubbed
@@ -84,37 +85,45 @@ OPTIONS:
       --reseed       when seeding the launch HOME from the template, overwrite
                      existing files instead of keeping them (default: keep).
       --accent COLOR tint the statusline repo name so profiles are tellable at
-                     a glance (e.g. personal vs work). COLOR is a name (red,
-                     green, yellow, blue, magenta, cyan, white, gray, or a
-                     bright-* variant) or raw ANSI SGR params (38;5;208).
-                     Also via a profile's accent=.
+                     a glance (e.g. personal vs work). COLOR is a name (black,
+                     red, green, yellow, blue, magenta, cyan, white, gray/grey,
+                     or a bright-* variant) or raw ANSI SGR params (38;5;208).
+                     Also via a profile's accent=; --no-accent untints.
   -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
                      (ns=, token_cmd=, latest=, verbose=, yolo=,
                      paranoid=, here=, ephemeral=, shell=, seed_creds=,
                      seed_home=, accent=, args=, keep=, setenv=).
-                     Optional [shared]/[claude]/[shell] sections let one file
-                     serve both modes ([claude] applies to claude launches,
-                     [shell] under -s; top-of-file lines are shared).
                      A gitignored NAME.local is layered on top for host-specific
                      values (its values win). Explicit CLI flags beat both.
+                     Bare '$PROG -p NAME' (no BRANCH) launches --here; plain
+                     '$PROG' still lists worktrees.
       --no-yolo (--yodo), --no-paranoid, --no-here, --no-shell,
-      --no-ephemeral, --no-latest, --no-verbose, --no-seed-creds
+      --no-ephemeral, --no-latest, --no-verbose, --no-seed-creds,
+      --no-ns, --no-seed-home, --no-accent
                      negate the corresponding option, overriding a profile
                      (or, for latest/verbose, the CSB_LATEST/CSB_VERBOSE env)
                      default for one run
   -n, --no-launch    prepare/reuse the worktree (incl. .worktreeinclude and
-                     .worktreesetup.sh) and exit; prints the worktree path
+                     .worktreesetup.sh's sandboxed 'up') and exit; prints the
+                     worktree path
   -L, --latest       get the very latest claude: re-lock the claude-code flake
                      input to its upstream HEAD (bypassing the committed
                      flake.lock). The upstream rev is checked at most once per
                      CSB_LATEST_TTL seconds (default daily) and cached, then
                      pinned so the rest of the day is fully cached. Trades
                      reproducibility for always-newest. Default via CSB_LATEST=1.
-  -d, --delete       delete mode: run .worktreesetup.sh's 'down' teardown (if
-                     any), then remove BRANCH's worktree AND its namespace
-                     config under ~/.csb/claudes (keeps the branch itself).
-                     Pass the same --ns you launched with; without it, -d only
-                     removes the branch-derived namespace.
+  -d, --delete       delete mode: run .worktreesetup.sh's sandboxed 'down'
+                     teardown (if any), then remove BRANCH's worktree AND its
+                     namespace config under ~/.csb/claudes (keeps the branch).
+                     Only worktrees csb created (under .worktrees/) are ever
+                     torn down/removed. Pass the same --ns you launched with;
+                     without it, -d only removes the branch-derived namespace.
+      --list-ns      list this repo's namespace configs under ~/.csb/claudes
+                     (and shared @ ones), flagging orphans whose branch and
+                     worktree are both gone
+      --prune-ns     remove the orphaned branch-derived namespace configs that
+                     --list-ns flags (explicit --ns and @-shared namespaces
+                     are never auto-removed)
   -v, --verbose      restore csb's routine status narration and nix's own build
                      output (evaluating/downloading progress). Launches are quiet
                      by default; warnings and errors always print. Default via
@@ -142,6 +151,7 @@ CSB_CLAUDE_FLAKE="github:sadjow/claude-code-nix"
 latest_claude_rev() {
   local cache="$CSB_CACHE_DIR/latest-claude-rev" \
         ttl="${CSB_LATEST_TTL:-86400}" now stamp sha
+  [[ "$ttl" =~ ^[0-9]+$ ]] || die "CSB_LATEST_TTL must be a whole number of seconds: '$ttl'"
   now="$(date +%s)"
   if [[ "$ttl" -gt 0 && -f "$cache" ]]; then
     read -r stamp sha <"$cache" || true
@@ -166,6 +176,14 @@ encode_branch() {
   local s="$1"
   s="${s//%/%25}"
   s="${s//\//%2F}"
+  echo "$s"
+}
+
+# Inverse of encode_branch (/ before %, mirroring the encode order).
+decode_branch() {
+  local s="$1"
+  s="${s//%2F//}"
+  s="${s//%25/%}"
   echo "$s"
 }
 
@@ -244,6 +262,9 @@ ensure_worktree() {
 # Copy gitignored files matching <repo>/.worktreeinclude into a fresh worktree.
 # Only files that match a pattern AND are gitignored are copied; existing files
 # in the worktree are never overwritten. No-op if .worktreeinclude is missing.
+# .worktreesetup.sh may be listed here too -- it no longer needs to be
+# git-tracked to run (see run_worktreesetup), so a personal, gitignored copy
+# can ride in this way just like any other local file.
 process_worktreeinclude() {
   local repo_root="$1" wt_path="$2"
   local include_file="$repo_root/.worktreeinclude"
@@ -269,34 +290,85 @@ process_worktreeinclude() {
   fi
 }
 
+# Resolve the devShell flake ref for DIR: the repo's own devShells.<system>.
+# default if present, else csb's generic fallback (with a warning to stderr).
+# Shared by the main launch and by run_worktreesetup's sandboxing below.
+resolve_devshell_ref() {
+  local dir="$1" system
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64)              system="aarch64-darwin" ;;
+    Darwin-x86_64)             system="x86_64-darwin" ;;
+    Linux-x86_64)              system="x86_64-linux" ;;
+    Linux-aarch64|Linux-arm64) system="aarch64-linux" ;;
+    *)                         system="" ;;
+  esac
+  # nix flakes ignore UNTRACKED files, so a brand-new flake.nix that hasn't
+  # been `git add`ed is invisible to nix develop -- the eval below treats that
+  # as "no devShell" and falls back too.
+  if [[ ! -f "$dir/flake.nix" ]] || \
+     { [[ -n "$system" ]] && ! nix eval "$dir#devShells.$system.default.name" >/dev/null 2>&1; }; then
+    echo "$PROG: no repo devShell at $dir -- using csb's generic fallback devShell" >&2
+    echo "$PROG: add devShells.default for a project toolchain (nix flake init -t $CSB_SELF; git add flake.nix)" >&2
+    echo "$CSB_SELF#fallback"
+    return
+  fi
+  echo "$dir"
+}
+
 # Source <worktree>/.worktreesetup.sh (present + executable) and dispatch to its
-# up/down functions. $1 is the action (up|down), $2 the worktree, $3 the branch.
-# `up` provisions (after .worktreeinclude, on every launch/create/reuse/-n);
-# `down` tears down on --delete, before the worktree is removed. Both receive the
-# branch as $1; either may be absent. The script is sourced+called in a subshell
-# so its `set -e`/`exit` can't leak into csb, on the HOST unsandboxed like the
-# repo's flake (the deny-list wraps only the final claude/bash process). `up` is
-# idempotent by contract and a non-zero exit aborts csb; `down` failures only
-# warn, so --delete still completes.
+# up/down functions, SANDBOXED: inside the repo's own devShell and the same
+# deny-list containment (build_deny_wrapper) the eventual claude/-s launch
+# gets, with the same env scrub (--ignore-environment + keep_args). So the
+# script has no more host access than the agent's own shell already would --
+# no git-tracked/unmodified gate is needed, since there is no longer a
+# privilege gap to escalate into. $1 is the action (up|down), $2 the worktree,
+# $3 the branch. `up` provisions (after .worktreeinclude, on every
+# launch/create/reuse/-n) and must be idempotent; a non-zero exit aborts csb.
+# `down` tears down on --delete, before the worktree is removed; a non-zero
+# exit only warns, so --delete still completes.
 run_worktreesetup() {
   local action="$1" wt_path="$2" branch="$3"
-  local setup="$wt_path/.worktreesetup.sh"
-  [[ -e "$setup" ]] || return 0
-  if [[ ! -x "$setup" ]]; then
-    echo "$PROG: warning: $setup exists but is not executable; skipping" >&2
-    echo "  (chmod +x it to have csb run it)" >&2
-    return 0
-  fi
+  [[ -f "$wt_path/.worktreesetup.sh" ]] || return 0
+
+  local devshell_ref
+  devshell_ref=$(resolve_devshell_ref "$wt_path")
+
+  # Scoped locals: build_deny_wrapper/build_write_roots read these globals
+  # dynamically. No namespace HOME here -- up/down run before the namespace is
+  # resolved and need none of its state; the write-allow roots are just the
+  # worktree, its git dir, and tmp.
+  local worktree="$wt_path" ns_dir="" claude_home="" cfg_tmpdir=""
+  build_deny_wrapper
+
+  # shellcheck disable=SC2016  # single-quoted: expands inside the bash -c below, not here
+  local script='
+prog="$1"; act="$2"; branch="$3"
+if [[ ! -x .worktreesetup.sh ]]; then
+  echo "$prog: warning: .worktreesetup.sh exists but is not executable; skipping" >&2
+  echo "  (chmod +x it to have csb run it)" >&2
+  exit 0
+fi
+# shellcheck disable=SC1091
+source .worktreesetup.sh "$branch"
+if declare -F "$act" >/dev/null 2>&1; then
+  "$act" "$branch"
+fi
+'
   local rc=0
+  vecho "$PROG: .worktreesetup.sh $action $branch (sandboxed, in the devShell)"
   (
     cd "$wt_path" || exit 1
-    # shellcheck source=/dev/null
-    source "$setup" "$branch" || exit $?
-    if declare -F "$action" >/dev/null 2>&1; then
-      vecho "$PROG: .worktreesetup.sh $action $branch"
-      "$action" "$branch"
-    fi
+    nix develop "$devshell_ref" "${nix_quiet[@]+"${nix_quiet[@]}"}" --ignore-environment "${keep_args[@]}" \
+      --command "${deny_wrapper[@]}" bash -c "$script" csb-worktreesetup "$PROG" "$action" "$branch"
   ) || rc=$?
+  # Unlike the final claude/-s launch, csb regains control right after this
+  # call (it isn't exec'd away), so the macOS seatbelt profile can be reaped
+  # immediately instead of waiting on the EXIT trap / OS temp reaper.
+  if [[ -n "$seatbelt_profile" ]]; then
+    rm -f "$seatbelt_profile"
+    seatbelt_profile=""
+  fi
+
   if (( rc != 0 )); then
     if [[ "$action" == "up" ]]; then
       die ".worktreesetup.sh up failed (exit $rc); not launching claude.
@@ -346,9 +418,12 @@ seed_claude_config() {
        | .projects[$p].hasTrustDialogAccepted = true
        | .projects[$p].projectOnboardingSeenCount = ((.projects[$p].projectOnboardingSeenCount) // 1)' \
       > "$tmp" && mv "$tmp" "$cfg"
+  elif [[ "$proj" == *'"'* || "$proj" == *\\* ]]; then
+    echo "$PROG: warning: jq not found and the project path needs JSON escaping;" >&2
+    echo "  not seeding $cfg — claude may prompt for login/trust. Install jq." >&2
   elif [[ ! -s "$cfg" ]]; then
-    # No jq, but a fresh/empty file needs no merge — write the minimal seed. proj
-    # is a filesystem path under the repo, so no JSON-significant chars are expected.
+    # No jq, but a fresh/empty file needs no merge — write the minimal seed
+    # (proj is guarded above against JSON-significant characters).
     cat > "$cfg" <<EOF
 {
   "hasCompletedOnboarding": true,
@@ -445,12 +520,21 @@ setup_namespace() {
   if [[ -n "$namespace" && "$namespace" == @* ]]; then
     ns_dir="$CSB_NS_ROOT/$ns"
     mkdir -p "$ns_dir/.claude"
+    echo "kind=shared" > "$ns_dir/.csb-ns"
     export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
     vecho "$PROG: namespace: $ns  (persistent, shared across repos: $ns_dir)"
     return
   fi
   ns_dir="$CSB_NS_ROOT/$ns_repo_key/$ns"
   mkdir -p "$ns_dir/.claude"
+  # Provenance stamp for --list-ns/--prune-ns: branch-derived namespaces may
+  # be auto-pruned once branch and worktree are gone; explicit --ns ones never
+  # are. Re-stamped every launch (also classifies pre-stamp dirs).
+  if [[ -n "$namespace" ]]; then
+    echo "kind=ns" > "$ns_dir/.csb-ns"
+  else
+    echo "kind=branch" > "$ns_dir/.csb-ns"
+  fi
   export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
   vecho "$PROG: namespace: $ns  (persistent: $ns_dir)"
 }
@@ -477,6 +561,7 @@ build_deny_paths() {
     "$HOME/.claude.json"
     "$HOME/.csb/claudes"
     "$HOME/.netrc"
+    "$HOME/.git-credentials"
     "$HOME/.config/gh"
     "$HOME/.config/gcloud"
     "$HOME/.kube"
@@ -497,6 +582,11 @@ build_deny_paths() {
     "$HOME/.terraformrc"
     "$HOME/.terraform.d"
     "$HOME/.granted"
+    "$HOME/.config/containers/auth.json"
+    "$HOME/.config/age/keys.txt"
+    "$HOME/.config/sops"
+    "$HOME/.sops"
+    "$HOME/.pulumi/credentials.json"
     "$HOME/.databrickscfg"
     "$HOME/.databrickscfg.bak"
     "$HOME/.databricks"
@@ -578,9 +668,12 @@ build_deny_paths() {
   for p in "${raw[@]}"; do
     [[ -e "$p" ]] || continue
     rp=$(realpath "$p")
-    # Both wrapper syntaxes quote paths; a double quote would break the seatbelt
-    # profile, so refuse it rather than emit a broken (weaker) profile.
-    [[ "$rp" == *'"'* ]] && die "deny path contains a double quote (unsupported): $rp"
+    # Both wrapper syntaxes quote paths; a double quote or backslash would
+    # break (or silently alter) the seatbelt profile string, so refuse it
+    # rather than emit a broken (weaker) profile.
+    case "$rp" in
+      *'"'*|*\\*) die "deny path contains a double quote or backslash (unsupported): $rp" ;;
+    esac
     if [[ -d "$rp" ]]; then
       deny_dirs+=("$rp")
     else
@@ -605,10 +698,20 @@ build_write_roots() {
   [[ -n "$cfg_tmpdir" ]] && cand+=("$cfg_tmpdir")
   cand+=("/tmp")
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    # The per-user /var/folders/... dir (parent of $TMPDIR covers both the
-    # T/ temp and C/ cache subdirs, which system frameworks write to) and the
-    # device tree (ptys; the TUI writes its terminal).
-    cand+=("$(dirname "$(realpath "${TMPDIR:-/tmp}")")" "/dev")
+    # The per-user /var/folders/... dir (covers both the T/ temp and C/ cache
+    # subdirs, which system frameworks write to) and the device tree (ptys;
+    # the TUI writes its terminal). Derived via getconf, NEVER from $TMPDIR:
+    # nix develop and stripped environments point TMPDIR at /tmp subpaths,
+    # whose parent resolves to /private — far too broad to write-allow.
+    local dtmp dpar=""
+    dtmp="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+    [[ -n "$dtmp" && -d "$dtmp" ]] && dpar="$(dirname "$(realpath "$dtmp")")"
+    case "$dpar" in
+      /var/folders/*|/private/var/folders/*) cand+=("$dpar") ;;
+      *) echo "$PROG: warning: per-user temp dir did not resolve under /var/folders ('$dpar');" >&2
+         echo "  not write-allowing it — /tmp stays writable" >&2 ;;
+    esac
+    cand+=("/dev")
   else
     cand+=("/var/tmp")
   fi
@@ -632,7 +735,9 @@ build_write_roots() {
   for p in "${cand[@]}"; do
     [[ -n "$p" && -e "$p" ]] || continue
     rp=$(realpath "$p")
-    [[ "$rp" == *'"'* ]] && die "allow-write path contains a double quote (unsupported): $rp"
+    case "$rp" in
+      *'"'*|*\\*) die "allow-write path contains a double quote or backslash (unsupported): $rp" ;;
+    esac
     write_roots+=("$rp")
   done
 }
@@ -676,7 +781,8 @@ build_deny_wrapper() {
   deny_wrapper=()
   build_deny_paths
   build_write_roots
-  local ns_real="" gc_real="" hooks_deny="" config_deny="" real_home
+  local ns_real="" gc_real="" hooks_deny="" config_deny="" cfgwt_deny="" \
+        wt_gitdir="" wt_cfgwt_deny="" real_home
   real_home=$(realpath "$HOME")
   # Extra --paranoid read-deny roots (config paranoid_deny=), canonicalized and
   # existence-checked like the deny-list; the write-root re-allows below reopen
@@ -688,7 +794,9 @@ build_deny_wrapper() {
     for pdp in "${cfg_paranoid_deny[@]+"${cfg_paranoid_deny[@]}"}"; do
       [[ -e "$pdp" ]] || continue
       pdr=$(realpath "$pdp")
-      [[ "$pdr" == *'"'* ]] && die "paranoid_deny path contains a double quote (unsupported): $pdr"
+      case "$pdr" in
+        *'"'*|*\\*) die "paranoid_deny path contains a double quote or backslash (unsupported): $pdr" ;;
+      esac
       paranoid_deny_roots+=("$pdr")
     done
   fi
@@ -697,8 +805,22 @@ build_deny_wrapper() {
   fi
   gc_real=$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
   [[ -n "$gc_real" ]] && gc_real=$(realpath "$gc_real")
-  [[ -d "$gc_real/hooks" ]] && hooks_deny="$gc_real/hooks"
-  [[ -f "$gc_real/config" ]] && config_deny="$gc_real/config"
+  # Host code-exec vectors inside the writable git common dir, denied even
+  # when the path does not exist yet: an existence-conditional deny would let
+  # the sandbox CREATE .git/hooks/pre-commit (or a config) and gain host
+  # execution. config.worktree gets the same treatment as config (git reads
+  # it when extensions.worktreeConfig is set): both the common-dir copy and
+  # the linked worktree's own gitdir copy.
+  if [[ -n "$gc_real" ]]; then
+    hooks_deny="$gc_real/hooks"
+    config_deny="$gc_real/config"
+    cfgwt_deny="$gc_real/config.worktree"
+    wt_gitdir=$(git -C "$worktree" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)
+    if [[ -n "$wt_gitdir" && -e "$wt_gitdir" ]]; then
+      wt_gitdir=$(realpath "$wt_gitdir")
+      [[ "$wt_gitdir" != "$gc_real" ]] && wt_cfgwt_deny="$wt_gitdir/config.worktree"
+    fi
+  fi
 
   # Deny roots whose interior a per-component path resolver must still traverse
   # (metadata-only) to reach a re-allowed subtree beneath them: the dir-form
@@ -714,6 +836,12 @@ build_deny_wrapper() {
     Darwin)
       local profile p
       profile=$(mktemp "${TMPDIR:-/tmp}/csb-deny.XXXXXX")
+      # Reap the profile if csb dies between here and the final exec. The trap
+      # deliberately does NOT fire on the exec itself: sandbox-exec reads the
+      # file after csb is gone; the temp dir reaps it eventually (paths only,
+      # no secrets).
+      seatbelt_profile="$profile"
+      trap 'rm -f "$seatbelt_profile"' EXIT
       {
         echo "(version 1)"
         echo "(allow default)"
@@ -756,9 +884,15 @@ build_deny_wrapper() {
         if [[ -n "$ns_real" ]]; then
           printf '(allow file-write* (subpath "%s"))\n' "$ns_real"
         fi
-        # Host code-execution vectors inside the writable git common dir.
-        [[ -n "$hooks_deny" ]]  && printf '(deny file-write* (subpath "%s"))\n' "$hooks_deny"
-        [[ -n "$config_deny" ]] && printf '(deny file-write* (literal "%s"))\n' "$config_deny"
+        # Host code-execution vectors inside the writable git common dir
+        # (string-matched by seatbelt, so nonexistence doesn't weaken them).
+        if [[ -n "$hooks_deny" ]]; then
+          printf '(deny file-write* (subpath "%s"))\n' "$hooks_deny"
+        fi
+        for p in "$config_deny" "$cfgwt_deny" "$wt_cfgwt_deny"; do
+          [[ -n "$p" ]] || continue
+          printf '(deny file-write* (literal "%s"))\n' "$p"
+        done
       } > "$profile"
       deny_wrapper=(/usr/bin/sandbox-exec -f "$profile")
       ;;
@@ -781,8 +915,18 @@ build_deny_wrapper() {
       for p in "${write_roots[@]+"${write_roots[@]}"}"; do
         deny_wrapper+=(--bind "$p" "$p")
       done
-      [[ -n "$hooks_deny" ]]  && deny_wrapper+=(--ro-bind "$hooks_deny" "$hooks_deny")
-      [[ -n "$config_deny" ]] && deny_wrapper+=(--ro-bind "$config_deny" "$config_deny")
+      # bwrap needs the bind source to exist: materialize absent deny targets
+      # host-side (empty placeholders are inert for git) so the sandbox can't
+      # create them rw through the parent bind.
+      if [[ -n "$hooks_deny" ]]; then
+        mkdir -p "$hooks_deny"
+        deny_wrapper+=(--ro-bind "$hooks_deny" "$hooks_deny")
+      fi
+      for p in "$config_deny" "$cfgwt_deny" "$wt_cfgwt_deny"; do
+        [[ -n "$p" ]] || continue
+        [[ -e "$p" ]] || touch "$p"
+        deny_wrapper+=(--ro-bind "$p" "$p")
+      done
       # READ policy: mount ordering matters — the ~/.csb/claudes parent is
       # tmpfs'd here, then the active namespace is bound back in (rw) last.
       for p in "${deny_dirs[@]+"${deny_dirs[@]}"}"; do
@@ -881,14 +1025,14 @@ profile_bool() {
 }
 
 # Dispatch one profile KEY=VALUE line. Writes load_profile's p_* locals via
-# bash dynamic scoping. `shell=` is handled by load_profile itself (it selects
-# which section applies, so it must be resolved before lines are dispatched).
+# bash dynamic scoping.
 apply_profile_line() {
   local f="$1" lineno="$2" line="$3" key val
   key="${line%%=*}"
   val="${line#*=}"
   case "$key" in
     ns)          p_ns="$val" ;;
+    shell)       profile_bool shell "$val" "$f:$lineno"; p_shell="$val" ;;
     token_cmd)   token_cmd="$val" ;;
     latest)      profile_bool latest    "$val" "$f:$lineno"; p_latest="$val" ;;
     verbose)     profile_bool verbose   "$val" "$f:$lineno"; p_verbose="$val" ;;
@@ -914,96 +1058,48 @@ apply_profile_line() {
 }
 
 # Parse ~/.config/csb/profiles/$profile_name and apply it as DEFAULTS -- explicit
-# CLI flags win. Keys and sections are documented in the README (Profiles).
-# Booleans track whether the CLI touched them (*_cli) so --no-* can override a
-# profile's true (and a profile latest= beats the CSB_LATEST default). An
-# optional gitignored <name>.local overlay is read last: its scalar values win,
-# its keep=/setenv= accumulate. Sections [shared]/[claude]/[shell] let one file
-# serve both modes; the mode is resolved before lines are dispatched.
+# CLI flags win. Keys are documented in the README (Profiles). Booleans track
+# whether the CLI touched them (*_cli) so --no-* can override a profile's true
+# (and a profile latest= beats the CSB_LATEST default). An optional gitignored
+# <name>.local overlay is read last: its scalar values win, its keep=/setenv=
+# accumulate.
 load_profile() {
   local base="$CSB_CONFIG_DIR/profiles/$profile_name"
   local override="$base.local"
   [[ -f "$base" ]] || die "profile not found: $base"
   local p_ns="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
-        p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" p_mode_shell="" v entry
-  local -a keep_list=() shared_lines=() claude_lines=() shell_lines=()
+        p_shell="" p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" v
+  local -a keep_list=()
 
   # Read the committed base profile, then the optional gitignored <name>.local
-  # overlay, into per-section buckets. Each entry is tagged with its source-file
-  # index (0=base, 1=override) so parse errors point at the right file — neither
-  # the index nor the lineno can contain ':', so the splits below are safe even
-  # though the line value can. The override is read (and dispatched) LAST so its
-  # scalar values win and its keep=/setenv= accumulate on top of the base.
-  local pf line lineno section fidx
+  # overlay. The override is read LAST so its scalar values win and its
+  # keep=/setenv= accumulate on top of the base.
+  local pf line lineno fidx
   for fidx in 0 1; do
     [[ "$fidx" == 0 ]] && pf="$base" || pf="$override"
     [[ -f "$pf" ]] || continue
-    lineno=0; section="shared"
+    lineno=0
+    # shellcheck disable=SC2094  # $pf is passed for error messages only, never written
     while IFS= read -r line || [[ -n "$line" ]]; do
       lineno=$((lineno + 1))
       [[ -z "$line" || "$line" == \#* ]] && continue
-      case "$line" in
-        "[shared]") section="shared"; continue ;;
-        "[claude]") section="claude"; continue ;;
-        "[shell]")  section="shell";  continue ;;
-        "["*) die "profile $pf:$lineno: unknown section '$line' (use [shared], [claude], or [shell])" ;;
-      esac
       [[ "$line" == *=* ]] || die "profile $pf:$lineno: expected KEY=VALUE: '$line'"
-      if [[ "$line" == shell=* ]]; then
-        [[ "$section" == "shared" ]] \
-          || die "profile $pf:$lineno: shell= is only valid in the shared section (it selects which section applies)"
-        profile_bool shell "${line#shell=}" "$pf:$lineno"
-        p_mode_shell="${line#shell=}"
-        continue
-      fi
-      case "$section" in
-        shared) shared_lines+=("$fidx:$lineno:$line") ;;
-        claude) claude_lines+=("$fidx:$lineno:$line") ;;
-        shell)  shell_lines+=("$fidx:$lineno:$line") ;;
-      esac
+      apply_profile_line "$pf" "$lineno" "$line"
     done < "$pf"
-  done
-
-  # Resolve the mode before dispatching lines: CLI beats the profile default.
-  if [[ -n "$p_mode_shell" && "$shell_cli" != "true" ]]; then
-    shell="$p_mode_shell"
-  fi
-
-  # Dispatch base fully (shared then the active mode section), then the override
-  # fully — so an override value beats a base value even across sections, while
-  # an explicit CLI flag still beats both in the application step below.
-  local src rest
-  for fidx in 0 1; do
-    [[ "$fidx" == 0 ]] && src="$base" || src="$override"
-    for entry in "${shared_lines[@]+"${shared_lines[@]}"}"; do
-      [[ "${entry%%:*}" == "$fidx" ]] || continue
-      rest="${entry#*:}"
-      apply_profile_line "$src" "${rest%%:*}" "${rest#*:}"
-    done
-    if [[ "$shell" == "true" ]]; then
-      for entry in "${shell_lines[@]+"${shell_lines[@]}"}"; do
-        [[ "${entry%%:*}" == "$fidx" ]] || continue
-        rest="${entry#*:}"
-        apply_profile_line "$src" "${rest%%:*}" "${rest#*:}"
-      done
-    else
-      for entry in "${claude_lines[@]+"${claude_lines[@]}"}"; do
-        [[ "${entry%%:*}" == "$fidx" ]] || continue
-        rest="${entry#*:}"
-        apply_profile_line "$src" "${rest%%:*}" "${rest#*:}"
-      done
-    fi
   done
 
   if [[ -n "$p_ns" && "$p_ephemeral" == "true" ]]; then
     die "profile $profile_name: ns and ephemeral=true are mutually exclusive"
+  fi
+  if [[ -n "$p_shell" && "$shell_cli" != "true" ]]; then
+    shell="$p_shell"
   fi
   # ephemeral before ns: an applied ephemeral=true suppresses nothing (the two
   # can't coexist in one profile), but an explicit --ns must suppress it.
   if [[ -n "$p_ephemeral" && "$ephemeral_cli" != "true" && -z "$namespace" ]]; then
     ephemeral="$p_ephemeral"
   fi
-  if [[ -n "$p_ns" && -z "$namespace" && "$ephemeral" != "true" ]]; then
+  if [[ -n "$p_ns" && -z "$namespace" && "$ephemeral" != "true" && "$ns_cli" != "true" ]]; then
     namespace="$p_ns"
   fi
   if [[ -n "$p_latest" && "$latest_cli" != "true" ]]; then
@@ -1018,6 +1114,9 @@ load_profile() {
   if [[ -n "$p_paranoid" && "$paranoid_cli" != "true" ]]; then
     paranoid="$p_paranoid"
   fi
+  # Exported for the bare `csb -p NAME` implied---here decision: an explicit
+  # profile here=false must suppress the implication.
+  profile_here="$p_here"
   if [[ -n "$p_here" && "$here_cli" != "true" ]]; then
     if [[ "$p_here" == "true" && -n "$branch" ]]; then
       echo "$PROG: warning: profile here=true overridden by BRANCH '$branch' (worktree mode)" >&2
@@ -1028,9 +1127,9 @@ load_profile() {
   if [[ -n "$p_seed_creds" && "$seed_creds_cli" != "true" ]]; then
     seed_creds="$p_seed_creds"
   fi
-  # emptiness-guarded like ns: an explicit --seed-home (non-empty)
-  # beats the profile value.
-  if [[ -n "$p_seed_home" && -z "$seed_home" ]]; then
+  # An explicit --seed-home beats the profile value; --no-seed-home resets to
+  # the default template for one run (seed_home_cli covers both).
+  if [[ -n "$p_seed_home" && -z "$seed_home" && "$seed_home_cli" != "true" ]]; then
     seed_home="$p_seed_home"
   fi
   if [[ -n "$p_accent" && "$accent_cli" != "true" ]]; then
@@ -1077,9 +1176,11 @@ run_token_cmd() {
 
 mode="launch"
 no_launch="false"
-namespace=""
+namespace="";       ns_cli="false"
 profile_name=""
+profile_here=""     # set by load_profile: the profile's raw here= value
 token_cmd=""
+seatbelt_profile="" # macOS: generated profile path, reaped by trap on abnormal exit
 # Booleans a profile can default: each tracks whether the CLI set it (*_cli),
 # in either direction (-X / --no-X) — CLI beats profile beats env default.
 yolo="false";       yolo_cli="false"
@@ -1097,12 +1198,16 @@ reseed="false"      # --reseed: overwrite existing files when seeding the HOME
 cfg_tmpdir=""
 cfg_paranoid_deny=()  # config paranoid_deny=: extra --paranoid read-deny roots
 seed_home=""        # --seed-home / profile seed_home=; empty -> ~/.config/csb/home
+seed_home_cli="false"
 accent="";          accent_cli="false"  # --accent / profile accent=; statusline tint
 branch=""
 claude_args=()
 extra_keep=()
 profile_setenv=()
 ns_dir=""
+claude_home=""       # set once the namespace/ephemeral HOME is resolved; empty
+                      # default lets run_worktreesetup call build_deny_wrapper
+                      # earlier (under set -u) with no namespace HOME involved
 csb_ns=""            # resolved namespace name (empty for ephemeral)
 csb_ephemeral="false"
 
@@ -1111,6 +1216,8 @@ while [[ $# -gt 0 ]]; do
     -h|--help) usage; exit 0 ;;
     -V|--version) echo "$PROG $CSB_VERSION"; exit 0 ;;
     -d|--delete) mode="delete"; shift ;;
+    --list-ns) mode="list_ns"; shift ;;
+    --prune-ns) mode="prune_ns"; shift ;;
     -y|--yolo) yolo="true"; yolo_cli="true"; shift ;;
     --no-yolo|--yodo) yolo="false"; yolo_cli="true"; shift ;;
     --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
@@ -1120,7 +1227,9 @@ while [[ $# -gt 0 ]]; do
     --no-here) here="false"; here_cli="true"; shift ;;
     -s|--shell) shell="true"; shell_cli="true"; shift ;;
     --no-shell) shell="false"; shell_cli="true"; shift ;;
-    -N|--ns) [[ $# -ge 2 ]] || die "--ns requires a NAME"; namespace="$2"; shift 2 ;;
+    -N|--ns) [[ $# -ge 2 && -n "$2" ]] || die "--ns requires a non-empty NAME (--no-ns resets to the branch default)"
+             namespace="$2"; ns_cli="true"; shift 2 ;;
+    --no-ns) namespace=""; ns_cli="true"; shift ;;
     -E|--ephemeral) ephemeral="true"; ephemeral_cli="true"; shift ;;
     --no-ephemeral) ephemeral="false"; ephemeral_cli="true"; shift ;;
     -L|--latest) latest="true"; latest_cli="true"; shift ;;
@@ -1129,15 +1238,18 @@ while [[ $# -gt 0 ]]; do
     --no-verbose) verbose="false"; verbose_cli="true"; shift ;;
     --seed-creds) seed_creds="true"; seed_creds_cli="true"; shift ;;
     --no-seed-creds) seed_creds="false"; seed_creds_cli="true"; shift ;;
-    --seed-home) [[ $# -ge 2 ]] || die "--seed-home requires a DIR"; seed_home="$2"; shift 2 ;;
-    --accent) [[ $# -ge 2 ]] || die "--accent requires a COLOR"; accent="$2"; accent_cli="true"; shift 2 ;;
+    --seed-home) [[ $# -ge 2 && -n "$2" ]] || die "--seed-home requires a non-empty DIR (--no-seed-home resets to the default template)"
+                 seed_home="$2"; seed_home_cli="true"; shift 2 ;;
+    --no-seed-home) seed_home=""; seed_home_cli="true"; shift ;;
+    --accent) [[ $# -ge 2 && -n "$2" ]] || die "--accent requires a COLOR (--no-accent untints)"
+              accent="$2"; accent_cli="true"; shift 2 ;;
     --no-accent) accent=""; accent_cli="true"; shift ;;
     --reseed) reseed="true"; shift ;;
     -k|--keep)
       [[ $# -ge 2 ]] || die "--keep requires a VAR name"
       [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env var name for --keep: '$2'"
       extra_keep+=("$2"); shift 2 ;;
-    -p|--profile) [[ $# -ge 2 ]] || die "--profile requires a NAME"; profile_name="$2"; shift 2 ;;
+    -p|--profile) [[ $# -ge 2 && -n "$2" ]] || die "--profile requires a non-empty NAME"; profile_name="$2"; shift 2 ;;
     --no-sandbox) die "--no-sandbox was removed: the devShell launch is the only mode; drop the flag" ;;
     --) shift; claude_args+=("$@"); claude_args_cli="true"; break ;;
     -*) usage >&2; die "unknown option: $1" ;;
@@ -1168,10 +1280,35 @@ if [[ -n "$profile_name" ]]; then
   load_profile
 fi
 
+# Bare `csb -p NAME` (no BRANCH) launches --here rather than falling into list
+# mode: a profile is a launch config, and plain `csb` still lists. Suppressed
+# when the CLI or the profile said otherwise (--no-here / here=false).
+if [[ -n "$profile_name" && "$mode" == "launch" && -z "$branch" \
+      && "$here" != "true" && "$here_cli" != "true" && "$profile_here" != "false" ]]; then
+  here="true"
+fi
+
 # Quiet nix's own progress/eval output unless verbose. Computed AFTER the profile
 # load so a profile verbose= (or -v/CSB_VERBOSE) governs it. Expanded into every
 # host-side nix build/develop below via the safe empty-array pattern.
 nix_quiet=(); [[ "$verbose" == "true" ]] || nix_quiet=(--quiet)
+
+# The env scrub allowlist: computed early (before ensure_worktree/
+# run_worktreesetup) so both the sandboxed .worktreesetup.sh call and the real
+# claude/-s launch get the identical scrub. nix sets PATH/toolchain from the
+# devShell, so `env` and the absolute paths resolve. HOME is kept (real) so
+# the devShell shellHook has one; the `env` wrapper at launch then overrides
+# HOME for the launched process and its children. SSH_AUTH_SOCK is
+# deliberately NOT kept — SSH push/fetch stays in your own shell.
+# __NIXOS_SET_ENVIRONMENT_DONE: on NixOS, an interactive bash (SYS_BASHRC =
+# /etc/bashrc) re-sources /etc/set-environment when the guard var is missing,
+# clobbering the devShell PATH. Keeping it is a no-op elsewhere.
+keep_vars=(HOME USER TERM LANG LC_ALL CLAUDE_CODE_OAUTH_TOKEN
+           GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+           __NIXOS_SET_ENVIRONMENT_DONE)
+keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
+keep_args=()
+for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 
 # Validate the namespace name: named namespaces become a directory under
 # ~/.csb/claudes. A leading @ marks a deliberately unscoped (cross-repo shared)
@@ -1205,10 +1342,11 @@ fi
 
 # Host-side credential work, before any worktree/namespace side effects (a
 # token_cmd failure must abort a clean launch, not a half-prepared one).
-# Skipped for delete/list/prepare-only invocations, which launch nothing; the
-# -s shell skips token_cmd too (it runs no claude — no reason to touch the
-# password store).
-if [[ "$mode" == "launch" && "$no_launch" != "true" && "$shell" != "true" ]]; then
+# Skipped for delete/list/prepare-only invocations, which launch nothing (the
+# branch/--here term keeps a listing run out of the password store); the -s
+# shell skips token_cmd too (it runs no claude — no reason to touch it).
+if [[ "$mode" == "launch" && "$no_launch" != "true" && "$shell" != "true" \
+      && ( -n "$branch" || "$here" == "true" ) ]]; then
   run_token_cmd
 fi
 
@@ -1217,15 +1355,83 @@ fi
 git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
 repo_root=$(git rev-parse --show-toplevel)
 ns_repo_key=$(repo_key "$repo_root")
+# The main checkout root: differs from repo_root when run from inside a linked
+# worktree. List/namespace modes read from here so they work from anywhere.
+main_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+
+# --- namespace list / prune modes ---------------------------------------------------
+
+# Classify one repo-scoped namespace dir. Echoes:
+#   active   worktree present for the decoded branch
+#   branch   branch exists, no worktree (e.g. --here use)
+#   orphan   branch-derived, branch AND worktree gone -> --prune-ns removes it
+#   explicit --ns provenance, never auto-pruned
+#   unknown  no provenance stamp (pre-stamp dir), never auto-pruned
+classify_ns() {
+  local dir="$1" ns="$2" kind="" br
+  [[ -f "$dir/.csb-ns" ]] && kind=$(sed -n 's/^kind=//p' "$dir/.csb-ns" | head -n 1)
+  br=$(decode_branch "$ns")
+  if [[ -n "$(find_worktree "$main_root" "$br")" || -d "$main_root/.worktrees/$ns" ]]; then
+    echo "active"; return
+  fi
+  case "$kind" in
+    ns)     echo "explicit"; return ;;
+    branch) ;;
+    *)      echo "unknown"; return ;;
+  esac
+  if branch_exists "$main_root" "$br"; then echo "branch"; else echo "orphan"; fi
+}
+
+if [[ "$mode" == "list_ns" || "$mode" == "prune_ns" ]]; then
+  [[ -z "$branch" ]] || die "--list-ns/--prune-ns take no BRANCH argument"
+  ns_root="$CSB_NS_ROOT/$ns_repo_key"
+  count=0; pruned=0
+  [[ "$mode" == "list_ns" ]] && echo "csb namespaces under $ns_root:"
+  if [[ -d "$ns_root" ]]; then
+    for d in "$ns_root"/*; do
+      [[ -d "$d" ]] || continue
+      ns=$(basename "$d")
+      status=$(classify_ns "$d" "$ns")
+      count=$((count + 1))
+      if [[ "$mode" == "list_ns" ]]; then
+        case "$status" in
+          active)   printf '  %-28s branch %s (worktree active)\n' "$ns" "$(decode_branch "$ns")" ;;
+          branch)   printf '  %-28s branch %s (no worktree)\n' "$ns" "$(decode_branch "$ns")" ;;
+          orphan)   printf '  %-28s ORPHAN: branch %s and its worktree are gone (--prune-ns removes)\n' \
+                      "$ns" "$(decode_branch "$ns")" ;;
+          explicit) printf '  %-28s explicit --ns (never auto-pruned)\n' "$ns" ;;
+          unknown)  printf '  %-28s unknown origin (never auto-pruned; a launch classifies it)\n' "$ns" ;;
+        esac
+      elif [[ "$status" == "orphan" ]]; then
+        echo "$PROG: removing orphaned namespace $d (branch '$(decode_branch "$ns")' and its worktree are gone)"
+        rm -rf "$d"
+        pruned=$((pruned + 1))
+      fi
+    done
+  fi
+  if [[ "$mode" == "list_ns" ]]; then
+    (( count > 0 )) || echo "  (none)"
+    shopt -s nullglob
+    shared_ns=("$CSB_NS_ROOT"/@*)
+    shopt -u nullglob
+    if (( ${#shared_ns[@]} > 0 )); then
+      echo "shared namespaces under $CSB_NS_ROOT (cross-repo, never auto-removed):"
+      for d in "${shared_ns[@]}"; do echo "  $(basename "$d")"; done
+    fi
+  else
+    (( pruned > 0 )) || echo "$PROG: no orphaned namespaces to prune under $ns_root"
+  fi
+  exit 0
+fi
 
 # --- list mode (no branch, launch, not --here) ------------------------------------
 
 if [[ "$mode" == "launch" && -z "$branch" && "$here" != "true" ]]; then
-  echo "csb worktrees under $repo_root/.worktrees:"
+  echo "csb worktrees under $main_root/.worktrees:"
   # `|| true` keeps pipefail from tripping when there are no matching worktrees
   # (awk exits 0 either way) or `git worktree list` fails outside a repo.
-  git -C "$repo_root" worktree list 2>/dev/null \
-    | awk -v pre="$repo_root/.worktrees/" 'index($1, pre) == 1' || true
+  git -C "$main_root" worktree list 2>/dev/null \
+    | awk -v pre="$main_root/.worktrees/" 'index($1, pre) == 1' || true
   exit 0
 fi
 
@@ -1241,12 +1447,28 @@ fi
 if [[ "$mode" == "delete" ]]; then
   [[ -n "$branch" ]] || die "delete mode requires a branch name"
   wt_path=$(find_worktree "$repo_root" "$branch")
-  if [[ -z "$wt_path" ]]; then
+  # Teardown/removal only ever applies to worktrees csb created under
+  # .worktrees/ — find_worktree returns ANY checkout of the branch, including
+  # the main tree or a hand-made worktree, which -d must not touch (running
+  # the repo's `down` teardown against them would be destructive).
+  wt_refused="false"
+  if [[ -n "$wt_path" ]]; then
+    case "$wt_path" in
+      "$repo_root"/.worktrees/*) ;;
+      *)
+        echo "$PROG: branch '$branch' is checked out at $wt_path — not a csb worktree;" >&2
+        echo "  leaving it alone (only the namespace config is removed, below)" >&2
+        wt_path=""
+        wt_refused="true"
+        ;;
+    esac
+  fi
+  if [[ -z "$wt_path" && "$wt_refused" != "true" ]]; then
     candidate=$(worktree_path "$repo_root" "$branch")
     [[ -d "$candidate" ]] && wt_path="$candidate"
   fi
   if [[ -z "$wt_path" ]]; then
-    echo "$PROG: no worktree for '$branch'"
+    [[ "$wt_refused" == "true" ]] || echo "$PROG: no worktree for '$branch'"
   elif [[ -d "$wt_path" ]]; then
     run_worktreesetup down "$wt_path" "$branch"
     echo "$PROG: removing worktree $wt_path"
@@ -1307,26 +1529,9 @@ if [[ "$no_launch" == "true" ]]; then
 fi
 
 # csb runs inside a devShell. Prefer the repo's own flake devShell; if the repo
-# has none for this system, fall back to a generic devShell from csb's own flake
-# so the sandbox can still run against repos that don't ship a flake. nix flakes
-# ignore UNTRACKED files, so a brand-new flake.nix that hasn't been `git add`ed
-# is invisible to nix develop -- the eval below treats that as "no devShell" and
-# falls back too.
-case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64)              csb_system="aarch64-darwin" ;;
-  Darwin-x86_64)             csb_system="x86_64-darwin" ;;
-  Linux-x86_64)              csb_system="x86_64-linux" ;;
-  Linux-aarch64|Linux-arm64) csb_system="aarch64-linux" ;;
-  *)                         csb_system="" ;;
-esac
-devshell_ref="$worktree"
-if [[ ! -f "$worktree/flake.nix" ]] || \
-   { [[ -n "$csb_system" ]] && \
-     ! nix eval "$worktree#devShells.$csb_system.default.name" >/dev/null 2>&1; }; then
-  devshell_ref="$CSB_SELF#fallback"
-  echo "$PROG: no repo devShell at $worktree -- using csb's generic fallback devShell" >&2
-  echo "$PROG: add devShells.default for a project toolchain (nix flake init -t $CSB_SELF; git add flake.nix)" >&2
-fi
+# has none for this system, fall back to a generic devShell from csb's own
+# flake so the sandbox can still run against repos that don't ship a flake.
+devshell_ref=$(resolve_devshell_ref "$worktree")
 
 setup_namespace "$worktree"
 
@@ -1342,7 +1547,8 @@ export_git_identity
 # nix's fetch cached across same-day launches. Empty array = use the lock as-is.
 # The input name must match flake.nix's inputs.claude-code.
 nix_latest_args=()
-if [[ "$latest" == "true" ]]; then
+# The -s shell never builds claude, so skip the upstream check there entirely.
+if [[ "$latest" == "true" && "$shell" != "true" ]]; then
   claude_rev="$(latest_claude_rev)"
   nix_latest_args=(--override-input claude-code "$CSB_CLAUDE_FLAKE/$claude_rev")
 fi
@@ -1379,8 +1585,14 @@ fi
 # claude, so it gets no credential dance at all (and no token warning); the
 # seeded session makes the token warning moot otherwise.
 if [[ "$shell" == "true" ]]; then
-  :
+  if [[ "$seed_creds" == "true" ]]; then
+    echo "$PROG: warning: --seed-creds has no effect with --shell (no claude runs; skipping)" >&2
+  fi
 elif [[ "$seed_creds" == "true" ]]; then
+  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    echo "$PROG: warning: CLAUDE_CODE_OAUTH_TOKEN is set and takes precedence over the" >&2
+    echo "  seeded session credential (unset it, or drop token_cmd=, to use --seed-creds)" >&2
+  fi
   seed_credentials "${CSB_CLAUDE_CONFIG_DIR:-$claude_home/.claude}"
 else
   warn_if_no_token
@@ -1442,20 +1654,9 @@ build_deny_wrapper
 vecho "$PROG: launching in the devShell at $worktree"
 vecho "$PROG:   scrubbed env, HOME=$claude_home, fs deny-list on; network OPEN"
 
-# Scrub the environment, re-admit only an allowlist (+ --keep VARs). nix sets
-# PATH/toolchain from the devShell, so `env` and the absolute paths resolve.
-# HOME is kept (real) so the devShell shellHook has one; the `env` wrapper then
-# overrides HOME for the launched process and its children. SSH_AUTH_SOCK is
-# deliberately NOT kept — SSH push/fetch stays in your own shell.
-# __NIXOS_SET_ENVIRONMENT_DONE: on NixOS, an interactive bash (SYS_BASHRC =
-# /etc/bashrc) re-sources /etc/set-environment when the guard var is missing,
-# clobbering the devShell PATH. Keeping it is a no-op elsewhere.
-keep_vars=(HOME USER TERM LANG LC_ALL CLAUDE_CODE_OAUTH_TOKEN
-           GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
-           __NIXOS_SET_ENVIRONMENT_DONE)
-keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
-keep_args=()
-for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
+# Scrub the environment, re-admit only an allowlist (+ --keep VARs). See
+# keep_vars/keep_args above (computed early so run_worktreesetup's sandboxed
+# .worktreesetup.sh call gets the same scrub as the real launch below).
 
 # Append /usr/bin to PATH at launch so bare-name lookups resolve system-only
 # tools (pbcopy/pbpaste, osascript). Those are already exec'able by absolute

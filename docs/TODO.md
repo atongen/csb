@@ -1,31 +1,26 @@
 # TODO
 
-## misc
-
 - [X] claude statusline script should include token use count
 - [X] allow copy&paste from within a sandbox
 
-## Resume here (dogfooding csb-on-csb)
+- [X] State as of the last session
+    - csb's own `flake.nix` now exposes `devShells.default` (git + shellcheck), so
+      `csb --here` / `csb <branch>` can launch claude inside csb itself.
+    - A pre-launch guard (bin/csb, just before `setup_namespace`) fails fast when a
+      repo's `flake.nix` has no devShell for this system, instead of nix develop's
+      cryptic "does not provide attribute" error.
+    - Read deny-list floor expanded (cloud/infra/db creds + REPL/shell histories;
+      see README "The read deny list").
+    - New `--paranoid` flag (and profile key): flips reads to deny-real-HOME-minus-
+      allowlist. Verified end-to-end on macOS/seatbelt AND Linux/bwrap (NixOS):
+      claude logs in, real-home and sibling-namespace reads denied, active-namespace
+      reads allowed; under bwrap the real HOME is tmpfs'd and the worktree/namespace
+      remain readable.
+      * Fixed a seatbelt alias-precedence bug that logged claude out under paranoid:
+        a later `(allow file* ns)` does NOT override an earlier `(deny file-read*
+        real_home)`, so the namespace needed its own `file-read*` re-allow. See
+        docs/PARANOID.md.
 
-State as of the last session (all UNCOMMITTED in the working tree):
-- csb's own `flake.nix` now exposes `devShells.default` (git + shellcheck), so
-  `csb --here` / `csb <branch>` can launch claude inside csb itself.
-- A pre-launch guard (bin/csb, just before `setup_namespace`) fails fast when a
-  repo's `flake.nix` has no devShell for this system, instead of nix develop's
-  cryptic "does not provide attribute" error.
-- Read deny-list floor expanded (cloud/infra/db creds + REPL/shell histories;
-  see README "The read deny list").
-- New `--paranoid` flag (and profile key): flips reads to deny-real-HOME-minus-
-  allowlist. Verified end-to-end on macOS/seatbelt AND Linux/bwrap (NixOS):
-  claude logs in, real-home and sibling-namespace reads denied, active-namespace
-  reads allowed; under bwrap the real HOME is tmpfs'd and the worktree/namespace
-  remain readable.
-  * Fixed a seatbelt alias-precedence bug that logged claude out under paranoid:
-    a later `(allow file* ns)` does NOT override an earlier `(deny file-read*
-    real_home)`, so the namespace needed its own `file-read*` re-allow. See
-    docs/PARANOID.md.
-
-Next steps:
 - [X] first live dogfood run: from the csb main checkout, `csb --here -s -- shellcheck bin/csb`
       (shell mode, no claude needed) should enter the devShell and pass; then
       `csb --here` to confirm claude launches. nix ignores UNTRACKED files, so
@@ -52,6 +47,20 @@ Next steps:
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch
       when the blacklist feels insufficient.
+- [ ] designed-but-deferred: per-profile / per-run deny and
+      allow-write additions, so one app's extra write root doesn't have to be
+      granted machine-wide via ~/.config/csb/allow-write. Shape when needed:
+      repeatable `deny=` / `allow_write=` profile keys (accumulating like
+      keep=/setenv= across base + .local) and optionally repeatable `--deny` /
+      `--allow-write` CLI flags, feeding the existing user-config paths in
+      build_deny_paths/build_write_roots (same ~/ expansion, canonicalization,
+      quote/backslash refusal, add-only floor). Two constraints are load-
+      bearing: values may come ONLY from operator-authored sources — profiles
+      (~/.config/csb is outside every write root, so the agent can't edit them)
+      and CLI flags — never from repo/worktree files, or the agent could widen
+      its own sandbox (same escalation class the .worktreesetup.sh gate
+      closes); and document that allow_write widens --paranoid READS too,
+      since write roots are read-re-allowed there.
 - [x] ~~future --aws upgrade path (out of scope for plan-002): host-side
       credential broker + AWS_CONTAINER_CREDENTIALS_FULL_URI, viable because
       sandbox networking is open — would fix the no-refresh-in-session caveat.~~

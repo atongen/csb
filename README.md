@@ -19,14 +19,17 @@ can reach local db/redis/etc for testing. The sandbox shrinks what can be
 read/written; it is **not** an egress firewall -- anything readable is
 exfiltratable. Read the [threat model](#threat-model) before relying on it.
 
-**Decoupled by design:** the repo needs no csb-specific files -- just its own
-`flake.nix` with `devShells.default`. The claude binary comes from *csb's own*
-flake; the repo never imports csb.
+**Decoupled by design:** the repo needs no csb-specific files. Its own
+`flake.nix` with `devShells.default` is preferred, not required -- csb falls
+back to a generic devShell otherwise (see [What a repo needs](#what-a-repo-needs)).
+The claude binary comes from *csb's own* flake; the repo never imports csb.
 
 > **Status.** Verified end-to-end on `aarch64-darwin` (seatbelt) and on NixOS
-> (bubblewrap). Distribution is currently **local-only**: `CSB_SELF` defaults to a self-hosted
-> git remote, so `make install` / `nix run` work only where that remote is
-> reachable. A public home is pending validation (`docs/TODO.md`).
+> (bubblewrap). Distribution is currently **local-only**: `CSB_SELF` defaults
+> to a self-hosted git remote. `make install` just copies the script and needs
+> no remote; *launching* fetches the claude binary from `CSB_SELF`, so that
+> works only where the remote is reachable. A public home is pending validation
+> (`docs/TODO.md`).
 
 ## Quickstart
 
@@ -40,16 +43,23 @@ csb feature/foo                  # worktree for feature/foo + claude in the devS
 Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
 box); `csb` shells out to `nix`.
 
-Two environment variables tune where csb gets things:
+Four environment variables tune csb:
 
 - **`CSB_SELF`** -- the flake ref csb pulls its claude binary (and, on Linux,
   bubblewrap) from. Defaults to the self-hosted remote
   `git+ssh://git@git.grandrew.com/atongen/csb.git`. For local development against
   a working tree, override per-invocation: `CSB_SELF=path:/path/to/csb csb ...`.
-- **`CSB_LATEST`** -- if set (non-empty), defaults `-L/--latest` on: each run
-  re-locks the `claude-code` flake input to its upstream HEAD instead of the rev
-  pinned in `flake.lock`. Trades reproducibility (and a little startup latency)
-  for always getting the newest claude. `-L` does the same for a single run.
+- **`CSB_LATEST`** -- if set (non-empty), defaults `-L/--latest` on: re-lock the
+  `claude-code` flake input to its upstream HEAD instead of the rev pinned in
+  `flake.lock`. Trades reproducibility for always getting the newest claude.
+  `-L` does the same for a single run.
+- **`CSB_LATEST_TTL`** -- seconds to reuse a cached upstream rev under
+  `-L`/`CSB_LATEST` before re-checking (default `86400` = daily; `0` = check
+  every run). Within the window the rev is pinned, so launches stay fully
+  cached and reproducible.
+- **`CSB_VERBOSE`** -- if set (non-empty), defaults `-v/--verbose` on. Launches
+  are otherwise quiet: csb's routine narration and nix's own progress are
+  suppressed (warnings and errors always print).
 
 ## Use
 
@@ -68,6 +78,8 @@ csb --ns @work feature/foo       # unscoped namespace, shared across repos
 csb -E feature/foo               # ephemeral: throwaway config/HOME, no namespace
 csb -n feature/foo               # just prepare/reuse the worktree, don't launch (prints its path)
 csb -d feature/foo               # remove the worktree AND its namespace config (branch is kept)
+csb --list-ns                    # list this repo's namespace configs (flags orphans)
+csb --prune-ns                   # remove orphaned branch-derived namespace configs
 csb                              # list csb worktrees
 ```
 
@@ -135,7 +147,17 @@ namespace, so one branch's agent can't read another's history.
 `csb -d <branch>` removes the worktree **and** its per-branch namespace config
 (stale configs hold session history and the auth they were seeded with, a
 footprint risk). Pass the same `--ns` you launched with; without it, `-d` only
-removes the branch-derived namespace.
+removes the branch-derived namespace. Only worktrees csb created under
+`.worktrees/` are ever torn down/removed -- a branch checked out in the main
+tree or a hand-made worktree is left alone.
+
+Namespace configs can still outlive their branch (`-d` with a different `--ns`
+than you launched with, a branch deleted outside csb, `--here` launches).
+`csb --list-ns` shows this repo's configs and flags **orphans** --
+branch-derived namespaces whose branch and worktree are both gone;
+`csb --prune-ns` removes exactly those. Explicit `--ns` and shared `@`
+namespaces are never auto-removed, and dirs predating the provenance stamp are
+listed but left alone (any launch stamps them).
 
 ## Profiles
 
@@ -150,13 +172,15 @@ ns=@work                                  # as --ns
 token_cmd=pass work/claude/token          # run host-side via bash -c;
                                           # stdout -> CLAUDE_CODE_OAUTH_TOKEN (never echoed)
 latest=true                               # as -L/--latest; beats CSB_LATEST, loses to explicit -L
+verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, loses to explicit -v
 yolo=true                                 # as -y/--yolo (allow-all)
 paranoid=true                             # as --paranoid (whitelist reads; see below)
 here=true                                 # as --here; an explicit BRANCH wins (with a warning)
 ephemeral=true                            # as -E; excludes ns= in the same profile
-shell=true                                # as -s/--shell (shared section only)
-seed_creds=true                           # as --seed-creds (skipped in -s shell mode)
+shell=true                                # as -s/--shell
+seed_creds=true                           # as --seed-creds (skipped in -s shell mode, with a warning)
 seed_home=~/.config/csb/home              # as --seed-home; template copied into the launch HOME
+accent=magenta                            # as --accent; statusline tint (csb --help lists the colors)
 args=bash --rcfile ~/.config/my.bashrc    # the ARGS after --: command in -s mode, extra claude
                                           # args otherwise. Whitespace-split, no quoting; a leading
                                           # ~/ or ${HOME} expands to the HOST home.
@@ -164,30 +188,11 @@ keep=COLORTERM DIRENV_LOG_FORMAT          # space-separated, appended to --keep
 setenv=CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1 # repeatable; injected post-scrub
 ```
 
-Note: bare `csb -p NAME` **launches** (it does not list worktrees); plain `csb`
-always lists. A failing or empty-output `token_cmd` aborts the launch before any
-worktree/namespace side effects.
-
-**Sections -- one profile, both modes.** Lines before any header (or under
-`[shared]`) always apply; `[claude]` applies only when claude launches, `[shell]`
-only under `-s`. The mode is resolved first (CLI `-s`/`--no-shell` beats a shared
-`shell=`), then shared lines, then the active section's -- so a section value
-overrides a shared one for scalar keys, while `keep=`/`setenv=` accumulate. In
-shell mode `token_cmd=` and `seed_creds=` are skipped (a shell runs no claude).
-
-```
-ns=@work
-seed_creds=true
-latest=true
-setenv=COLORTERM=truecolor
-
-[shell]
-here=true
-args=bash --rcfile ~/.config/nix-dev-pure.bashrc
-```
-
-`csb -p work feature/foo` launches claude in a worktree; `csb -p work -s` drops
-into the rcfile'd shell in the current dir -- one file, one flag.
+Note: bare `csb -p NAME` (no BRANCH) **launches** in the current dir --
+`--here` is implied, unless the CLI or the profile says otherwise; plain `csb`
+always lists. A failing or empty-output `token_cmd` aborts the launch before
+any worktree/namespace side effects. In `-s` shell mode `token_cmd=` is skipped
+and `seed_creds=` is ignored with a warning (a shell runs no claude).
 
 **Host-specific overlay.** A profile `NAME` can have a sibling, gitignored
 `NAME.local` layered on top after it is read: same syntax/sections, but its
@@ -241,13 +246,12 @@ the worktree root is read directly, and a gitignored one can ride in via
 
 ## Per-repo worktree files
 
-These are read from the worktree in worktree mode (not `--here`). All are
-repo-controlled and run/inject **host-side, unsandboxed** -- see the
-[threat model](#threat-model).
+These are read from the worktree in worktree mode (not `--here`).
 
 **`.worktreeinclude`** (repo root, `.gitignore` syntax) -- csb copies matching
-**gitignored** files (local `.env`s, generated config) into a newly created
-worktree; existing files are never overwritten. A generic worktree-tooling
+**gitignored** files (local `.env`s, generated config, a personal
+`.worktreesetup.sh`) into the worktree on **every** launch/prepare, **host-side,
+unsandboxed**; existing files are never overwritten. A generic worktree-tooling
 convention, not csb-specific.
 
 **`.worktreesetup.sh`** (in the worktree, executable) -- a library of shell
@@ -262,9 +266,19 @@ branch is passed as `$1`. Define either or both:
   warns; the delete still proceeds. `down` gets only the branch (delete does not
   load `.worktreeenv`), so re-derive any state from it exactly as `up` did.
 
-csb sources the worktree's *own* copy in a subshell (so a stray `set -e`/`exit`
-can't escape into csb), so each branch can carry its own setup. Top-level code
-runs at source time on both paths -- keep the real work inside the functions.
+Unlike `.worktreeinclude`, this file runs **sandboxed**: csb sources it (cwd =
+worktree) and calls the requested function inside the repo's own devShell,
+behind the *same* deny-list containment and env scrub (`--ignore-environment` +
+`--keep`) the eventual claude/`-s` launch gets -- so it has no more host access
+than the agent's own sandboxed shell already would. It needs no git-tracking or
+commit -- gitignore it, or bring in a personal copy via `.worktreeinclude`, if
+it's specific to your machine. `up` failures abort the launch; `down` failures
+only warn (`--delete` still completes). Local (network-reachable) services like Postgres/Redis stay
+reachable from inside the sandbox exactly as they do for claude itself --
+[network stays open by design](#threat-model).
+
+Top-level code in the script runs at source time on both `up` and `down` --
+keep the real work inside the functions.
 
 ```bash
 #!/usr/bin/env bash
@@ -296,8 +310,9 @@ A profile's `setenv=` is injected *after* `.worktreeenv`, so user config wins
 when both set a var. A literal `${HOME}` in a value expands to the launch's
 *effective* home (the namespace dir, or throwaway dir with `-E`) -- the only way
 to anchor a value to the sandbox HOME, since generators run before the namespace
-is resolved. In `--here` mode an existing `.worktreeenv` is honored, but setup
-and seeding are not run.
+is resolved. In `--here` mode an existing `.worktreeenv` is honored, but
+`.worktreeinclude` and `.worktreesetup.sh` are not run ([seeding the sandbox
+HOME](#seeding-the-sandbox-home) still happens on every launch).
 
 ## Filesystem sandbox
 
@@ -312,16 +327,18 @@ launch):
 ```
 secrets / keys   ~/.ssh  ~/.aws  ~/.gnupg  ~/.password-store  ~/.netrc
                  ~/.azure  ~/.oci  ~/.vault-token  ~/.granted
+                 ~/.config/age/keys.txt  ~/.config/sops  ~/.sops
 claude           ~/.claude  ~/.claude.json{,.backup}
                  ~/.csb/claudes  (the active namespace is re-allowed)
-cloud / infra    ~/.config/{gh,gcloud,doctl,fly,rclone,op,configstore,git,
-                 github-copilot}  ~/.kube  ~/.docker  ~/.gemini
+cloud / infra    ~/.config/{gh,gcloud,doctl,fly,rclone,op,configstore,
+                 github-copilot}  ~/.config/containers/auth.json
+                 ~/.kube  ~/.docker  ~/.gemini  ~/.pulumi/credentials.json
                  ~/.terraformrc  ~/.terraform.d  ~/.databrickscfg{,.bak}
                  ~/.databricks  ~/.mc  ~/.minio  ~/.s3cfg  ~/.boto
 packaging creds  ~/.cargo/credentials{,.toml}  ~/.gem/credentials  ~/.pypirc
                  ~/.m2/settings.xml
 db creds         ~/.pgpass  ~/.my.cnf
-git / vcs        ~/.gitconfig  ~/.config/git
+git / vcs        ~/.gitconfig  ~/.config/git  ~/.git-credentials
 shell / REPL     ~/.bash_history  ~/.zsh_history  ~/.python_history
 history          ~/.node_repl_history  ~/.irb_history  ~/.rdbg_history
                  ~/.pry_history  ~/.rediscli_history  ~/.mysql_history
@@ -339,8 +356,17 @@ may need them): `~/.npmrc`, `~/.bundle/config`, `~/.yarnrc`. Add your own in
 `${XDG_CONFIG_HOME:-~/.config}/csb/deny` -- one path per line, leading `~/`
 expanded, `#` comments and blanks ignored. **Add-only**: the built-ins can never
 be removed via config; any other line is a parse error and the launch aborts
-loudly. (Denying `~/Library/Keychains` makes host `security` calls fail inside
-the sandbox -- expected, but it may surprise repo tooling that shells out to it.)
+loudly.
+
+**Keychain caveat (macOS).** Denying `~/Library/Keychains` blocks direct file
+reads of the keychain DB, and in practice the `security` CLI **fails closed**
+under it (verified: an item present on the host returns "could not be found"
+in-sandbox). The guarantee is empirical, not structural: `security` talks to
+`securityd` -- a separate, unsandboxed process -- over mach, and this profile
+does **not** deny mach lookups, so a different client of that service could
+behave differently. Re-check your box with
+`csb -s -E --here -- security find-generic-password -s '<item-name>' -w`
+(conclusive only if the same command outside csb returns the secret).
 
 ### Write allow-list
 
@@ -348,11 +374,14 @@ Writes are **default-denied**; allowed roots:
 
 - the worktree (or the current dir with `--here`)
 - the repo's git common dir -- commits from a linked worktree write objects into
-  the main repo's `.git` -- **except** `hooks/` and `config` (host code-exec
-  vectors), which stay read-only
+  the main repo's `.git` -- **except** `hooks/` and `config`/`config.worktree`
+  (host code-exec vectors), which stay read-only *even when they don't exist
+  yet* (an existence-conditional deny could be bypassed by creating them)
 - the active namespace HOME (or the ephemeral HOME)
-- tmp: `/tmp`, the per-user temp/cache dirs (macOS), `/var/tmp` (Linux), and the
-  configured `tmpdir` if set
+- tmp: `/tmp`, the per-user `/var/folders/...` temp/cache dir (macOS; derived
+  via `getconf`, never from `$TMPDIR` -- a stripped or nix-set `TMPDIR` must
+  not widen the write policy), `/var/tmp` (Linux), and the configured `tmpdir`
+  if set
 - `/dev` (ptys -- the TUI writes its terminal)
 
 Extra roots go in `${XDG_CONFIG_HOME:-~/.config}/csb/allow-write`, same format
@@ -477,10 +506,21 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   directories listable -- so sibling volume/host/org/repo *names* on that one path
   are visible, though sibling *contents* stay denied. Bounded by design; see
   [`--paranoid`: ancestor traversal and what it leaks](#--paranoid-ancestor-traversal-and-what-it-leaks).
-- **Host-side trust.** All `nix` eval/build/develop, the repo's
-  `flake.nix`/`shellHook`, and `.worktreesetup.sh` run on the host,
-  **unsandboxed**. Only the final claude/bash process is wrapped. Don't point csb
-  at a repo you don't trust.
+- **Host-side trust (flake.nix/shellHook only).** All `nix` eval/build/develop,
+  and the repo's `flake.nix`/`shellHook`, run on the host, **unsandboxed** --
+  nix itself is out of scope for containment. `.worktreesetup.sh` is not in
+  this bucket: its `up`/`down` run *inside* the deny-list wrapper, in the same
+  devShell and with the same env scrub the eventual claude/`-s` launch gets
+  (see [Per-repo worktree files](#per-repo-worktree-files)), so a malicious or
+  agent-modified copy has no more reach than the agent's own sandboxed shell.
+  The genuinely host-side surface is `flake.nix`/`shellHook`: the worktree is
+  **agent-writable**, and nix reads *tracked but uncommitted* edits from a
+  dirty worktree -- no commit required -- so an agent could get host execution
+  on your **next launch** of that branch by editing either. Don't point csb at
+  a repo you don't trust, and review agent changes to `flake.nix`/`shellHook`
+  before relaunching a branch an agent has worked on. `.git/hooks` / `config` /
+  `config.worktree` are write-denied even when absent, closing that adjacent
+  host-exec path.
 - **Single layer.** The seatbelt/bwrap profile *is* the containment -- no
   unprivileged-user boundary underneath. On macOS a second boundary means a
   separate OS user or a VM, not a profile tweak (seatbelt has no
@@ -530,7 +570,8 @@ templates/home/            starter seed-home skeleton (copy to ~/.config/csb/hom
 Makefile                   install, lint, and build targets (make help)
 docs/PLAN-002.md           the implemented design (single mode, deny-list, profiles)
 docs/PLAN-003.md           roadmap: VM second boundary (not implemented)
+docs/PLAN-004.md           the pre-release audit: findings, fixes, scope decisions
 docs/TODO.md               current state and next steps
 ```
 
-See `docs/` for design rationale and history (`PLAN-000` ... `PLAN-003`).
+See `docs/` for design rationale and history (`PLAN-000` ... `PLAN-004`).
