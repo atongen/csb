@@ -22,9 +22,16 @@
             packages = with pkgs; [
               git
               jq  # lets a seeded claude statusline parse the session JSON
+              bashInteractive bash-completion neovim less  # interactive shell
               # <-- add your toolchain here (ruby, nodejs, cargo, …) and any
               #     native-build/runtime deps + lib-path env in a shellHook.
             ];
+
+            # Expose bash-completion for a seeded interactive rc to source, so
+            # `csb -s` on this repo is comfortable. Add your lib-path env here.
+            shellHook = ''
+              export BASH_COMPLETION="${pkgs.bash-completion}/share/bash-completion/bash_completion"
+            '';
           };
         });
     };

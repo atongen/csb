@@ -549,6 +549,19 @@ sandbox still runs, logging a note on launch. nix ignores untracked files, so a
 brand-new `flake.nix` counts as absent until you `git add` it -- csb falls back
 in that case too.
 
+The fallback aims to be genuinely comfortable for both claude and an
+interactive `csb -s` shell -- a language-agnostic toolset with no project
+toolchain:
+
+- **gnu toolset** (shadows macOS BSD `/usr/bin` variants, matches Linux):
+  `coreutils`, `gnused`, `gnugrep`, `gawk`, `findutils`, `gnutar`,
+  `diffutils`, `gnumake`
+- **vcs + repo/agent staples:** `git`, `ripgrep`, `fd`, `jq`, `yq-go`,
+  `curl`, `tree`
+- **interactive shell:** `bashInteractive`, `bash-completion`, `neovim`,
+  `less` (the shellHook exports `BASH_COMPLETION` for a seeded rc to source)
+- **convenience:** `gzip`, `xz`, `zstd`, `unzip`, `delta`, `bat`
+
 For a project-specific toolchain, expose a standard `flake.nix` with
 `devShells.default` (the repo's full toolchain); csb prefers it over the
 fallback. Scaffold a minimal standalone dev flake with:

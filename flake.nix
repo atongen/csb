@@ -78,11 +78,19 @@
           # their own devShells.default (nix flake init -t <csb>).
           fallback = pkgs.mkShell {
             packages = with pkgs; [
-              git
-              coreutils gnused gnugrep gawk findutils gnutar   # gnu toolset
-              ripgrep jq curl                                  # agent staples
-              fd less diffutils tree gzip                      # convenience
+              # gnu toolset (shadows macOS BSD /usr/bin variants; matches Linux)
+              coreutils gnused gnugrep gawk findutils gnutar diffutils gnumake
+              git ripgrep fd jq yq-go curl tree      # vcs + repo/agent staples
+              bashInteractive bash-completion neovim less   # interactive shell
+              gzip xz zstd unzip delta bat                  # convenience
             ];
+
+            # Expose bash-completion for an interactive rc to source (see the
+            # default devShell above); makes `csb -s` in a flakeless repo
+            # genuinely comfortable when paired with a seeded .bashrc.
+            shellHook = ''
+              export BASH_COMPLETION="${pkgs.bash-completion}/share/bash-completion/bash_completion"
+            '';
           };
         });
 
