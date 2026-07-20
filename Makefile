@@ -15,7 +15,7 @@ DEST    := $(BIN_DIR)/csb
 
 # Flake ref csb pulls the claude binary from; mirrors bin/csb's CSB_SELF default.
 # Override to refresh a different remote: make refresh CSB_SELF=path:/path/to/csb
-CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
+CSB_SELF ?= github:atongen/csb
 
 .DEFAULT_GOAL := help
 .PHONY: help install uninstall check build update refresh

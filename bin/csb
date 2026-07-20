@@ -8,7 +8,7 @@
 # Usage: csb --help    Design, threat model, and config: README.md and docs/.
 #
 # Env: CSB_SELF   flake ref csb pulls the claude binary from (default: the
-#                 self-hosted remote; override with CSB_SELF=path:/path/to/csb).
+#                 public GitHub remote; override with CSB_SELF=path:/path/to/csb).
 #      CSB_LATEST non-empty defaults -L/--latest on.
 #      CSB_LATEST_TTL seconds to reuse a cached upstream claude-code rev under
 #                 -L/--latest before re-checking (default 86400 = daily; 0 =
@@ -22,9 +22,9 @@ PROG=$(basename "$0")
 CSB_VERSION="0.1.0"
 
 # csb supplies the claude binary from its own flake (so repos stay decoupled).
-# Default: the network-local remote. For local dev against a working tree,
+# Default: the public GitHub remote. For local dev against a working tree,
 # override: CSB_SELF=path:/path/to/csb csb ...
-CSB_SELF="${CSB_SELF:-git+ssh://git@git.grandrew.com/atongen/csb.git}"
+CSB_SELF="${CSB_SELF:-github:atongen/csb}"
 
 CSB_NS_ROOT="$HOME/.csb/claudes"
 CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"
@@ -63,8 +63,13 @@ OPTIONS:
                      ~/.csb/claudes/<repo-key>/NAME. @NAME is unscoped — one
                      config shared across repos (~/.csb/claudes/@NAME); -d
                      never auto-removes @-namespaces.
-  -E, --ephemeral    throwaway config/HOME, no namespace (not persisted).
-                     Mutually exclusive with --ns.
+  -E, --ephemeral[=NAME]
+                     throwaway config/HOME, no namespace (not persisted).
+                     Mutually exclusive with --ns. Bare: a random throwaway
+                     HOME. With =NAME: a deterministic throwaway HOME under tmp
+                     (csb-home-NAME), so a sibling '$PROG -s -E=NAME' in another
+                     pane attaches to the exact same env. Still ephemeral (tmp,
+                     OS-reaped; untracked by --list-ns), not a namespace.
   -s, --shell        drop into an interactive bash — or run ARGS after -- as a
                      command — instead of claude, in the exact environment
                      claude would get: same worktree, devShell, env scrub,
@@ -1188,6 +1193,8 @@ paranoid="false";   paranoid_cli="false"
 shell="false";      shell_cli="false"
 here="false";       here_cli="false"
 ephemeral="false";  ephemeral_cli="false"
+ephemeral_name=""   # -E=NAME/--ephemeral=NAME: a reusable throwaway HOME under
+                    # tmp (deterministic path), so a sibling -s shell can attach
 seed_creds="false"; seed_creds_cli="false"
 latest="false";     latest_cli="false"
 [[ -n "${CSB_LATEST:-}" ]] && latest="true"
@@ -1231,7 +1238,12 @@ while [[ $# -gt 0 ]]; do
              namespace="$2"; ns_cli="true"; shift 2 ;;
     --no-ns) namespace=""; ns_cli="true"; shift ;;
     -E|--ephemeral) ephemeral="true"; ephemeral_cli="true"; shift ;;
-    --no-ephemeral) ephemeral="false"; ephemeral_cli="true"; shift ;;
+    -E=*|--ephemeral=*)
+      ephemeral="true"; ephemeral_cli="true"
+      ephemeral_name="${1#*=}"
+      [[ -n "$ephemeral_name" ]] || die "-E=/--ephemeral= requires a NAME (use bare -E for a random throwaway)"
+      shift ;;
+    --no-ephemeral) ephemeral="false"; ephemeral_cli="true"; ephemeral_name=""; shift ;;
     -L|--latest) latest="true"; latest_cli="true"; shift ;;
     --no-latest) latest="false"; latest_cli="true"; shift ;;
     -v|--verbose) verbose="true"; verbose_cli="true"; shift ;;
@@ -1316,6 +1328,14 @@ for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 if [[ -n "$namespace" ]]; then
   [[ "$namespace" =~ ^@?[A-Za-z0-9._-]+$ && "$namespace" != "." && "$namespace" != ".." ]] \
     || die "invalid namespace '$namespace' (use letters, digits, . _ -; optional leading @)"
+fi
+
+# Named ephemeral: NAME becomes one filesystem path component (csb-home-<NAME>),
+# so hold it to the same safe set as a namespace (no @ — there is no cross-repo
+# sharing concept for a throwaway tmp HOME).
+if [[ -n "$ephemeral_name" ]]; then
+  [[ "$ephemeral_name" =~ ^[A-Za-z0-9._-]+$ && "$ephemeral_name" != "." && "$ephemeral_name" != ".." ]] \
+    || die "invalid ephemeral name '$ephemeral_name' (use letters, digits, . _ -)"
 fi
 
 # Accent: a statusline tint, passed through as CSB_ACCENT. Accept a known color
@@ -1567,6 +1587,18 @@ if [[ -n "${CSB_CLAUDE_CONFIG_DIR:-}" ]]; then
   claude_home="$(dirname "$CSB_CLAUDE_CONFIG_DIR")"
   env_overrides=("HOME=$claude_home" "CLAUDE_CONFIG_DIR=$CSB_CLAUDE_CONFIG_DIR")
   claude_json="$CSB_CLAUDE_CONFIG_DIR/.claude.json"
+elif [[ -n "$ephemeral_name" ]]; then
+  # Named ephemeral: a DETERMINISTIC throwaway HOME under the same tmp base the
+  # random one uses (already a write root, undenied), so a sibling `csb -s
+  # -E=NAME` in another pane lands in the exact same env. Not a namespace: no
+  # ~/.csb/claudes entry, no provenance stamp, untracked by --list-ns; the OS
+  # reaps it from tmp. Both panes must resolve the same base (set tmpdir= in
+  # config, or keep $TMPDIR stable) for the paths to coincide.
+  claude_home="${cfg_tmpdir:-${TMPDIR:-/tmp}}/csb-home-$ephemeral_name"
+  (umask 077; mkdir -p "$claude_home")
+  env_overrides=("HOME=$claude_home")
+  claude_json="$claude_home/.claude.json"
+  vecho "$PROG: named ephemeral HOME (reusable): $claude_home"
 else
   claude_home="$(mktemp -d "${cfg_tmpdir:-${TMPDIR:-/tmp}}/csb-home.XXXXXX")"
   env_overrides=("HOME=$claude_home")

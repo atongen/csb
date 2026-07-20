@@ -25,11 +25,12 @@ back to a generic devShell otherwise (see [What a repo needs](#what-a-repo-needs
 The claude binary comes from *csb's own* flake; the repo never imports csb.
 
 > **Status.** Verified end-to-end on `aarch64-darwin` (seatbelt) and on NixOS
-> (bubblewrap). Distribution is currently **local-only**: `CSB_SELF` defaults
-> to a self-hosted git remote. `make install` just copies the script and needs
-> no remote; *launching* fetches the claude binary from `CSB_SELF`, so that
-> works only where the remote is reachable. A public home is pending validation
-> (`docs/TODO.md`).
+> (bubblewrap). `CSB_SELF` defaults to the public GitHub remote
+> `github:atongen/csb`, but the repo is **not yet published there** -- until it
+> is, *launching* (which fetches the claude binary from `CSB_SELF`) needs a
+> reachable override: a local checkout (`CSB_SELF=path:/path/to/csb`) or your
+> own mirror. `make install` just copies the script and needs no remote. See
+> `docs/TODO.md`.
 
 ## Quickstart
 
@@ -46,9 +47,9 @@ box); `csb` shells out to `nix`.
 Four environment variables tune csb:
 
 - **`CSB_SELF`** -- the flake ref csb pulls its claude binary (and, on Linux,
-  bubblewrap) from. Defaults to the self-hosted remote
-  `git+ssh://git@git.grandrew.com/atongen/csb.git`. For local development against
-  a working tree, override per-invocation: `CSB_SELF=path:/path/to/csb csb ...`.
+  bubblewrap) from. Defaults to the public GitHub remote `github:atongen/csb`.
+  For local development against a working tree, override per-invocation:
+  `CSB_SELF=path:/path/to/csb csb ...`.
 - **`CSB_LATEST`** -- if set (non-empty), defaults `-L/--latest` on: re-lock the
   `claude-code` flake input to its upstream HEAD instead of the rev pinned in
   `flake.lock`. Trades reproducibility for always getting the newest claude.
@@ -76,6 +77,7 @@ csb -L feature/foo               # newest claude (re-lock claude-code to upstrea
 csb --ns work feature/foo        # override the namespace (default is the branch)
 csb --ns @work feature/foo       # unscoped namespace, shared across repos
 csb -E feature/foo               # ephemeral: throwaway config/HOME, no namespace
+csb -E=work --here               # named ephemeral: reusable throwaway HOME (attach a shell)
 csb -n feature/foo               # just prepare/reuse the worktree, don't launch (prints its path)
 csb -d feature/foo               # remove the worktree AND its namespace config (branch is kept)
 csb --list-ns                    # list this repo's namespace configs (flags orphans)
@@ -142,7 +144,24 @@ namespace, so one branch's agent can't read another's history.
   `@NAME` can't alias it. `-d` never auto-removes an `@`-namespace (retire it
   manually: `rm -rf ~/.csb/claudes/@NAME`).
 - **`-E`, `--ephemeral`** -- throwaway config/HOME under `$TMPDIR`, no namespace.
-  Mutually exclusive with `--ns`.
+  Mutually exclusive with `--ns`. A bare `-E` mints a random throwaway dir, so
+  there is nothing a second invocation can reattach to.
+- **`-E=NAME`, `--ephemeral=NAME`** -- a **named** ephemeral: the throwaway HOME
+  is `$TMPDIR/csb-home-NAME` (deterministic) instead of random, so a sibling
+  shell in another pane can attach to the exact same environment:
+
+  ```sh
+  csb -E=work --here          # claude, in a reusable ephemeral HOME
+  csb -s -E=work --here       # a shell in the identical env (other pane)
+  ```
+
+  It is still *ephemeral*, not a namespace: it lives in tmp (OS-reaped, gone on
+  reboot/tmp-clean), leaves no `~/.csb/claudes` entry, and is untracked by
+  `--list-ns`/`--prune-ns`. Both panes must resolve the same tmp base for the
+  paths to coincide -- set `tmpdir=` in the config for a fixed base, or keep
+  `$TMPDIR` stable across your shells. (For a shareable env that *persists*
+  across reboots and is tracked/pruneable, use a short-lived `--ns NAME`
+  instead.) The name is a single path component: letters, digits, `. _ -`.
 
 `csb -d <branch>` removes the worktree **and** its per-branch namespace config
 (stale configs hold session history and the auth they were seeded with, a
@@ -567,7 +586,7 @@ For a project-specific toolchain, expose a standard `flake.nix` with
 fallback. Scaffold a minimal standalone dev flake with:
 
 ```sh
-nix flake init -t git+ssh://git@git.grandrew.com/atongen/csb.git
+nix flake init -t github:atongen/csb
 ```
 
 csb dogfoods itself: its own `flake.nix` exposes a `devShells.default` (git +
@@ -577,6 +596,7 @@ shellcheck), so `csb --here` runs claude on the csb repo like any other.
 
 ```
 bin/csb                    the orchestrator (worktree + deny-list + launch)
+LICENSE                    MIT
 flake.nix                  packages {csb, claude, bwrap (linux)} + apps + templates
 templates/repo/            scaffold: a standalone dev-shell flake for a consuming repo
 templates/home/            starter seed-home skeleton (copy to ~/.config/csb/home)
@@ -588,3 +608,7 @@ docs/TODO.md               current state and next steps
 ```
 
 See `docs/` for design rationale and history (`PLAN-000` ... `PLAN-004`).
+
+## License
+
+MIT -- see [LICENSE](LICENSE). Do what you like with it.

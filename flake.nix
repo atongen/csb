@@ -103,7 +103,7 @@
       });
 
       # `nix flake init -t "$CSB_SELF"` scaffolds a consuming repo (CSB_SELF
-      # defaults to the self-hosted remote; see bin/csb).
+      # defaults to the public GitHub remote; see bin/csb).
       templates.default = {
         path = ./templates/repo;
         description = "Repo flake: a standalone devShell that csb runs claude in";

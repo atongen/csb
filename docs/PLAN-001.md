@@ -652,9 +652,8 @@ fresh-file paths exercised. Not yet run end-to-end (pending tire-kicking).
    `~/.claude/.credentials.json` also exist, which may make the sticky-token story
    easier than on macOS).
 5. **Push csb + flip `CSB_SELF`** — DONE. `CSB_SELF` defaults to
-   `git+ssh://git@git.grandrew.com/atongen/csb.git`, and csb **is pushed** to that
-   network-local Gitea remote and resolves. This is the canonical source while csb
-   is in-house — use it (don't fall back to GitHub). For local dev against
+   `github:atongen/csb`, the canonical source csb pulls its own flake from — use
+   it. For local dev against
    *uncommitted* working-tree changes, override `CSB_SELF=path:/path/to/csb`; note
    that only matters for changes to the flake's packages (the orchestrator runs
    from `~/bin`, and `--no-sandbox` only pulls `#claude`, which is unchanged).
@@ -857,8 +856,8 @@ names; `inputs.repo.inputs.nixpkgs.follows` keeps it cheap.
   on its own nixpkgs; package/overlay/container outputs to be added later per the
   skeleton above.)*
 - **csb is a pure consumer — AS BUILT.** csb supplies the claude binaries from
-  its OWN flake via `CSB_SELF` (default: the network-local remote
-  `git+ssh://git@git.grandrew.com/atongen/csb.git`; override `CSB_SELF=path:…`
+  its OWN flake via `CSB_SELF` (default: the public GitHub remote
+  `github:atongen/csb`; override `CSB_SELF=path:…`
   for local dev against a working tree). Two modes:
   - **Sandboxed** (`csb <branch>`) → `nix run "$CSB_SELF#claude-sandboxed[-global]"`
     — csb's **generic** jail (minimal, language-agnostic toolset). The repo flake
