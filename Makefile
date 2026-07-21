@@ -18,7 +18,7 @@ DEST    := $(BIN_DIR)/csb
 CSB_SELF ?= github:atongen/csb
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check build update refresh
+.PHONY: help install uninstall check test build update refresh
 
 help: ## Show this help
 	@echo "csb — targets (override BIN_DIR to change the install location):"
@@ -49,6 +49,13 @@ check: ## Lint the shell scripts with shellcheck
 		nix develop --command shellcheck $(SHELLSCRIPTS); \
 	fi
 	@echo "check: shellcheck clean"
+
+test: ## Run the bats test suite (test/)
+	@if command -v bats >/dev/null 2>&1; then \
+		bats test/; \
+	else \
+		nix develop --command bats test/; \
+	fi
 
 build: ## Build the csb package from the flake (nix build .#csb)
 	@nix build .#csb

@@ -506,6 +506,44 @@ All four read/write lists are set per launch, via CLI flags or profile vars
 Each flag is repeatable; profile vars accumulate across `NAME` + `NAME.local`.
 The host tmp/scratch dir is the `CSB_TMPDIR` env var (see [Quickstart](#quickstart)).
 
+## Inspecting the config and sandbox (dry-run)
+
+Two read-only flags resolve a launch and print what it *would* use, then exit
+before any launch, HOME seeding, credential seeding, or `token_cmd`. Both are
+safe to run anywhere and never print a secret, so they double as the seam the
+test suite (`docs/PLAN-005-tests.md`) drives.
+
+- `--dump-config` -- print the resolved knobs as stable `KEY=VALUE` lines
+  (flags + profile + `.local` + env, after all precedence). Git-free: it exits
+  before locating the repo, so a branch-derived namespace shows as an empty
+  `namespace=` plus `branch=`. `token_cmd` is reported `present`/`absent` (never
+  run), and `setenv` lists VAR names only (never their values).
+
+  ```
+  $ csb -p work --paranoid --dump-config
+  mode=launch
+  here=true
+  paranoid=true
+  namespace=@work
+  token_cmd=present
+  claude_args=--model|opus
+  ...
+  ```
+
+- `--dump-sandbox` -- print the generated sandbox artifact: the seatbelt profile
+  text on macOS, or the `bwrap` argv (one token per line) on Linux. It runs the
+  real build path (`build_deny_paths` / `build_write_roots` and every path
+  validation), so build-time errors -- a `"`/`\` in a path, a
+  `--paranoid-allow-read` that overlaps a deny -- surface here too. Drive it with
+  `--here` inside a git repo so no `.worktrees/` checkout is created:
+
+  ```
+  $ csb --here --paranoid --dump-sandbox
+  ```
+
+  On Linux, `--dump-sandbox` resolves the `bwrap` binary; set `CSB_BWRAP_BIN` to
+  a path to use it verbatim instead of building it via nix (hermetic dumps/tests).
+
 ## Threat model
 
 **Read this first.** csb assumes a **trusted operator running trusted
@@ -611,14 +649,16 @@ LICENSE                    MIT
 flake.nix                  packages {csb, claude, bwrap (linux)} + apps + templates
 templates/repo/            scaffold: a standalone dev-shell flake for a consuming repo
 templates/home/            starter seed-home skeleton (copy to ~/.config/csb/home)
-Makefile                   install, lint, and build targets (make help)
+Makefile                   install, lint, test, and build targets (make help)
+test/                      bats test suite (make test); see docs/PLAN-005-tests.md
 docs/PLAN-002.md           the implemented design (single mode, deny-list, profiles)
 docs/PLAN-003.md           roadmap: VM second boundary (not implemented)
 docs/PLAN-004.md           the pre-release audit: findings, fixes, scope decisions
+docs/PLAN-005-tests.md     the test-suite plan (dump seams + bats tiers)
 docs/TODO.md               current state and next steps
 ```
 
-See `docs/` for design rationale and history (`PLAN-000` ... `PLAN-004`).
+See `docs/` for design rationale and history (`PLAN-000` ... `PLAN-005`).
 
 ## License
 

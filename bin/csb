@@ -15,6 +15,8 @@
 #                 check every run).
 #      CSB_VERBOSE non-empty defaults -v/--verbose on (launches are otherwise
 #                 quiet: routine status + nix progress suppressed).
+#      CSB_BWRAP_BIN (Linux) use this bwrap binary verbatim instead of building
+#                 it via nix (keeps --dump-sandbox / tests hermetic).
 
 set -euo pipefail
 
@@ -146,6 +148,14 @@ OPTIONS:
                      output (evaluating/downloading progress). Launches are quiet
                      by default; warnings and errors always print. Default via
                      CSB_VERBOSE=1.
+      --dump-config  resolve flags + profile (+ .local) + env and print the final
+                     KEY=VALUE knobs, then exit — no launch, no repo lookup, no
+                     token_cmd. A read-only debug/test seam; never prints a secret
+                     (token_cmd shows present/absent; setenv shows VAR names only).
+      --dump-sandbox resolve far enough to build the sandbox artifact and print it
+                     — the seatbelt profile text (macOS) or the bwrap argv, one
+                     token per line (Linux) — then exit before any launch, seeding,
+                     or token_cmd. Drive it with --here in a git repo.
   -h, --help         show this help
   -V, --version      print the version and exit
 EOF
@@ -939,7 +949,14 @@ build_deny_wrapper() {
       # processes are invisible and unsignalable. No --unshare-net /
       # --unshare-ipc: open host access is a requirement.
       local bwrap_bin p
-      bwrap_bin="$(nix build "$CSB_SELF#bwrap" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/bwrap"
+      # CSB_BWRAP_BIN overrides the store build with a verbatim path: keeps
+      # --dump-sandbox / tests hermetic (a stable placeholder, no nested nix)
+      # and lets a host point at an already-built bwrap. Otherwise build it.
+      if [[ -n "${CSB_BWRAP_BIN:-}" ]]; then
+        bwrap_bin="$CSB_BWRAP_BIN"
+      else
+        bwrap_bin="$(nix build "$CSB_SELF#bwrap" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/bwrap"
+      fi
       deny_wrapper=("$bwrap_bin" --ro-bind / / --dev-bind /dev /dev --proc /proc
                     --unshare-pid --die-with-parent)
       # PARANOID reads: blank the real HOME; the write-root binds below (and the
@@ -1181,6 +1198,7 @@ run_token_cmd() {
 
 mode="launch"
 no_launch="false"
+dump=""             # --dump-config|--dump-sandbox: read-only dry-run seam, no launch
 namespace="";       ns_cli="false"
 profile_name=""
 profile_here=""     # set by load_profile: the profile's raw here= value
@@ -1233,6 +1251,8 @@ while [[ $# -gt 0 ]]; do
     --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
     --no-paranoid) paranoid="false"; paranoid_cli="true"; shift ;;
     -n|--no-launch) no_launch="true"; shift ;;
+    --dump-config) dump="config"; shift ;;
+    --dump-sandbox) dump="sandbox"; shift ;;
     --here) here="true"; here_cli="true"; shift ;;
     --no-here) here="false"; here_cli="true"; shift ;;
     -s|--shell) shell="true"; shell_cli="true"; shift ;;
@@ -1378,13 +1398,52 @@ if [[ "$yolo" == "true" ]]; then
   fi
 fi
 
+# --dump-config: read-only Tier-1 seam. Print the resolved flag/profile/env
+# knobs as stable KEY=VALUE lines and exit -- before locating the repo, running
+# token_cmd, or any launch/seeding side effect. Git-free: a branch-derived
+# namespace shows as an empty namespace= plus a branch= field. Never prints a
+# secret: token_cmd is reported present/absent (never run), setenv reports VAR
+# names only (never their values), seeded credentials are never touched.
+if [[ "$dump" == "config" ]]; then
+  join_bar() { local IFS='|'; printf '%s' "$*"; }
+  dump_setenv_names=()
+  for v in "${profile_setenv[@]+"${profile_setenv[@]}"}"; do dump_setenv_names+=("${v%%=*}"); done
+  printf 'mode=%s\n'                "$mode"
+  printf 'no_launch=%s\n'           "$no_launch"
+  printf 'here=%s\n'                "$here"
+  printf 'shell=%s\n'               "$shell"
+  printf 'paranoid=%s\n'            "$paranoid"
+  printf 'yolo=%s\n'                "$yolo"
+  printf 'latest=%s\n'              "$latest"
+  printf 'verbose=%s\n'             "$verbose"
+  printf 'namespace=%s\n'           "$namespace"
+  printf 'branch=%s\n'              "$branch"
+  printf 'ephemeral=%s\n'           "$ephemeral"
+  printf 'ephemeral_name=%s\n'      "$ephemeral_name"
+  printf 'profile=%s\n'             "$profile_name"
+  printf 'seed_creds=%s\n'          "$seed_creds"
+  printf 'seed_home=%s\n'           "$seed_home"
+  printf 'reseed=%s\n'              "$reseed"
+  printf 'accent=%s\n'              "$accent"
+  printf 'cfg_tmpdir=%s\n'          "$cfg_tmpdir"
+  if [[ -n "$token_cmd" ]]; then printf 'token_cmd=present\n'; else printf 'token_cmd=absent\n'; fi
+  printf 'claude_args=%s\n'         "$(join_bar "${claude_args[@]+"${claude_args[@]}"}")"
+  printf 'keep=%s\n'                "$(join_bar "${extra_keep[@]+"${extra_keep[@]}"}")"
+  printf 'setenv=%s\n'              "$(join_bar "${dump_setenv_names[@]+"${dump_setenv_names[@]}"}")"
+  printf 'deny_read=%s\n'           "$(join_bar "${deny_read_paths[@]+"${deny_read_paths[@]}"}")"
+  printf 'allow_write=%s\n'         "$(join_bar "${allow_write_paths[@]+"${allow_write_paths[@]}"}")"
+  printf 'paranoid_deny_read=%s\n'  "$(join_bar "${paranoid_deny_read_paths[@]+"${paranoid_deny_read_paths[@]}"}")"
+  printf 'paranoid_allow_read=%s\n' "$(join_bar "${paranoid_allow_read_paths[@]+"${paranoid_allow_read_paths[@]}"}")"
+  exit 0
+fi
+
 # Host-side credential work, before any worktree/namespace side effects (a
 # token_cmd failure must abort a clean launch, not a half-prepared one).
 # Skipped for delete/list/prepare-only invocations, which launch nothing (the
 # branch/--here term keeps a listing run out of the password store); the -s
 # shell skips token_cmd too (it runs no claude — no reason to touch it).
 if [[ "$mode" == "launch" && "$no_launch" != "true" && "$shell" != "true" \
-      && ( -n "$branch" || "$here" == "true" ) ]]; then
+      && -z "$dump" && ( -n "$branch" || "$here" == "true" ) ]]; then
   run_token_cmd
 fi
 
@@ -1586,7 +1645,8 @@ export_git_identity
 # The input name must match flake.nix's inputs.claude-code.
 nix_latest_args=()
 # The -s shell never builds claude, so skip the upstream check there entirely.
-if [[ "$latest" == "true" && "$shell" != "true" ]]; then
+# --dump-sandbox never launches, so it skips the (networked) upstream check too.
+if [[ "$latest" == "true" && "$shell" != "true" && -z "$dump" ]]; then
   claude_rev="$(latest_claude_rev)"
   nix_latest_args=(--override-input claude-code "$CSB_CLAUDE_FLAKE/$claude_rev")
 fi
@@ -1625,16 +1685,21 @@ else
 fi
 # Seed user-level files into the launch HOME from the template dir, BEFORE the
 # onboarding seed below so a template-provided .claude.json is merged (via jq),
-# not overwritten.
-seed_home_template "$claude_home"
-seed_claude_config "$claude_json" "$worktree"
+# not overwritten. Skipped under --dump-sandbox (it resolves and prints only).
+if [[ -z "$dump" ]]; then
+  seed_home_template "$claude_home"
+  seed_claude_config "$claude_json" "$worktree"
+fi
 if [[ -n "$cfg_tmpdir" ]]; then
   env_overrides+=("TMPDIR=$cfg_tmpdir")
 fi
 # Host-session credential seeding (see the helper). The -s shell runs no
 # claude, so it gets no credential dance at all (and no token warning); the
-# seeded session makes the token warning moot otherwise.
-if [[ "$shell" == "true" ]]; then
+# seeded session makes the token warning moot otherwise. Skipped under
+# --dump-sandbox (never touches the keychain / seeded credentials).
+if [[ -n "$dump" ]]; then
+  :
+elif [[ "$shell" == "true" ]]; then
   if [[ "$seed_creds" == "true" ]]; then
     echo "$PROG: warning: --seed-creds has no effect with --shell (no claude runs; skipping)" >&2
   fi
@@ -1700,6 +1765,19 @@ env_overrides+=(
 # The deny-list wraps the innermost command only; nix eval/build/develop above
 # and below run host-side with the real HOME, unrestricted.
 build_deny_wrapper
+
+# --dump-sandbox: read-only Tier-2 seam. build_deny_wrapper above already ran
+# the real build path (build_deny_paths/build_write_roots and every validation),
+# so print the generated artifact -- the seatbelt profile text on macOS, the
+# bwrap argv one token per line on Linux -- and exit before any launch. The
+# EXIT trap reaps the macOS profile after we have printed it.
+if [[ "$dump" == "sandbox" ]]; then
+  case "$(uname -s)" in
+    Darwin) cat "$seatbelt_profile" ;;
+    *)      printf '%s\n' "${deny_wrapper[@]}" ;;
+  esac
+  exit 0
+fi
 
 vecho "$PROG: launching in the devShell at $worktree"
 vecho "$PROG:   scrubbed env, HOME=$claude_home, fs deny-list on; network OPEN"

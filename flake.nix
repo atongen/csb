@@ -58,6 +58,9 @@
               pkgs.jq                # statusline template parses claude's session JSON
               pkgs.bashInteractive   # `complete`/readline — mkShell's default bash lacks progcomp
               pkgs.bash-completion   # programmable Tab completion (git, etc.)
+              # bats + assertion libraries for `make test` (docs/PLAN-005-tests.md).
+              # withLibraries sets BATS_LIB_PATH so `bats_load_library` resolves them.
+              (pkgs.bats.withLibraries (p: [ p.bats-support p.bats-assert ]))
             ];
 
             # `csb -s` launches a fresh interactive bash with a redirected HOME,
