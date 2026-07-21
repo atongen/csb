@@ -18,7 +18,7 @@ DEST    := $(BIN_DIR)/csb
 CSB_SELF ?= github:atongen/csb
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check test build update refresh
+.PHONY: help install uninstall check test test-update build update refresh
 
 help: ## Show this help
 	@echo "csb — targets (override BIN_DIR to change the install location):"
@@ -56,6 +56,14 @@ test: ## Run the bats test suite (test/)
 	else \
 		nix develop --command bats test/; \
 	fi
+
+test-update: ## Regenerate the Tier 2 snapshot goldens for THIS platform
+	@if command -v bats >/dev/null 2>&1; then \
+		SNAPSHOT_UPDATE=1 bats test/; \
+	else \
+		nix develop --command env SNAPSHOT_UPDATE=1 bats test/; \
+	fi
+	@echo "test-update: regenerated test/snapshots/$$(uname -s | tr 'A-Z' 'a-z')/ - review the diff"
 
 build: ## Build the csb package from the flake (nix build .#csb)
 	@nix build .#csb

@@ -1,8 +1,12 @@
 # plan 005
 
-Status: steps 1-2 implemented (the `--dump-config`/`--dump-sandbox` seams +
-`CSB_BWRAP_BIN`, and the Tier 1 bats suite under `test/` wired to `make test`).
-Steps 3 (Tier 2 snapshot goldens) and 4 (`docs/SMOKE.md` + `make smoke`) remain
+Status: steps 1-3 implemented. Step 1: the `--dump-config`/`--dump-sandbox`
+seams + `CSB_BWRAP_BIN`. Step 2: the Tier 1 bats suite under `test/` wired to
+`make test`. Step 3: the Tier 2 snapshot tests (`test/snapshots.bats` + the
+normalizer in `test/helpers.bash`), `make test-update`, with the `darwin`
+goldens committed under `test/snapshots/darwin/`. Still outstanding on step 3:
+the `linux` goldens (need a Linux runner: `make test-update` there) and the
+`flake` `checks.test` wiring. Step 4 (`docs/SMOKE.md` + `make smoke`) remains
 proposed.
 
 ## A test suite for csb
