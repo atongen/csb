@@ -44,7 +44,7 @@ csb feature/foo                  # worktree for feature/foo + claude in the devS
 Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
 box); `csb` shells out to `nix`.
 
-Four environment variables tune csb:
+Five environment variables tune csb:
 
 - **`CSB_SELF`** -- the flake ref csb pulls its claude binary (and, on Linux,
   bubblewrap) from. Defaults to the public GitHub remote `github:atongen/csb`.
@@ -61,6 +61,10 @@ Four environment variables tune csb:
 - **`CSB_VERBOSE`** -- if set (non-empty), defaults `-v/--verbose` on. Launches
   are otherwise quiet: csb's routine narration and nix's own progress are
   suppressed (warnings and errors always print).
+- **`CSB_TMPDIR`** -- host scratch/temp dir for the launched process: its
+  `TMPDIR`, the base for ephemeral/named HOMEs, and a write-allow root (e.g. a
+  scratch device). Must be an existing directory. Host-scoped, so it lives here
+  rather than in a profile.
 
 ## Use
 
@@ -158,7 +162,7 @@ namespace, so one branch's agent can't read another's history.
   It is still *ephemeral*, not a namespace: it lives in tmp (OS-reaped, gone on
   reboot/tmp-clean), leaves no `~/.csb/claudes` entry, and is untracked by
   `--list-ns`/`--prune-ns`. Both panes must resolve the same tmp base for the
-  paths to coincide -- set `tmpdir=` in the config for a fixed base, or keep
+  paths to coincide -- set `CSB_TMPDIR` for a fixed base, or keep
   `$TMPDIR` stable across your shells. (For a shareable env that *persists*
   across reboots and is tracked/pruneable, use a short-lived `--ns NAME`
   instead.) The name is a single path component: letters, digits, `. _ -`.
@@ -205,6 +209,11 @@ args=bash --rcfile ~/.config/my.bashrc    # the ARGS after --: command in -s mod
                                           # ~/ or ${HOME} expands to the HOST home.
 keep=COLORTERM DIRENV_LOG_FORMAT          # space-separated, appended to --keep
 setenv=CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1 # repeatable; injected post-scrub
+deny_read=~/notes                         # as --deny-read: extra read deny (both modes); repeatable
+allow_write=~/scratch                     # as --allow-write: extra write root (both modes); repeatable
+paranoid_deny_read=/Volumes               # as --paranoid-deny-read: extra deny under --paranoid; repeatable
+paranoid_allow_read=~/ref                 # as --paranoid-allow-read: re-expose read-only under --paranoid;
+                                          # repeatable; rejected if it overlaps a deny
 ```
 
 Note: bare `csb -p NAME` (no BRANCH) **launches** in the current dir --
@@ -215,7 +224,9 @@ and `seed_creds=` is ignored with a warning (a shell runs no claude).
 
 **Host-specific overlay.** A profile `NAME` can have a sibling, gitignored
 `NAME.local` layered on top after it is read: same syntax/sections, but its
-scalar values win and its `keep=`/`setenv=` accumulate. Commit portable profiles
+scalar values win and its list values (`keep=`, `setenv=`, `deny_read=`,
+`allow_write=`, `paranoid_deny_read=`, `paranoid_allow_read=`) accumulate.
+Commit portable profiles
 to a dotfiles repo; keep host-specific values (a `token_cmd=` path, a
 `seed_home=`) in the uncommitted `.local`. Precedence: base -> `.local`
 -> explicit CLI flags.
@@ -371,11 +382,10 @@ Linux: ~/.local/share/keyrings  ~/.mozilla
 ```
 
 Deliberately **not** in the floor (in-sandbox installs against private registries
-may need them): `~/.npmrc`, `~/.bundle/config`, `~/.yarnrc`. Add your own in
-`${XDG_CONFIG_HOME:-~/.config}/csb/deny` -- one path per line, leading `~/`
-expanded, `#` comments and blanks ignored. **Add-only**: the built-ins can never
-be removed via config; any other line is a parse error and the launch aborts
-loudly.
+may need them): `~/.npmrc`, `~/.bundle/config`, `~/.yarnrc`. Add your own with
+`--deny-read PATH` (repeatable) or a profile's `deny_read=` (accumulates across
+`NAME` + `NAME.local`); each is an absolute or leading-`~/` path. **Add-only**:
+these extend the floor and can never remove a built-in.
 
 **Keychain caveat (macOS).** Denying `~/Library/Keychains` blocks direct file
 reads of the keychain DB, and in practice the `security` CLI **fails closed**
@@ -399,12 +409,11 @@ Writes are **default-denied**; allowed roots:
 - the active namespace HOME (or the ephemeral HOME)
 - tmp: `/tmp`, the per-user `/var/folders/...` temp/cache dir (macOS; derived
   via `getconf`, never from `$TMPDIR` -- a stripped or nix-set `TMPDIR` must
-  not widen the write policy), `/var/tmp` (Linux), and the configured `tmpdir`
-  if set
+  not widen the write policy), `/var/tmp` (Linux), and `CSB_TMPDIR` if set
 - `/dev` (ptys -- the TUI writes its terminal)
 
-Extra roots go in `${XDG_CONFIG_HOME:-~/.config}/csb/allow-write`, same format
-and add-only/parse-error rules. Expected fallout: `git config` writes and hook
+Extra roots go via `--allow-write PATH` (repeatable) or a profile's
+`allow_write=`, add-only. Expected fallout: `git config` writes and hook
 installation fail inside the sandbox; tools that write caches to absolute paths
 outside `$HOME` need an entry.
 
@@ -417,21 +426,25 @@ git dir, namespace HOME, tmp) are re-allowed for reading. Paths outside HOME
 
 Because the launched `HOME` is redirected to the namespace dir, tool caches and
 config land under that re-allowed dir and keep working -- so `--paranoid` is
-rarely disruptive. When something needs a specific real-HOME path, add it to
-`allow-write` (write-allow roots are read-allowed too). Enable per run
-(`--paranoid` / negate `--no-paranoid`) or per context via a profile's
-`paranoid=true`; there is no global toggle.
+rarely disruptive. When something needs a specific real-HOME path, re-expose it
+read-only with `--paranoid-allow-read PATH` (or a profile's `paranoid_allow_read=`),
+or make it writable with `--allow-write` (write-allow roots are read-allowed too).
+A `paranoid_allow_read` that overlaps a deny root (the floor, a `deny_read`, or a
+`paranoid_deny_read`) is rejected, so an allow can never silently re-expose a
+denied path. Enable per run (`--paranoid` / negate `--no-paranoid`) or per
+context via a profile's `paranoid=true`; there is no global toggle.
 
 The deny is scoped to the real HOME, so a source tree that lives *outside* HOME
 stays readable -- e.g. a `~/src -> /Volumes/src` symlink resolves to a path that
-paranoid never fences. Wall such trees off with `paranoid_deny=` (below); the
-write-allow roots are re-allowed on top, so the active worktree stays readable.
+paranoid never fences. Wall such trees off with `--paranoid-deny-read` (or a
+profile's `paranoid_deny_read=`); the write-allow roots are re-allowed on top, so
+the active worktree stays readable.
 
 ### `--paranoid`: ancestor traversal and what it leaks
 
 A re-allowed subtree usually sits *below* a denied root -- the worktree beneath
-the real HOME (when repos live under `$HOME`) or beneath a `paranoid_deny=` root
-(when the code tree lives outside `$HOME`, e.g. on a separate volume), and the
+the real HOME (when repos live under `$HOME`) or beneath a `paranoid_deny_read=`
+root (when the code tree lives outside `$HOME`, e.g. on a separate volume), and the
 namespace beneath the denied `~/.csb/claudes`. Reaching it means traversing the
 denied ancestor directories in between, which per-component path resolution does
 constantly: canonicalizing a path `lstat`s every component, and a directory glob
@@ -473,27 +486,25 @@ worktree's *physical* ancestor chain. If repos live under `$HOME`, that chain
 runs through your home directory, so its entry names -- including which dotfiles
 and credential *directories* exist -- become listable (contents still denied). If
 the code tree instead lives outside `$HOME` (e.g. on a separate volume fenced
-with `paranoid_deny=`), only the code-tree names leak and `$HOME` is reached
+with `paranoid_deny_read=`), only the code-tree names leak and `$HOME` is reached
 solely via the metadata-only namespace chain, so it stays un-listable. A symlink
 out of `$HOME` resolves to its physical target, so it is the physical location,
 not the symlinked path, that determines what leaks.
 
-### Machine config
+### Where the lists live
 
-`${XDG_CONFIG_HOME:-~/.config}/csb/config` -- `KEY=VALUE` lines. A gitignored
-`config.local` alongside it is read last (scalar values win, list values
-accumulate), so one committed `config` can be shared across hosts with
-host-specific overrides layered on top -- the same pattern as profile `.local`
-overlays:
+All four read/write lists are set per launch, via CLI flags or profile vars
+(no machine-wide config file) -- add-only, absolute or leading-`~/` paths:
 
-```
-tmpdir=/scratch/tmp     # tmp dir for the launched process: its TMPDIR, the
-                        # ephemeral -E HOMEs, and a write-allow root. For
-                        # machines with a scratch device.
-paranoid_deny=/Volumes  # under --paranoid, also read-deny this root (write
-                        # roots are re-allowed on top). Repeatable. For trees
-                        # outside the real HOME that the HOME-scoped deny misses.
-```
+| List | CLI flag | Profile var | Modes |
+|---|---|---|---|
+| extra read deny | `--deny-read` | `deny_read=` | both |
+| extra write root | `--allow-write` | `allow_write=` | both |
+| extra paranoid read deny | `--paranoid-deny-read` | `paranoid_deny_read=` | `--paranoid` |
+| paranoid read re-allow (read-only) | `--paranoid-allow-read` | `paranoid_allow_read=` | `--paranoid` |
+
+Each flag is repeatable; profile vars accumulate across `NAME` + `NAME.local`.
+The host tmp/scratch dir is the `CSB_TMPDIR` env var (see [Quickstart](#quickstart)).
 
 ## Threat model
 
@@ -519,7 +530,7 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   (a stray `.env`, files under `~/Documents`, a dotfile the floor didn't
   anticipate) is readable. A read allow-list would close this but breaks
   interactive toolchains pervasively; `--paranoid` is the opt-in whitelist escape
-  hatch. Add paths to `~/.config/csb/deny` as you find them.
+  hatch. Add paths with `--deny-read` / a profile's `deny_read=` as you find them.
 - **paranoid leaks ancestor names (macOS).** To let path-walking tools reach a
   worktree nested under a denied root, `--paranoid` makes the worktree's ancestor
   directories listable -- so sibling volume/host/org/repo *names* on that one path

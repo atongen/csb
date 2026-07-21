@@ -48,20 +48,22 @@
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch
       when the blacklist feels insufficient.
-- [ ] designed-but-deferred: per-profile / per-run deny and
-      allow-write additions, so one app's extra write root doesn't have to be
-      granted machine-wide via ~/.config/csb/allow-write. Shape when needed:
-      repeatable `deny=` / `allow_write=` profile keys (accumulating like
-      keep=/setenv= across base + .local) and optionally repeatable `--deny` /
-      `--allow-write` CLI flags, feeding the existing user-config paths in
-      build_deny_paths/build_write_roots (same ~/ expansion, canonicalization,
-      quote/backslash refusal, add-only floor). Two constraints are load-
-      bearing: values may come ONLY from operator-authored sources — profiles
-      (~/.config/csb is outside every write root, so the agent can't edit them)
-      and CLI flags — never from repo/worktree files, or the agent could widen
-      its own sandbox (same escalation class the .worktreesetup.sh gate
-      closes); and document that allow_write widens --paranoid READS too,
-      since write roots are read-re-allowed there.
+- [x] ~~designed-but-deferred: per-profile / per-run deny and allow-write
+      additions, so one app's extra write root doesn't have to be granted
+      machine-wide.~~ DONE (2026-07-21): the four read/write lists are now
+      profile vars (`deny_read=`, `allow_write=`, `paranoid_deny_read=`,
+      `paranoid_allow_read=`) and repeatable CLI flags (`--deny-read`,
+      `--allow-write`, `--paranoid-deny-read`, `--paranoid-allow-read`),
+      accumulating like keep=/setenv= across base + .local, add-only over the
+      built-in floor. The change went further than the sketch: the machine-wide
+      config (deny/allow-write/config files) was removed entirely — the tmp dir
+      moved to `CSB_TMPDIR`, and `paranoid_deny=` became `paranoid_deny_read=`.
+      `paranoid_allow_read` is new (re-expose a read under --paranoid WITHOUT
+      write; rejected at build time if it overlaps a deny). Load-bearing
+      constraints held: values come ONLY from operator-authored sources
+      (profiles under ~/.config/csb, outside every write root, + CLI flags),
+      never from repo/worktree files; and allow_write widens --paranoid READS
+      too (write roots are read-re-allowed there).
 - [x] ~~future --aws upgrade path (out of scope for plan-002): host-side
       credential broker + AWS_CONTAINER_CREDENTIALS_FULL_URI, viable because
       sandbox networking is open — would fix the no-refresh-in-session caveat.~~
