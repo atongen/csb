@@ -1,0 +1,41 @@
+name: CI
+
+# Lint (shellcheck) and run the bats test suite on both platforms csb targets,
+# from inside csb's own nix devShell. The suite is hermetic: Tier 1 uses
+# --dump-config (no nix), and Tier 2 uses --dump-sandbox, which needs no nix on
+# macOS (seatbelt text) and, on Linux, is pinned to a placeholder bwrap via
+# CSB_BWRAP_BIN (set by the test harness) instead of `nix build .#bwrap`. So CI
+# never resolves CSB_SELF, builds the claude/bwrap packages, or reaches a
+# sandbox -- it validates csb's DECISIONS and emitted profile text only. Actual
+# kernel enforcement is the manual on-host checklist (see docs/PLAN-005-tests.md
+# Tier 3), which cannot run in CI (sandbox-exec will not nest).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: check + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest -> x86_64-linux (bwrap argv goldens);
+        # macos-latest  -> aarch64-darwin (seatbelt profile goldens).
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs Nix with flakes + nix-command enabled by default.
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: shellcheck + bats, in the devShell
+        run: nix develop --command make check test

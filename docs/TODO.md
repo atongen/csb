@@ -38,12 +38,12 @@
       non-overwriting (`--reseed` to overwrite). Seeds before the onboarding
       .claude.json so a template-provided one is merged. See README "Seeding the
       sandbox HOME". (env/auth config was already covered by profiles.)
-- [ ] publish to the public distribution home. CSB_SELF now defaults to
-      `github:atongen/csb` (bin/csb, Makefile, flake template hint, README), but
-      the repo is NOT yet pushed there -- until it is, launching needs a
-      reachable CSB_SELF override (a local `path:` checkout, kept in the
-      environment). Remaining: push the repo to github.com/atongen/csb and
-      confirm `make install` + `nix run` work for outside users against it.
+- [x] publish to the public distribution home. DONE: the repo is pushed to
+      `github.com/atongen/csb`, which is CSB_SELF's default (bin/csb, Makefile,
+      flake template hint, README), so `make install` and `nix run
+      github:atongen/csb` work out of the box for outside users. A CSB_SELF
+      override (a local `path:` checkout) is now only needed for local
+      development against a working tree.
 - [ ] revisit the deny-list defaults after the first month of use (blacklist
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch

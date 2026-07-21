@@ -25,12 +25,10 @@ back to a generic devShell otherwise (see [What a repo needs](#what-a-repo-needs
 The claude binary comes from *csb's own* flake; the repo never imports csb.
 
 > **Status.** Verified end-to-end on `aarch64-darwin` (seatbelt) and on NixOS
-> (bubblewrap). `CSB_SELF` defaults to the public GitHub remote
-> `github:atongen/csb`, but the repo is **not yet published there** -- until it
-> is, *launching* (which fetches the claude binary from `CSB_SELF`) needs a
-> reachable override: a local checkout (`CSB_SELF=path:/path/to/csb`) or your
-> own mirror. `make install` just copies the script and needs no remote. See
-> `docs/TODO.md`.
+> (bubblewrap). Published at `github:atongen/csb`, which is `CSB_SELF`'s default,
+> so `make install` and `nix run github:atongen/csb` work out of the box. Override
+> `CSB_SELF` (`CSB_SELF=path:/path/to/csb`) only for local development against a
+> working tree.
 
 ## Quickstart
 
