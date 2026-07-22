@@ -74,10 +74,23 @@ OPTIONS:
                      (csb-home-NAME), so a sibling '$PROG -s -E=NAME' in another
                      pane attaches to the exact same env. Still ephemeral (tmp,
                      OS-reaped; untracked by --list-ns), not a namespace.
+      --real-home    use the operator's REAL HOME instead of a redirected one:
+                     no namespace, no seeding, and the real HOME is NOT made
+                     writable. A third launch-HOME choice, mutually exclusive
+                     with --ns and -E. Pair with --no-sandbox for a shell whose
+                     ~/.ssh, ~/.kube, ~/.aws etc. resolve (e.g. a deployment).
+                     Also via a profile's real_home=true.
   -s, --shell        drop into an interactive bash — or run ARGS after -- as a
                      command — instead of claude, in the exact environment
                      claude would get: same worktree, devShell, env scrub,
                      HOME redirection, and deny-list.
+      --no-sandbox   drop the filesystem sandbox (the seatbelt/bwrap wrapper)
+                     for the launched process. SHELL ONLY — csb refuses to run
+                     claude unsandboxed. The env scrub, devShell, HOME policy,
+                     and --keep still apply; only the read/write lockdown is
+                     gone, so the shell has full host filesystem access. With
+                     it, --paranoid and the deny/allow lists are inert. Also via
+                     a profile's sandbox=false.
   -k, --keep VAR     also keep env var VAR across the scrubbed environment.
                      Repeatable.
       --deny-read PATH   also read-DENY PATH (both modes). Repeatable. Adds to
@@ -110,16 +123,17 @@ OPTIONS:
                      Also via a profile's accent=; --no-accent untints.
   -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
                      (ns=, token_cmd=, latest=, verbose=, yolo=,
-                     paranoid=, here=, ephemeral=, shell=, seed_creds=,
-                     seed_home=, accent=, args=, keep=, setenv=, deny_read=,
-                     allow_write=, paranoid_deny_read=, paranoid_allow_read=).
+                     paranoid=, sandbox=, real_home=, here=, ephemeral=, shell=,
+                     seed_creds=, seed_home=, accent=, args=, keep=, setenv=,
+                     deny_read=, allow_write=, paranoid_deny_read=,
+                     paranoid_allow_read=).
                      A gitignored NAME.local is layered on top for host-specific
                      values (its values win). Explicit CLI flags beat both.
                      Bare '$PROG -p NAME' (no BRANCH) launches --here; plain
                      '$PROG' still lists worktrees.
-      --no-yolo (--yodo), --no-paranoid, --no-here, --no-shell,
-      --no-ephemeral, --no-latest, --no-verbose, --no-seed-creds,
-      --no-ns, --no-seed-home, --no-accent
+      --no-yolo (--yodo), --no-paranoid, --sandbox, --no-real-home,
+      --no-here, --no-shell, --no-ephemeral, --no-latest, --no-verbose,
+      --no-seed-creds, --no-ns, --no-seed-home, --no-accent
                      negate the corresponding option, overriding a profile
                      (or, for latest/verbose, the CSB_LATEST/CSB_VERBOSE env)
                      default for one run
@@ -520,6 +534,15 @@ setup_namespace() {
   local worktree="$1" ns cur_branch
   ns_dir=""
 
+  if [[ "$real_home" == "true" ]]; then
+    # No redirection: HOME stays the operator's real HOME (kept through the env
+    # scrub). No namespace dir, no CLAUDE_CONFIG_DIR override, and (below) no
+    # seeding -- csb must never write into the real ~/.claude.
+    export CSB_CLAUDE_CONFIG_DIR=""
+    vecho "$PROG: HOME: real ($HOME)  (no namespace, no redirection)"
+    return
+  fi
+
   if [[ "$ephemeral" == "true" ]]; then
     csb_ephemeral="true"
     export CSB_CLAUDE_CONFIG_DIR=""
@@ -729,7 +752,10 @@ build_write_roots() {
   # Commits from a linked worktree write objects/refs into the MAIN repo's git
   # dir, so it must be writable (hooks/ and config are re-denied afterwards).
   [[ -n "$gc" ]] && cand+=("$gc")
-  [[ -n "$claude_home" && -z "$ns_dir" ]] && cand+=("$claude_home")
+  # The ephemeral HOME is a write root; the REAL HOME under --real-home is NOT
+  # (writes stay default-deny -- the shell reaches the fs via --no-sandbox, not
+  # by widening the write policy).
+  [[ -n "$claude_home" && -z "$ns_dir" && "$real_home" != "true" ]] && cand+=("$claude_home")
   [[ -n "$cfg_tmpdir" ]] && cand+=("$cfg_tmpdir")
   cand+=("/tmp")
   if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -1056,6 +1082,8 @@ apply_profile_line() {
     verbose)     profile_bool verbose   "$val" "$f:$lineno"; p_verbose="$val" ;;
     yolo)        profile_bool yolo      "$val" "$f:$lineno"; p_yolo="$val" ;;
     paranoid)    profile_bool paranoid  "$val" "$f:$lineno"; p_paranoid="$val" ;;
+    sandbox)     profile_bool sandbox   "$val" "$f:$lineno"; p_sandbox="$val" ;;
+    real_home)   profile_bool real_home "$val" "$f:$lineno"; p_real_home="$val" ;;
     here)        profile_bool here      "$val" "$f:$lineno"; p_here="$val" ;;
     ephemeral)   profile_bool ephemeral "$val" "$f:$lineno"; p_ephemeral="$val" ;;
     seed_creds)  profile_bool seed_creds "$val" "$f:$lineno"; p_seed_creds="$val" ;;
@@ -1075,7 +1103,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, paranoid_deny_read, paranoid_allow_read)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, sandbox, real_home, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, paranoid_deny_read, paranoid_allow_read)" ;;
   esac
 }
 
@@ -1090,7 +1118,8 @@ load_profile() {
   local override="$base.local"
   [[ -f "$base" ]] || die "profile not found: $base"
   local p_ns="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
-        p_shell="" p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" v
+        p_shell="" p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" v \
+        p_sandbox="" p_real_home=""
   local -a keep_list=()
 
   # Read the committed base profile, then the optional gitignored <name>.local
@@ -1110,18 +1139,28 @@ load_profile() {
     done < "$pf"
   done
 
-  if [[ -n "$p_ns" && "$p_ephemeral" == "true" ]]; then
-    die "profile $profile_name: ns and ephemeral=true are mutually exclusive"
-  fi
+  # At most one launch-HOME selector per profile: ns=, ephemeral=true, and
+  # real_home=true all pick where HOME comes from.
+  local home_sel=0
+  [[ -n "$p_ns" ]]                && home_sel=$((home_sel + 1))
+  [[ "$p_ephemeral" == "true" ]]  && home_sel=$((home_sel + 1))
+  [[ "$p_real_home" == "true" ]]  && home_sel=$((home_sel + 1))
+  (( home_sel <= 1 )) \
+    || die "profile $profile_name: ns, ephemeral=true, and real_home=true are mutually exclusive"
   if [[ -n "$p_shell" && "$shell_cli" != "true" ]]; then
     shell="$p_shell"
   fi
+  # real_home first (like ephemeral, it's a HOME-kind selector): an explicit CLI
+  # --ns / -E suppresses it, and it in turn suppresses a profile ns=/ephemeral=.
+  if [[ -n "$p_real_home" && "$real_home_cli" != "true" && -z "$namespace" && "$ephemeral_cli" != "true" ]]; then
+    real_home="$p_real_home"
+  fi
   # ephemeral before ns: an applied ephemeral=true suppresses nothing (the two
-  # can't coexist in one profile), but an explicit --ns must suppress it.
-  if [[ -n "$p_ephemeral" && "$ephemeral_cli" != "true" && -z "$namespace" ]]; then
+  # can't coexist in one profile), but an explicit --ns / --real-home must.
+  if [[ -n "$p_ephemeral" && "$ephemeral_cli" != "true" && -z "$namespace" && "$real_home" != "true" ]]; then
     ephemeral="$p_ephemeral"
   fi
-  if [[ -n "$p_ns" && -z "$namespace" && "$ephemeral" != "true" && "$ns_cli" != "true" ]]; then
+  if [[ -n "$p_ns" && -z "$namespace" && "$ephemeral" != "true" && "$real_home" != "true" && "$ns_cli" != "true" ]]; then
     namespace="$p_ns"
   fi
   if [[ -n "$p_latest" && "$latest_cli" != "true" ]]; then
@@ -1135,6 +1174,9 @@ load_profile() {
   fi
   if [[ -n "$p_paranoid" && "$paranoid_cli" != "true" ]]; then
     paranoid="$p_paranoid"
+  fi
+  if [[ -n "$p_sandbox" && "$sandbox_cli" != "true" ]]; then
+    sandbox="$p_sandbox"
   fi
   # Exported for the bare `csb -p NAME` implied---here decision: an explicit
   # profile here=false must suppress the implication.
@@ -1208,6 +1250,8 @@ seatbelt_profile="" # macOS: generated profile path, reaped by trap on abnormal 
 # in either direction (-X / --no-X) — CLI beats profile beats env default.
 yolo="false";       yolo_cli="false"
 paranoid="false";   paranoid_cli="false"
+sandbox="true";     sandbox_cli="false"  # --no-sandbox drops the fs lockdown (shell only)
+real_home="false";  real_home_cli="false"  # --real-home: use the real HOME, no redirect
 shell="false";      shell_cli="false"
 here="false";       here_cli="false"
 ephemeral="false";  ephemeral_cli="false"
@@ -1250,6 +1294,10 @@ while [[ $# -gt 0 ]]; do
     --no-yolo|--yodo) yolo="false"; yolo_cli="true"; shift ;;
     --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
     --no-paranoid) paranoid="false"; paranoid_cli="true"; shift ;;
+    --sandbox) sandbox="true"; sandbox_cli="true"; shift ;;
+    --no-sandbox) sandbox="false"; sandbox_cli="true"; shift ;;
+    --real-home) real_home="true"; real_home_cli="true"; shift ;;
+    --no-real-home) real_home="false"; real_home_cli="true"; shift ;;
     -n|--no-launch) no_launch="true"; shift ;;
     --dump-config) dump="config"; shift ;;
     --dump-sandbox) dump="sandbox"; shift ;;
@@ -1293,7 +1341,6 @@ while [[ $# -gt 0 ]]; do
     --paranoid-allow-read) [[ $# -ge 2 && -n "$2" ]] || die "--paranoid-allow-read requires a PATH"
       paranoid_allow_read_paths+=("$(normalize_list_path "$2" "--paranoid-allow-read")"); shift 2 ;;
     -p|--profile) [[ $# -ge 2 && -n "$2" ]] || die "--profile requires a non-empty NAME"; profile_name="$2"; shift 2 ;;
-    --no-sandbox) die "--no-sandbox was removed: the devShell launch is the only mode; drop the flag" ;;
     --) shift; claude_args+=("$@"); claude_args_cli="true"; break ;;
     -*) usage >&2; die "unknown option: $1" ;;
     *)
@@ -1316,6 +1363,17 @@ if [[ -n "$namespace" && "$ephemeral" == "true" ]]; then
   die "--ns and -E/--ephemeral are mutually exclusive"
 fi
 
+# --real-home selects a THIRD kind of launch HOME (the operator's real one), so
+# it is mutually exclusive with the two that select a redirected HOME. Checked
+# at the CLI level here (both explicit); a profile-side conflict is caught in
+# load_profile, and a CLI value beats a profile default without erroring.
+if [[ "$real_home" == "true" && -n "$namespace" ]]; then
+  die "--real-home and --ns are mutually exclusive (each selects the launch HOME)"
+fi
+if [[ "$real_home" == "true" && "$ephemeral" == "true" ]]; then
+  die "--real-home and -E/--ephemeral are mutually exclusive (each selects the launch HOME)"
+fi
+
 # CSB_TMPDIR (host scratch/temp dir; replaces the old config tmpdir= key): the
 # launched process's TMPDIR, its ephemeral HOME base, and a write-allow root.
 if [[ -n "$cfg_tmpdir" ]]; then
@@ -1336,6 +1394,28 @@ fi
 if [[ -n "$profile_name" && "$mode" == "launch" && -z "$branch" \
       && "$here" != "true" && "$here_cli" != "true" && "$profile_here" != "false" ]]; then
   here="true"
+fi
+
+# --no-sandbox drops the filesystem lockdown (the seatbelt/bwrap wrapper) for
+# the launched process. Only ever allowed for a shell -- a deploy/escape-hatch
+# shell you drive yourself. Running claude with no sandbox defeats the whole
+# tool, so fail hard and fast. The condition mirrors the "will actually launch
+# claude" guard used for token_cmd below (mode launch, not prepare-only, not a
+# shell, with a worktree or --here).
+if [[ "$sandbox" != "true" && "$shell" != "true" && "$mode" == "launch" \
+      && "$no_launch" != "true" && ( -n "$branch" || "$here" == "true" ) ]]; then
+  die "--no-sandbox is only allowed with -s/--shell -- claude never runs unsandboxed.
+  add -s for an unsandboxed shell, or drop --no-sandbox."
+fi
+
+# With no sandbox there is no read/write policy to shape, so the deny/allow knobs
+# are inert. They commonly ride in from a profile, so note rather than error.
+if [[ "$sandbox" != "true" ]]; then
+  if [[ "$paranoid" == "true" || ${#deny_read_paths[@]} -gt 0 || ${#allow_write_paths[@]} -gt 0 \
+        || ${#paranoid_deny_read_paths[@]} -gt 0 || ${#paranoid_allow_read_paths[@]} -gt 0 ]]; then
+    echo "$PROG: warning: --no-sandbox drops the filesystem sandbox; --paranoid and the" >&2
+    echo "  deny-read / allow-write lists have no effect in this mode" >&2
+  fi
 fi
 
 # Quiet nix's own progress/eval output unless verbose. Computed AFTER the profile
@@ -1413,6 +1493,8 @@ if [[ "$dump" == "config" ]]; then
   printf 'here=%s\n'                "$here"
   printf 'shell=%s\n'               "$shell"
   printf 'paranoid=%s\n'            "$paranoid"
+  printf 'sandbox=%s\n'             "$sandbox"
+  printf 'real_home=%s\n'           "$real_home"
   printf 'yolo=%s\n'                "$yolo"
   printf 'latest=%s\n'              "$latest"
   printf 'verbose=%s\n'             "$verbose"
@@ -1661,7 +1743,14 @@ fi
 #  - -E/--ephemeral        -> a throwaway HOME under $TMPDIR (the OS reaps it;
 #    deliberately not under any denied path, so it needs no re-allow).
 env_overrides=()
-if [[ -n "${CSB_CLAUDE_CONFIG_DIR:-}" ]]; then
+if [[ "$real_home" == "true" ]]; then
+  # --real-home: no HOME / CLAUDE_CONFIG_DIR override -- the env scrub keeps the
+  # real HOME (it's in keep_vars). claude_home names it only for the launch
+  # messages and the ~/bin PATH prepend; it is never seeded or write-allowed.
+  claude_home="$HOME"
+  claude_json="$HOME/.claude.json"
+  vecho "$PROG: real HOME: $claude_home (not redirected, not seeded)"
+elif [[ -n "${CSB_CLAUDE_CONFIG_DIR:-}" ]]; then
   claude_home="$(dirname "$CSB_CLAUDE_CONFIG_DIR")"
   env_overrides=("HOME=$claude_home" "CLAUDE_CONFIG_DIR=$CSB_CLAUDE_CONFIG_DIR")
   claude_json="$CSB_CLAUDE_CONFIG_DIR/.claude.json"
@@ -1686,7 +1775,9 @@ fi
 # Seed user-level files into the launch HOME from the template dir, BEFORE the
 # onboarding seed below so a template-provided .claude.json is merged (via jq),
 # not overwritten. Skipped under --dump-sandbox (it resolves and prints only).
-if [[ -z "$dump" ]]; then
+# Never seed the real HOME (--real-home): the template copy and the onboarding
+# .claude.json merge are only for a redirected/throwaway HOME.
+if [[ -z "$dump" && "$real_home" != "true" ]]; then
   seed_home_template "$claude_home"
   seed_claude_config "$claude_json" "$worktree"
 fi
@@ -1703,6 +1794,12 @@ elif [[ "$shell" == "true" ]]; then
   if [[ "$seed_creds" == "true" ]]; then
     echo "$PROG: warning: --seed-creds has no effect with --shell (no claude runs; skipping)" >&2
   fi
+elif [[ "$real_home" == "true" ]]; then
+  # Real HOME: the host's own ~/.claude session is already visible (nothing is
+  # redirected or denied there), so neither seed nor token warning applies --
+  # and --seed-creds must not overwrite the real credential store.
+  [[ "$seed_creds" == "true" ]] \
+    && echo "$PROG: warning: --seed-creds has no effect with --real-home (your real ~/.claude session is used as-is)" >&2
 elif [[ "$seed_creds" == "true" ]]; then
   if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
     echo "$PROG: warning: CLAUDE_CODE_OAUTH_TOKEN is set and takes precedence over the" >&2
@@ -1759,19 +1856,33 @@ env_overrides+=(
   "CSB_MODE=$csb_mode"
   "CSB_YOLO=$yolo"
   "CSB_PARANOID=$paranoid"
+  "CSB_SANDBOX=$sandbox"
+  "CSB_REAL_HOME=$real_home"
   "CSB_ACCENT=$accent"
 )
 
 # The deny-list wraps the innermost command only; nix eval/build/develop above
-# and below run host-side with the real HOME, unrestricted.
-build_deny_wrapper
+# and below run host-side with the real HOME, unrestricted. --no-sandbox skips
+# the wrapper entirely (shell-only, enforced above): the launch degrades to
+# `env ... path_shim cmd`, giving the shell full host filesystem access.
+if [[ "$sandbox" == "true" ]]; then
+  build_deny_wrapper
+else
+  deny_wrapper=()
+  [[ -n "$dump" ]] \
+    || echo "$PROG: NOTE: filesystem sandbox is OFF (--no-sandbox) -- this shell has full host filesystem access" >&2
+fi
 
-# --dump-sandbox: read-only Tier-2 seam. build_deny_wrapper above already ran
-# the real build path (build_deny_paths/build_write_roots and every validation),
-# so print the generated artifact -- the seatbelt profile text on macOS, the
-# bwrap argv one token per line on Linux -- and exit before any launch. The
-# EXIT trap reaps the macOS profile after we have printed it.
+# --dump-sandbox: read-only Tier-2 seam. When the sandbox is on, build_deny_wrapper
+# above already ran the real build path (build_deny_paths/build_write_roots and
+# every validation), so print the generated artifact -- the seatbelt profile text
+# on macOS, the bwrap argv one token per line on Linux -- and exit before any
+# launch. The EXIT trap reaps the macOS profile after we have printed it.
 if [[ "$dump" == "sandbox" ]]; then
+  if [[ "$sandbox" != "true" ]]; then
+    echo "(no filesystem sandbox: --no-sandbox)"
+    exit 0
+  fi
   case "$(uname -s)" in
     Darwin) cat "$seatbelt_profile" ;;
     *)      printf '%s\n' "${deny_wrapper[@]}" ;;
@@ -1786,14 +1897,22 @@ vecho "$PROG:   scrubbed env, HOME=$claude_home, fs deny-list on; network OPEN"
 # keep_vars/keep_args above (computed early so run_worktreesetup's sandboxed
 # .worktreesetup.sh call gets the same scrub as the real launch below).
 
-# Append /usr/bin to PATH at launch so bare-name lookups resolve system-only
-# tools (pbcopy/pbpaste, osascript). Those are already exec'able by absolute
-# path under the allow-default profile, so this affects name resolution only,
-# not the sandbox boundary. Appended LAST so the devShell's GNU tools keep
-# priority over macOS BSD ones. nix owns PATH and `env` can't append, so mutate
-# it in a shim that execs the real command on.
-# shellcheck disable=SC2016  # $PATH/$@ must expand at shim runtime, not here
-path_shim=(bash -c 'export PATH="${PATH:+$PATH:}/usr/bin"; exec "$@"' csb-path-shim)
+# PATH shaping at launch, in a shim that execs the real command on (nix owns
+# PATH and `env` can't edit it in place). Two edits, both at shim RUNTIME so
+# they see the effective HOME (real or redirected), for claude and the shell
+# alike:
+#   - PREPEND $HOME/bin when it exists, so the operator's own scripts (deploy
+#     wrappers under --real-home; anything seeded into a namespace HOME) take
+#     precedence. This intentionally outranks the devShell toolchain.
+#   - APPEND /usr/bin so bare-name lookups resolve system-only tools
+#     (pbcopy/pbpaste, osascript) already exec'able by absolute path -- name
+#     resolution only, not the sandbox boundary. Appended LAST so the devShell's
+#     GNU tools keep priority over macOS BSD ones.
+# shellcheck disable=SC2016  # $HOME/$PATH/$@ must expand at shim runtime, not here
+path_shim=(bash -c '
+  [[ -d "$HOME/bin" ]] && PATH="$HOME/bin${PATH:+:$PATH}"
+  export PATH="${PATH:+$PATH:}/usr/bin"
+  exec "$@"' csb-path-shim)
 
 # --shell: same worktree/devShell/scrub/HOME/deny-list, but exec an interactive
 # bash (or the args after --) instead of claude. No claude build needed.
@@ -1803,10 +1922,10 @@ if [[ "$shell" == "true" ]]; then
   vecho "$PROG: shell in the devShell at $worktree (claude's env, no claude)"
   exec nix develop "$devshell_ref" "${nix_quiet[@]+"${nix_quiet[@]}"}" --ignore-environment "${keep_args[@]}" \
     --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
-      "${deny_wrapper[@]}" "${path_shim[@]}" "${cmd[@]}"
+      "${deny_wrapper[@]+"${deny_wrapper[@]}"}" "${path_shim[@]}" "${cmd[@]}"
 fi
 
 claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/claude"
 exec nix develop "$devshell_ref" "${nix_quiet[@]+"${nix_quiet[@]}"}" --ignore-environment "${keep_args[@]}" \
   --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
-    "${deny_wrapper[@]}" "${path_shim[@]}" "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"
+    "${deny_wrapper[@]+"${deny_wrapper[@]}"}" "${path_shim[@]}" "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"

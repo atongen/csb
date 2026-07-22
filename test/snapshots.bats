@@ -59,3 +59,22 @@ load helpers
   assert_success
   assert_snapshot unscoped-ns "$repo"
 }
+
+@test "snapshot: --real-home (real HOME, sandbox on)" {
+  # No namespace, no HOME redirect: the deny-list still fences the real HOME,
+  # but there is no namespace re-allow and the real HOME is NOT a write root.
+  local repo; repo="$(fake_repo feature/x)"
+  dump_sandbox_snapshot "$repo" --real-home
+  assert_success
+  assert_snapshot real-home "$repo"
+}
+
+@test "snapshot: --no-sandbox emits no profile (shell only)" {
+  # The launch degrades to `env ... path_shim cmd`; --dump-sandbox prints a
+  # sentinel instead of a seatbelt profile / bwrap argv. Needs -s (csb refuses
+  # to run claude unsandboxed).
+  local repo; repo="$(fake_repo feature/x)"
+  dump_sandbox_snapshot "$repo" -s --no-sandbox
+  assert_success
+  assert_snapshot no-sandbox "$repo"
+}

@@ -46,6 +46,39 @@ load helpers
   assert_output --partial "mutually exclusive"
 }
 
+@test "--real-home + --ns are mutually exclusive" {
+  dump_config --real-home --ns foo
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+@test "--real-home + -E are mutually exclusive" {
+  dump_config --real-home -E
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+@test "profile real_home=true + ns= are mutually exclusive" {
+  write_profile p "real_home=true" "ns=foo"
+  dump_config -p p
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+# --- --no-sandbox is shell-only ----------------------------------------------
+
+@test "--no-sandbox without --shell dies (claude never runs unsandboxed)" {
+  dump_config --here --no-sandbox
+  assert_failure
+  assert_output --partial "only allowed with -s/--shell"
+}
+
+@test "--no-sandbox with --shell is allowed" {
+  dump_config --here -s --no-sandbox
+  assert_success
+  assert_line "sandbox=false"
+}
+
 # --- unknown keys / bad values -----------------------------------------------
 
 @test "unknown CLI flag dies" {

@@ -26,6 +26,56 @@ load helpers
   assert_line "paranoid=true"
 }
 
+# --- sandbox (--no-sandbox / profile sandbox=) -------------------------------
+
+@test "CLI --sandbox beats profile sandbox=false" {
+  write_profile p "sandbox=false" "shell=true"
+  dump_config -p p --sandbox
+  assert_success
+  assert_line "sandbox=true"
+}
+
+@test "CLI --no-sandbox beats profile sandbox=true (shell)" {
+  write_profile p "sandbox=true" "shell=true"
+  dump_config -p p --no-sandbox
+  assert_success
+  assert_line "sandbox=false"
+}
+
+@test "profile sandbox=false applies with no CLI override" {
+  write_profile p "sandbox=false" "shell=true"
+  dump_config -p p
+  assert_success
+  assert_line "sandbox=false"
+}
+
+# --- real_home (--real-home / profile real_home=) ----------------------------
+
+@test "CLI --real-home beats profile real_home=false" {
+  write_profile p "real_home=false"
+  dump_config -p p --real-home
+  assert_line "real_home=true"
+}
+
+@test "CLI --no-real-home beats profile real_home=true" {
+  write_profile p "real_home=true"
+  dump_config -p p --no-real-home
+  assert_line "real_home=false"
+}
+
+@test "profile real_home=true applies with no CLI override" {
+  write_profile p "real_home=true"
+  dump_config -p p
+  assert_line "real_home=true"
+}
+
+@test "CLI --real-home suppresses a profile ns= (same HOME axis)" {
+  write_profile p "ns=fromprofile"
+  dump_config -p p --real-home
+  assert_line "real_home=true"
+  assert_line "namespace="
+}
+
 # --- latest (also CSB_LATEST env default) ------------------------------------
 
 @test "CSB_LATEST defaults latest on" {

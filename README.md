@@ -73,6 +73,8 @@ csb feature/foo -- --model opus  # everything after -- is passed to claude
 csb --here                       # run in the current dir, no worktree (namespace = current branch)
 csb -s feature/foo               # interactive shell instead of claude (exact same env)
 csb -s -E --here -- cat ~/.ssh/config   # run a command in the agent's env (this one fails: denied)
+csb -s --no-sandbox --real-home --here -k SSH_AUTH_SOCK   # deploy shell: same devShell
+                                 # + env scrub, but full fs + real HOME (see Filesystem sandbox)
 csb -p work feature/foo          # profile: ns/token/keeps/env from ~/.config/csb/profiles/work
 csb -k AWS_PROFILE feature/foo   # also keep AWS_PROFILE across the env scrub (repeatable)
 csb -L feature/foo               # newest claude (re-lock claude-code to upstream HEAD this run)
@@ -196,6 +198,8 @@ latest=true                               # as -L/--latest; beats CSB_LATEST, lo
 verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, loses to explicit -v
 yolo=true                                 # as -y/--yolo (allow-all)
 paranoid=true                             # as --paranoid (whitelist reads; see below)
+sandbox=false                             # as --no-sandbox (shell only; drops the fs lockdown)
+real_home=true                            # as --real-home; excludes ns=/ephemeral= (HOME axis)
 here=true                                 # as --here; an explicit BRANCH wins (with a warning)
 ephemeral=true                            # as -E; excludes ns= in the same profile
 shell=true                                # as -s/--shell
@@ -415,6 +419,39 @@ Extra roots go via `--allow-write PATH` (repeatable) or a profile's
 installation fail inside the sandbox; tools that write caches to absolute paths
 outside `$HOME` need an entry.
 
+### `--no-sandbox` and `--real-home`: the deploy shell
+
+Two independent axes let you loosen the environment when you're the one driving
+it. They compose; the common pairing is a shell that can actually deploy.
+
+- **`--no-sandbox`** drops the filesystem lockdown entirely -- no seatbelt/bwrap
+  wrapper, so the read deny-list and the write allow-list do not apply and the
+  process has full host filesystem access. Everything *else* is unchanged: the
+  worktree, the repo's devShell, the env scrub (`--ignore-environment` +
+  `--keep`), and the HOME policy. It is **shell only** -- csb refuses to run
+  claude unsandboxed (hard error) -- and with it `--paranoid` and the
+  deny/allow lists are inert (csb says so). Also via a profile's `sandbox=false`.
+- **`--real-home`** points the launched `HOME` at your *real* home instead of a
+  redirected one. It is a third launch-HOME choice, mutually exclusive with
+  `--ns` and `-E` (all three select where HOME comes from). The real HOME is
+  **not** seeded and is **not** made writable -- under the sandbox its
+  credential paths stay denied; it's `--no-sandbox` that opens them. Also via a
+  profile's `real_home=true`.
+
+Why both for a deployment: `--no-sandbox` alone (with the default redirected
+HOME) opens the filesystem, but `~/.ssh/known_hosts`, `~/.ssh/config` host
+aliases, `~/.kube`, `~/.aws` still resolve under the *namespace* HOME, where
+they don't exist. `--real-home` makes `~` your real home so those resolve, and
+`--keep SSH_AUTH_SOCK` forwards your agent for the actual auth:
+
+```sh
+csb -s --no-sandbox --real-home --here -k SSH_AUTH_SOCK -- ./deploy.sh
+```
+
+All four combinations are valid. `--sandbox --real-home` (the default sandbox,
+real HOME) is the interesting middle: your own home is readable, but the
+credential deny-list still fences `~/.ssh`, `~/.aws`, `~/.claude`, etc.
+
 ### `--paranoid`: whitelist reads
 
 The default read policy is a blacklist. `--paranoid` flips it to a whitelist: the
@@ -591,6 +628,12 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   unprivileged-user boundary underneath. On macOS a second boundary means a
   separate OS user or a VM, not a profile tweak (seatbelt has no
   process-isolation primitive). Linux gets a PID namespace for free.
+- **`--no-sandbox` removes the layer.** The escape-hatch shell (see
+  [`--no-sandbox` and `--real-home`](#--no-sandbox-and---real-home-the-deploy-shell))
+  runs with no filesystem containment at all -- it exists for operator-driven,
+  trusted work (a deployment) where you *want* full host access. It is refused
+  for claude and confined to `-s/--shell` precisely because it drops the one
+  boundary csb has; treat that shell as ordinary host access, not a sandbox.
 - `sandbox-exec` is formally deprecated (but stable -- nix's own darwin sandbox
   uses the same libsandbox). The mechanism is isolated in one helper
   (`build_deny_wrapper`) if it needs replacing.
@@ -627,6 +670,13 @@ toolchain:
 - **interactive shell:** `bashInteractive`, `bash-completion`, `neovim`,
   `less` (the shellHook exports `BASH_COMPLETION` for a seeded rc to source)
 - **convenience:** `gzip`, `xz`, `zstd`, `unzip`, `delta`, `bat`
+
+**`~/bin` on PATH.** For both claude and the shell, if `$HOME/bin` exists (in
+whichever HOME the launch uses -- real under `--real-home`, otherwise the
+namespace/ephemeral HOME) it is **prepended** to `PATH`, so your own scripts
+(e.g. deploy wrappers) take precedence -- ahead of the devShell toolchain. This
+happens inside the launched process only; host-side `nix` runs first with the
+real PATH, so the trust model is unaffected.
 
 For a project-specific toolchain, expose a standard `flake.nix` with
 `devShells.default` (the repo's full toolchain); csb prefers it over the
