@@ -7,7 +7,8 @@ three layers:
 1. **env scrub** -- `nix develop --ignore-environment` plus a small allowlist
    (extend with `-k/--keep` or a profile's `keep=`).
 2. **private HOME** -- `HOME` is redirected to a per-namespace dir under
-   `~/.csb/claudes` (or a throwaway dir with `-E`) for the launched process only.
+   `~/.csb/claudes` (one per repo by default, shared across its branches; or a
+   throwaway dir with `-E`) for the launched process only.
 3. **filesystem sandbox** (`sandbox-exec`/seatbelt on macOS, bubblewrap on
    Linux): **reads** are default-allow minus a deny-list (`~/.ssh`, `~/.aws`,
    the real `~/.claude`, ...), **writes** are default-deny plus an allow-list
@@ -70,7 +71,7 @@ Five environment variables tune csb:
 csb feature/foo                  # worktree for feature/foo (off HEAD) + claude in the devShell
 csb -y feature/foo               # allow-all (--dangerously-skip-permissions)
 csb feature/foo -- --model opus  # everything after -- is passed to claude
-csb --here                       # run in the current dir, no worktree (namespace = current branch)
+csb --here                       # run in the current dir, no worktree (per-repo namespace)
 csb -s feature/foo               # interactive shell instead of claude (exact same env)
 csb -s -E --here -- cat ~/.ssh/config   # run a command in the agent's env (this one fails: denied)
 csb -s --no-sandbox --real-home --here -k SSH_AUTH_SOCK   # deploy shell: same devShell
@@ -78,14 +79,13 @@ csb -s --no-sandbox --real-home --here -k SSH_AUTH_SOCK   # deploy shell: same d
 csb -p work feature/foo          # profile: ns/token/keeps/env from ~/.config/csb/profiles/work
 csb -k AWS_PROFILE feature/foo   # also keep AWS_PROFILE across the env scrub (repeatable)
 csb -L feature/foo               # newest claude (re-lock claude-code to upstream HEAD this run)
-csb --ns work feature/foo        # override the namespace (default is the branch)
-csb --ns @work feature/foo       # unscoped namespace, shared across repos
+csb --ns work feature/foo        # shared, cross-repo HOME (default is per-repo)
+csb --ns @work feature/foo       # same thing -- the @ is optional (work == @work)
 csb -E feature/foo               # ephemeral: throwaway config/HOME, no namespace
 csb -E=work --here               # named ephemeral: reusable throwaway HOME (attach a shell)
 csb -n feature/foo               # just prepare/reuse the worktree, don't launch (prints its path)
-csb -d feature/foo               # remove the worktree AND its namespace config (branch is kept)
-csb --list-ns                    # list this repo's namespace configs (flags orphans)
-csb --prune-ns                   # remove orphaned branch-derived namespace configs
+csb -d feature/foo               # remove the worktree (branch and per-repo HOME are kept)
+csb --list-ns                    # list csb namespace configs (per-repo + shared @)
 csb                              # list csb worktrees
 ```
 
@@ -117,36 +117,52 @@ is never visible. Two ways in:
 
 ## Namespaces
 
-A namespace partitions the agent's claude config (history/sessions/settings).
-**By default the namespace is the branch** (percent-encoded -- `/`->`%2F`, so
-`feature/foo`->`feature%2Ffoo`, an injective mapping with no collisions), so
-config is deterministic per branch with no hidden state. **Namespaces are scoped
-per repo**: they live under `~/.csb/claudes/<repo-key>/<ns>`, where `<repo-key>`
-is the basename of the physical main-checkout root plus a short path hash
-(`myapp-4f9a11b2`). Equal branch (or `--ns`) names in different repos therefore
-never share config -- and `csb -d` in one repo can never delete another's
-history. Below, `<rk>` is the current repo's key:
+A namespace is just **which `HOME` the sandboxed process gets** -- and with it
+the agent's claude config (history/sessions/settings), caches, and anything else
+that lives in `$HOME`. `-N`, `-E`, and `--real-home` are three mutually-exclusive
+choices for that HOME; the default is a per-repo redirected HOME. They differ in
+*persistence* and in whether that HOME is *writable* inside the sandbox:
 
-| Invocation | Namespace | Config |
+| Choice | HOME | Persistent | Writable in sandbox | Seeded |
+|---|---|---|---|---|
+| **default** | `~/.csb/claudes/repo-<key>` (per repo) | yes | yes | yes |
+| **`-N NAME`** | `~/.csb/claudes/@NAME` (shared across repos) | yes | yes | yes |
+| **`-E`** | a throwaway dir under tmp | no | yes | yes |
+| **`--real-home`** | your real `$HOME` | n/a | **no** (reads obey the deny-list) | no |
+
+**By default the namespace is the repo, not the branch.** One persistent HOME is
+shared by every branch and worktree of the repo, living flat at
+`~/.csb/claudes/repo-<key>`, where `<key>` is the basename of the physical
+main-checkout root plus a short path hash (`myapp-4f9a11b2`). The hash keeps two
+different repos that share a basename from ever sharing a HOME. Because the
+default is derived from the repo every run, `csb <branch>` is deterministic with
+no hidden state.
+
+| Invocation | Namespace | HOME |
 |---|---|---|
-| `csb feature/foo` | `feature%2Ffoo` (from the branch) | persistent `~/.csb/claudes/<rk>/feature%2Ffoo/.claude` |
-| `csb --here` (on `feature/foo`) | `feature%2Ffoo` (from current HEAD) | persistent, same dir |
-| `csb --here` (detached HEAD) | -- | **error: fail fast** |
-| `csb --ns work feature/foo` | `work` (explicit override) | persistent `~/.csb/claudes/<rk>/work/.claude` |
-| `csb --ns @work feature/foo` | `@work` (unscoped) | persistent `~/.csb/claudes/@work/.claude`, shared across repos |
+| `csb feature/foo` | `repo-<key>` (this repo) | persistent `~/.csb/claudes/repo-<key>` |
+| `csb --here` | `repo-<key>` (this repo) | persistent, same dir |
+| `csb --ns work feature/foo` | `@work` (shared) | persistent `~/.csb/claudes/@work` |
+| `csb --ns @work feature/foo` | `@work` -- identical to the line above | persistent `~/.csb/claudes/@work` |
 | `csb -E feature/foo` | none | throwaway (not persisted) |
 
 `HOME` for the launched process is the namespace dir; its config lands at
 `<ns>/.claude` (coinciding with claude's default `$HOME/.claude`), so caches that
-normally live in `$HOME` (npm, bundler, ...) rebuild there and persist per
-namespace. The whole `~/.csb/claudes` tree is denied except the **active**
-namespace, so one branch's agent can't read another's history.
+normally live in `$HOME` (npm, bundler, ...) rebuild there and persist. The whole
+`~/.csb/claudes` tree is denied except the **active** namespace.
 
-- **`-N`, `--ns NAME`** -- named, isolated, repo-scoped config.
-- **`--ns @NAME`** -- deliberately **unscoped**: one config shared by every repo
-  launched with it. Only an explicit `--ns` can be unscoped; a branch named
-  `@NAME` can't alias it. `-d` never auto-removes an `@`-namespace (retire it
-  manually: `rm -rf ~/.csb/claudes/@NAME`).
+> **Parallel sessions share one HOME.** Two `csb` sessions on different branches
+> of the same repo now share the per-repo HOME (config, history, `.claude.json`)
+> with no locking. This is exactly the situation you already get running native
+> `claude` twice against one real `~/.claude`; the old per-branch default was
+> *more* isolated than native. Want per-branch isolation back for a repo? Launch
+> with an explicit name, e.g. `csb --ns "$(git branch --show-current)" <branch>`.
+
+- **`-N`, `--ns NAME`** -- a named HOME shared across **all** repos launched with
+  it (the classic use: one `--ns @work` for every work repo). `NAME` and `@NAME`
+  are equivalent -- the `@` is optional and always added, which also keeps user
+  names in their own space so none can collide with a `repo-<key>` default. `-d`
+  never auto-removes it (retire it manually: `rm -rf ~/.csb/claudes/@NAME`).
 - **`-E`, `--ephemeral`** -- throwaway config/HOME under `$TMPDIR`, no namespace.
   Mutually exclusive with `--ns`. A bare `-E` mints a random throwaway dir, so
   there is nothing a second invocation can reattach to.
@@ -161,26 +177,22 @@ namespace, so one branch's agent can't read another's history.
 
   It is still *ephemeral*, not a namespace: it lives in tmp (OS-reaped, gone on
   reboot/tmp-clean), leaves no `~/.csb/claudes` entry, and is untracked by
-  `--list-ns`/`--prune-ns`. Both panes must resolve the same tmp base for the
-  paths to coincide -- set `CSB_TMPDIR` for a fixed base, or keep
-  `$TMPDIR` stable across your shells. (For a shareable env that *persists*
-  across reboots and is tracked/pruneable, use a short-lived `--ns NAME`
-  instead.) The name is a single path component: letters, digits, `. _ -`.
+  `--list-ns`. Both panes must resolve the same tmp base for the paths to
+  coincide -- set `CSB_TMPDIR` for a fixed base, or keep `$TMPDIR` stable across
+  your shells. (For a shareable env that *persists*, use a `--ns NAME` instead.)
+  The name is a single path component: letters, digits, `. _ -`.
 
-`csb -d <branch>` removes the worktree **and** its per-branch namespace config
-(stale configs hold session history and the auth they were seeded with, a
-footprint risk). Pass the same `--ns` you launched with; without it, `-d` only
-removes the branch-derived namespace. Only worktrees csb created under
-`.worktrees/` are ever torn down/removed -- a branch checked out in the main
-tree or a hand-made worktree is left alone.
+`csb -d <branch>` removes only the worktree; the branch is kept, and so is the
+launch HOME -- the per-repo default is shared by every branch, and a `--ns`
+namespace is shared across repos, so neither is tied to the branch being
+deleted. Retire a namespace deliberately with `rm -rf ~/.csb/claudes/<name>`.
+Only worktrees csb created under `.worktrees/` are ever torn down/removed -- a
+branch checked out in the main tree or a hand-made worktree is left alone.
 
-Namespace configs can still outlive their branch (`-d` with a different `--ns`
-than you launched with, a branch deleted outside csb, `--here` launches).
-`csb --list-ns` shows this repo's configs and flags **orphans** --
-branch-derived namespaces whose branch and worktree are both gone;
-`csb --prune-ns` removes exactly those. Explicit `--ns` and shared `@`
-namespaces are never auto-removed, and dirs predating the provenance stamp are
-listed but left alone (any launch stamps them).
+`csb --list-ns` lists the namespace configs under `~/.csb/claudes`: the per-repo
+default (`repo-<key>`), any others from sibling repos, and the shared `@` ones.
+None are ever auto-removed. Dirs left over from the pre-0.3 per-branch layout are
+flagged as legacy; remove them manually when convenient.
 
 ## Profiles
 
@@ -550,7 +562,7 @@ test suite (`docs/PLAN-005-tests.md`) drives.
 
 - `--dump-config` -- print the resolved knobs as stable `KEY=VALUE` lines
   (flags + profile + `.local` + env, after all precedence). Git-free: it exits
-  before locating the repo, so a branch-derived namespace shows as an empty
+  before locating the repo, so the default (per-repo) namespace shows as an empty
   `namespace=` plus `branch=`. `token_cmd` is reported `present`/`absent` (never
   run), and `setenv` lists VAR names only (never their values).
 

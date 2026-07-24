@@ -8,7 +8,7 @@
 
 load helpers
 
-@test "snapshot: baseline (--here, branch-derived namespace)" {
+@test "snapshot: baseline (--here, per-repo namespace)" {
   local repo; repo="$(fake_repo feature/x)"
   dump_sandbox_snapshot "$repo"
   assert_success

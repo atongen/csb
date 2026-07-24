@@ -120,11 +120,11 @@ normalize_sandbox() {
   rrepo="$(realpath "$repo")"
   rtmp="$(realpath "$CSB_TMPDIR")"
 
-  # Namespace dirs, located by the .csb-ns stamp csb writes (covers both the
-  # branch/ns-scoped <repo-key>/<ns> form and the @unscoped form). Replace the ns
-  # dir itself with <NS>, and -- for the scoped form -- its <repo-key> parent
-  # (whose name embeds a volatile path hash) with <NSKEY>, since csb emits an
-  # ancestor-metadata rule for that parent. The ns dir (longer) goes first.
+  # Namespace dirs, located by the .csb-ns stamp csb writes. Both current forms
+  # (the per-repo default repo-<key> and the shared @NAME) sit flat directly
+  # under ~/.csb/claudes, so their parent IS the claudes root and only the ns
+  # dir itself is replaced with <NS>. The <NSKEY> parent replacement fires only
+  # for a legacy pre-0.3 nested <repo-key>/<ns> dir, if one is present.
   local keydir
   while IFS= read -r stamp; do
     nsdir="$(dirname "$stamp")"

@@ -21,7 +21,7 @@
 set -euo pipefail
 
 PROG=$(basename "$0")
-CSB_VERSION="0.2.0"
+CSB_VERSION="0.3.0"
 
 # csb supplies the claude binary from its own flake (so repos stay decoupled).
 # Default: the public GitHub remote. For local dev against a working tree,
@@ -41,15 +41,15 @@ USAGE:
   $PROG [OPTIONS] --here [-- ARGS...]     launch in the current dir (no worktree)
   $PROG -n BRANCH                         prepare BRANCH's worktree, don't launch
   $PROG -d BRANCH                         remove BRANCH's worktree (keeps the branch)
-  $PROG --list-ns | --prune-ns            list / prune namespace configs
+  $PROG --list-ns                         list csb namespace configs
   $PROG                                   list csb worktrees
 
 Claude (or the -s shell) runs inside the repo's devShell with a scrubbed
-environment, a private per-namespace HOME, a read deny-list (~/.ssh, ~/.aws,
-the real ~/.claude, etc. — extend with --deny-read / a profile's deny_read=),
-and a write allow-list (worktree, git dir, namespace HOME, tmp — extend with
---allow-write / a profile's allow_write=). Network and local services stay
-reachable.
+environment, a private HOME (per-repo by default), a read deny-list (~/.ssh,
+~/.aws, the real ~/.claude, etc. — extend with --deny-read / a profile's
+deny_read=), and a write allow-list (worktree, git dir, the launch HOME, tmp —
+extend with --allow-write / a profile's allow_write=). Network and local
+services stay reachable.
 
 OPTIONS:
   -y, --yolo         pass --dangerously-skip-permissions to claude (allow-all)
@@ -60,13 +60,24 @@ OPTIONS:
                      --paranoid-allow-read, deny extra trees with
                      --paranoid-deny-read. Also via a profile's paranoid=true.
       --here         no worktree: run in the current directory (quick ops).
-                     Mutually exclusive with BRANCH. The namespace comes from
-                     the current HEAD branch (detached = error).
-  -N, --ns NAME      override the claude namespace (default: the branch,
-                     percent-encoded). Persistent, isolated config under
-                     ~/.csb/claudes/<repo-key>/NAME. @NAME is unscoped — one
-                     config shared across repos (~/.csb/claudes/@NAME); -d
-                     never auto-removes @-namespaces.
+                     Mutually exclusive with BRANCH.
+
+  HOME choice: -N, -E, and --real-home are three MUTUALLY-EXCLUSIVE answers to
+  one question -- which HOME the sandboxed process gets. Each one (potentially
+  creates and) sets \$HOME inside the sandbox; they differ only in persistence
+  and in whether that HOME is WRITABLE inside the sandbox:
+    default        per-repo HOME ~/.csb/claudes/repo-<key>, persistent,
+                   writable, shared by all the repo's branches/worktrees.
+    -N/--ns NAME   a shared, cross-repo HOME ~/.csb/claudes/@NAME, persistent,
+                   writable. NAME and @NAME mean the same thing.
+    -E/--ephemeral throwaway HOME under tmp, not persisted, writable.
+    --real-home    the operator's REAL HOME: NOT redirected, NOT seeded, and
+                   NOT made writable (reads still obey the deny-list).
+
+  -N, --ns NAME      use a shared, cross-repo HOME at ~/.csb/claudes/@NAME
+                     instead of the per-repo default. NAME and @NAME are
+                     equivalent (the @ is added if you omit it). Persistent and
+                     never auto-removed by -d.
   -E, --ephemeral[=NAME]
                      throwaway config/HOME, no namespace (not persisted).
                      Mutually exclusive with --ns. Bare: a random throwaway
@@ -76,10 +87,10 @@ OPTIONS:
                      OS-reaped; untracked by --list-ns), not a namespace.
       --real-home    use the operator's REAL HOME instead of a redirected one:
                      no namespace, no seeding, and the real HOME is NOT made
-                     writable. A third launch-HOME choice, mutually exclusive
-                     with --ns and -E. Pair with --no-sandbox for a shell whose
-                     ~/.ssh, ~/.kube, ~/.aws etc. resolve (e.g. a deployment).
-                     Also via a profile's real_home=true.
+                     writable. Mutually exclusive with --ns and -E. Pair with
+                     --no-sandbox for a shell whose ~/.ssh, ~/.kube, ~/.aws etc.
+                     resolve (e.g. a deployment). Also via a profile's
+                     real_home=true.
   -s, --shell        drop into an interactive bash — or run ARGS after -- as a
                      command — instead of claude, in the exact environment
                      claude would get: same worktree, devShell, env scrub,
@@ -147,17 +158,14 @@ OPTIONS:
                      pinned so the rest of the day is fully cached. Trades
                      reproducibility for always-newest. Default via CSB_LATEST=1.
   -d, --delete       delete mode: run .worktreesetup.sh's sandboxed 'down'
-                     teardown (if any), then remove BRANCH's worktree AND its
-                     namespace config under ~/.csb/claudes (keeps the branch).
-                     Only worktrees csb created (under .worktrees/) are ever
-                     torn down/removed. Pass the same --ns you launched with;
-                     without it, -d only removes the branch-derived namespace.
-      --list-ns      list this repo's namespace configs under ~/.csb/claudes
-                     (and shared @ ones), flagging orphans whose branch and
-                     worktree are both gone
-      --prune-ns     remove the orphaned branch-derived namespace configs that
-                     --list-ns flags (explicit --ns and @-shared namespaces
-                     are never auto-removed)
+                     teardown (if any), then remove BRANCH's worktree (keeps the
+                     branch). Only worktrees csb created (under .worktrees/) are
+                     ever torn down/removed. The launch HOME is NOT removed: it
+                     is per-repo (or a shared @-namespace), not tied to one
+                     branch. Retire a namespace deliberately with rm -rf.
+      --list-ns      list csb namespace configs under ~/.csb/claudes: the
+                     per-repo default (repo-<key>) and shared @ ones. Flags any
+                     leftover dirs from the pre-0.3 per-branch layout.
   -v, --verbose      restore csb's routine status narration and nix's own build
                      output (evaluating/downloading progress). Launches are quiet
                      by default; warnings and errors always print. Default via
@@ -214,18 +222,11 @@ latest_claude_rev() {
 
 # Percent-encode a branch into one filesystem-safe path component, injectively
 # (% first, then /): feature/foo -> feature%2Ffoo, so no two branches collide.
+# Used only for the .worktrees/<branch> path; namespaces are no longer per-branch.
 encode_branch() {
   local s="$1"
   s="${s//%/%25}"
   s="${s//\//%2F}"
-  echo "$s"
-}
-
-# Inverse of encode_branch (/ before %, mirroring the encode order).
-decode_branch() {
-  local s="$1"
-  s="${s//%2F//}"
-  s="${s//%25/%}"
   echo "$s"
 }
 
@@ -522,16 +523,20 @@ seed_home_template() {
   fi
 }
 
-# Resolve the effective claude namespace. Sets the global ns_dir (empty =
-# ephemeral) and exports CSB_CLAUDE_CONFIG_DIR. Precedence:
-#   -E/--ephemeral       -> throwaway config (no namespace)
-#   --ns NAME (explicit) -> persistent ~/.csb/claudes/<repo-key>/NAME
-#                           (@NAME: unscoped ~/.csb/claudes/@NAME)
-#   default              -> persistent ~/.csb/claudes/<repo-key>/<branch>
-# There is no sticky state: the default is derived from the branch every run, so
+# Resolve the effective claude namespace, i.e. which HOME the launched process
+# gets. Sets the global ns_dir (empty = ephemeral) and exports
+# CSB_CLAUDE_CONFIG_DIR. The three overrides and the default are mutually
+# exclusive HOME choices:
+#   --real-home    -> the operator's REAL HOME (no redirect, no dir)
+#   -E/--ephemeral -> throwaway config/HOME under tmp (no namespace)
+#   -N NAME        -> shared, cross-repo HOME at ~/.csb/claudes/@NAME
+#                     (the leading @ is optional: NAME and @NAME are the same)
+#   default        -> one persistent HOME per REPO at ~/.csb/claudes/repo-<key>,
+#                     shared across all the repo's branches/worktrees
+# There is no sticky state: the default is derived from the repo every run, so
 # `csb BRANCH` is deterministic without remembering anything.
 setup_namespace() {
-  local worktree="$1" ns cur_branch
+  local ns
   ns_dir=""
 
   if [[ "$real_home" == "true" ]]; then
@@ -550,44 +555,32 @@ setup_namespace() {
     return
   fi
 
-  if [[ -n "$namespace" ]]; then
-    ns="$namespace"
-  elif [[ "$here" == "true" ]]; then
-    # --here has no BRANCH arg: derive from the current HEAD branch. Fail fast
-    # and loud on a detached HEAD rather than guessing.
-    cur_branch=$(git -C "$worktree" branch --show-current 2>/dev/null || true)
-    [[ -n "$cur_branch" ]] || die "--here on a detached HEAD: no branch to derive a namespace from.
-  Pass --ns NAME or -E/--ephemeral explicitly."
-    ns=$(encode_branch "$cur_branch")
-  else
-    ns=$(encode_branch "$branch")
-  fi
-  csb_ns="$ns"
-
   # HOME redirects to <ns>, so the config dir is <ns>/.claude (coincides with
-  # claude's default $HOME/.claude). @NAME (explicit --ns only) is unscoped --
-  # one dir shared across repos; branch-derived names stay under the repo key,
-  # so a branch literally named '@x' cannot alias one.
-  if [[ -n "$namespace" && "$namespace" == @* ]]; then
+  # claude's default $HOME/.claude).
+  if [[ -n "$namespace" ]]; then
+    # -N NAME and -N @NAME both name the SAME shared, cross-repo namespace: one
+    # dir at ~/.csb/claudes/@NAME, never auto-removed. The auto-@ prefix keeps
+    # user names in their own flat space, so none can alias a repo-<key> dir.
+    ns="@${namespace#@}"
     ns_dir="$CSB_NS_ROOT/$ns"
     mkdir -p "$ns_dir/.claude"
     echo "kind=shared" > "$ns_dir/.csb-ns"
     export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
+    csb_ns="$ns"
     vecho "$PROG: namespace: $ns  (persistent, shared across repos: $ns_dir)"
     return
   fi
-  ns_dir="$CSB_NS_ROOT/$ns_repo_key/$ns"
+
+  # Default: one persistent HOME per repo (repo-<basename>-<pathhash>), shared
+  # by every branch and worktree of the repo. Not tied to any one branch, so it
+  # is never auto-pruned or removed by -d.
+  ns="repo-$ns_repo_key"
+  ns_dir="$CSB_NS_ROOT/$ns"
   mkdir -p "$ns_dir/.claude"
-  # Provenance stamp for --list-ns/--prune-ns: branch-derived namespaces may
-  # be auto-pruned once branch and worktree are gone; explicit --ns ones never
-  # are. Re-stamped every launch (also classifies pre-stamp dirs).
-  if [[ -n "$namespace" ]]; then
-    echo "kind=ns" > "$ns_dir/.csb-ns"
-  else
-    echo "kind=branch" > "$ns_dir/.csb-ns"
-  fi
+  echo "kind=repo" > "$ns_dir/.csb-ns"
   export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
-  vecho "$PROG: namespace: $ns  (persistent: $ns_dir)"
+  csb_ns="$ns"
+  vecho "$PROG: namespace: $ns  (persistent, per-repo: $ns_dir)"
 }
 
 # --- deny-list / write policy -----------------------------------------------------
@@ -1289,7 +1282,6 @@ while [[ $# -gt 0 ]]; do
     -V|--version) echo "$PROG $CSB_VERSION"; exit 0 ;;
     -d|--delete) mode="delete"; shift ;;
     --list-ns) mode="list_ns"; shift ;;
-    --prune-ns) mode="prune_ns"; shift ;;
     -y|--yolo) yolo="true"; yolo_cli="true"; shift ;;
     --no-yolo|--yodo) yolo="false"; yolo_cli="true"; shift ;;
     --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
@@ -1440,9 +1432,9 @@ keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
 keep_args=()
 for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 
-# Validate the namespace name: named namespaces become a directory under
-# ~/.csb/claudes. A leading @ marks a deliberately unscoped (cross-repo shared)
-# namespace.
+# Validate the namespace name: a named namespace becomes a directory
+# ~/.csb/claudes/@NAME, shared across repos. The leading @ is optional here (it
+# is added at resolve time); NAME and @NAME are equivalent.
 if [[ -n "$namespace" ]]; then
   [[ "$namespace" =~ ^@?[A-Za-z0-9._-]+$ && "$namespace" != "." && "$namespace" != ".." ]] \
     || die "invalid namespace '$namespace' (use letters, digits, . _ -; optional leading @)"
@@ -1538,67 +1530,33 @@ ns_repo_key=$(repo_key "$repo_root")
 # worktree. List/namespace modes read from here so they work from anywhere.
 main_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 
-# --- namespace list / prune modes ---------------------------------------------------
+# --- namespace list mode ------------------------------------------------------------
 
-# Classify one repo-scoped namespace dir. Echoes:
-#   active   worktree present for the decoded branch
-#   branch   branch exists, no worktree (e.g. --here use)
-#   orphan   branch-derived, branch AND worktree gone -> --prune-ns removes it
-#   explicit --ns provenance, never auto-pruned
-#   unknown  no provenance stamp (pre-stamp dir), never auto-pruned
-classify_ns() {
-  local dir="$1" ns="$2" kind="" br
-  [[ -f "$dir/.csb-ns" ]] && kind=$(sed -n 's/^kind=//p' "$dir/.csb-ns" | head -n 1)
-  br=$(decode_branch "$ns")
-  if [[ -n "$(find_worktree "$main_root" "$br")" || -d "$main_root/.worktrees/$ns" ]]; then
-    echo "active"; return
-  fi
-  case "$kind" in
-    ns)     echo "explicit"; return ;;
-    branch) ;;
-    *)      echo "unknown"; return ;;
-  esac
-  if branch_exists "$main_root" "$br"; then echo "branch"; else echo "orphan"; fi
-}
-
-if [[ "$mode" == "list_ns" || "$mode" == "prune_ns" ]]; then
-  [[ -z "$branch" ]] || die "--list-ns/--prune-ns take no BRANCH argument"
-  ns_root="$CSB_NS_ROOT/$ns_repo_key"
-  count=0; pruned=0
-  [[ "$mode" == "list_ns" ]] && echo "csb namespaces under $ns_root:"
-  if [[ -d "$ns_root" ]]; then
-    for d in "$ns_root"/*; do
+if [[ "$mode" == "list_ns" ]]; then
+  [[ -z "$branch" ]] || die "--list-ns takes no BRANCH argument"
+  this_repo="repo-$ns_repo_key"
+  echo "csb namespaces under $CSB_NS_ROOT:"
+  count=0; legacy=0
+  if [[ -d "$CSB_NS_ROOT" ]]; then
+    shopt -s nullglob
+    for d in "$CSB_NS_ROOT"/*; do
       [[ -d "$d" ]] || continue
       ns=$(basename "$d")
-      status=$(classify_ns "$d" "$ns")
       count=$((count + 1))
-      if [[ "$mode" == "list_ns" ]]; then
-        case "$status" in
-          active)   printf '  %-28s branch %s (worktree active)\n' "$ns" "$(decode_branch "$ns")" ;;
-          branch)   printf '  %-28s branch %s (no worktree)\n' "$ns" "$(decode_branch "$ns")" ;;
-          orphan)   printf '  %-28s ORPHAN: branch %s and its worktree are gone (--prune-ns removes)\n' \
-                      "$ns" "$(decode_branch "$ns")" ;;
-          explicit) printf '  %-28s explicit --ns (never auto-pruned)\n' "$ns" ;;
-          unknown)  printf '  %-28s unknown origin (never auto-pruned; a launch classifies it)\n' "$ns" ;;
-        esac
-      elif [[ "$status" == "orphan" ]]; then
-        echo "$PROG: removing orphaned namespace $d (branch '$(decode_branch "$ns")' and its worktree are gone)"
-        rm -rf "$d"
-        pruned=$((pruned + 1))
-      fi
+      case "$ns" in
+        "$this_repo") printf '  %-34s per-repo default (this repo)\n' "$ns" ;;
+        repo-*)       printf '  %-34s per-repo default (another repo)\n' "$ns" ;;
+        @*)           printf '  %-34s shared across repos\n' "$ns" ;;
+        *)            printf '  %-34s LEGACY pre-0.3 per-branch layout (remove manually)\n' "$ns"
+                      legacy=$((legacy + 1)) ;;
+      esac
     done
-  fi
-  if [[ "$mode" == "list_ns" ]]; then
-    (( count > 0 )) || echo "  (none)"
-    shopt -s nullglob
-    shared_ns=("$CSB_NS_ROOT"/@*)
     shopt -u nullglob
-    if (( ${#shared_ns[@]} > 0 )); then
-      echo "shared namespaces under $CSB_NS_ROOT (cross-repo, never auto-removed):"
-      for d in "${shared_ns[@]}"; do echo "  $(basename "$d")"; done
-    fi
-  else
-    (( pruned > 0 )) || echo "$PROG: no orphaned namespaces to prune under $ns_root"
+  fi
+  (( count > 0 )) || echo "  (none)"
+  if (( legacy > 0 )); then
+    echo "$PROG: $legacy legacy dir(s) from the pre-0.3 per-branch layout remain;" >&2
+    echo "  they are never used or auto-removed -- delete when ready: rm -rf $CSB_NS_ROOT/<name>" >&2
   fi
   exit 0
 fi
@@ -1661,24 +1619,14 @@ if [[ "$mode" == "delete" ]]; then
     git -C "$repo_root" worktree prune
   fi
 
-  # Also remove the persistent namespace config for this branch. Leaving stale
-  # per-branch configs (session history + the auth they were seeded with) around
-  # is a footprint/credential risk. Skip when an override makes removal unsafe or
-  # irrelevant (-E: nothing persisted).
-  if [[ "$ephemeral" != "true" ]]; then
-    if [[ "$namespace" == @* ]]; then
-      # Shared across repos: its lifecycle must not be a side effect of
-      # deleting one branch's worktree.
-      echo "$PROG: namespace '$namespace' is shared across repos — not removing." >&2
-      echo "  to retire it deliberately: rm -rf $CSB_NS_ROOT/$namespace" >&2
-    else
-      ns_name="${namespace:-$(encode_branch "$branch")}"
-      ns_dir="$CSB_NS_ROOT/$ns_repo_key/$ns_name"
-      if [[ -d "$ns_dir" ]]; then
-        echo "$PROG: removing namespace config $ns_dir"
-        rm -rf "$ns_dir"
-      fi
-    fi
+  # -d removes only the worktree. The launch HOME is now per-repo (shared by all
+  # the repo's branches) or a shared @-namespace -- neither is tied to a single
+  # branch, so deleting a worktree never removes a config. Retire a namespace
+  # deliberately with `rm -rf <dir>`; point there if one was named explicitly.
+  if [[ "$ephemeral" != "true" && -n "$namespace" ]]; then
+    ns_name="@${namespace#@}"
+    echo "$PROG: namespace '$ns_name' is shared and not tied to this branch -- not removing." >&2
+    echo "  to retire it deliberately: rm -rf $CSB_NS_ROOT/$ns_name" >&2
   fi
   exit 0
 fi
@@ -1712,7 +1660,7 @@ fi
 # flake so the sandbox can still run against repos that don't ship a flake.
 devshell_ref=$(resolve_devshell_ref "$worktree")
 
-setup_namespace "$worktree"
+setup_namespace
 
 cd "$worktree"
 

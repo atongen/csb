@@ -3,7 +3,6 @@
 (deny file* (subpath "<HOME>/.csb/claudes"))
 (deny file* (subpath "<HOME>/scratch"))
 (allow file* (subpath "<NS>"))
-(allow file-read-metadata (literal "<NSKEY>"))
 (allow file-read-metadata (literal "<HOME>/.csb/claudes"))
 (deny file-write*)
 (allow file-write* (subpath "<REPO>"))

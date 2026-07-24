@@ -11,7 +11,6 @@
 (allow file-read* (subpath "/dev"))
 (allow file-read* (subpath "<NS>"))
 (allow file* (subpath "<NS>"))
-(allow file-read-metadata (literal "<NSKEY>"))
 (allow file-read-metadata (literal "<HOME>/.csb/claudes"))
 (allow file-read-metadata (literal "<HOME>/.csb"))
 (allow file-read-metadata (literal "<HOME>"))
