@@ -151,12 +151,34 @@ normalize_sandbox() {
     fi
   fi
 
-  # Linux: the bwrap binary (pinned to the CSB_BWRAP_BIN placeholder), and the
-  # per-uid runtime dir csb tmpfs's to cut the session bus (PLAN-007 F4).
+  # Linux: the bwrap binary (pinned to the CSB_BWRAP_BIN placeholder).
   prog+="s#$(_sed_escape "$CSB_BWRAP_BIN")#<BWRAP>#g;"
-  prog+="s#/run/user/[0-9][0-9]*#/run/user/<UID>#g;"
 
-  printf '%s\n' "$output" | sed "$prog"
+  printf '%s\n' "$output" | sed "$prog" | collapse_ipc_tmpfs
+}
+
+# Read a bwrap argv on stdin (one token per line) and replace the IPC tmpfs
+# block with a single <IPC-TMPFS> marker. csb emits a --tmpfs for each of the
+# three broker paths that EXISTS on the host, so an expanded golden would encode
+# which ones the generating host happened to have and fail everywhere else --
+# the same defect as PLAN-007 addendum D1, one tier over. Which paths are
+# actually covered is asserted behaviourally in snapshots.bats instead.
+# A no-op on macOS: a seatbelt profile has no --tmpfs tokens.
+collapse_ipc_tmpfs() {
+  local uid line nxt marked="false"
+  uid="$(id -u)"
+  while IFS= read -r line; do
+    if [[ "$line" == "--tmpfs" ]] && IFS= read -r nxt; then
+      case "$nxt" in
+        "/run/user/$uid"|/run/dbus|/nix/var/nix/daemon-socket)
+          [[ "$marked" == "true" ]] || { printf '%s\n' "<IPC-TMPFS>"; marked="true"; }
+          continue ;;
+      esac
+      printf '%s\n%s\n' "$line" "$nxt"
+      continue
+    fi
+    printf '%s\n' "$line"
+  done
 }
 
 # assert_snapshot NAME REPO -- normalize the just-captured --dump-sandbox $output
@@ -164,6 +186,17 @@ normalize_sandbox() {
 # golden is (re)written instead; a missing golden fails with how to generate it.
 assert_snapshot() {
   local name="$1" repo="$2" golden actual
+  # A golden is a host fingerprint, and inside a csb sandbox the host looks
+  # different: getconf DARWIN_USER_TEMP_DIR falls back to $TMPDIR when the
+  # confstr lookup is denied, so <VARTMP> silently stands for /private/tmp and
+  # the write root of that name vanishes. Goldens regenerated in there are
+  # wrong, and they still compare EQUAL in there, which is how it went unnoticed
+  # (PLAN-007 addendum D1). Generate and check them from a normal terminal only.
+  if [[ -n "${CSB_SANDBOX:-}" ]]; then
+    [[ "${SNAPSHOT_UPDATE:-}" != "1" ]] \
+      || fail "refusing to regenerate goldens inside csb: run 'make test-update' from a normal terminal"
+    skip "inside csb -- Tier 2 goldens are only meaningful on the host"
+  fi
   golden="$BATS_TEST_DIRNAME/snapshots/$(platform)/$name"
   actual="$(normalize_sandbox "$repo")"
 

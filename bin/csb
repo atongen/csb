@@ -49,10 +49,12 @@ environment, a private HOME (per-repo by default), a read deny-list (~/.ssh,
 ~/.aws, the real ~/.claude, etc. — extend with --deny-read / a profile's
 deny_read=), and a write allow-list (worktree, git dir, the launch HOME, tmp —
 extend with --allow-write / a profile's allow_write=). Network egress stays
-open, so local services over TCP stay reachable; host IPC does NOT (mach/XPC on
-macOS, the session bus on Linux, unix sockets on both) — that is what keeps a
-host service from acting outside the sandbox on the sandbox's behalf. See the
-README's threat model, and 'Known gaps' for what is still open.
+open, so local services over TCP stay reachable; host IPC does not — mach/XPC
+and every HOST unix socket on macOS, the session/system bus and the nix daemon
+socket on Linux — so a host service cannot act outside the sandbox on the
+sandbox's behalf. Unix sockets inside the sandbox's own trees (worktree, git
+dir, launch HOME) still work. See the README's threat model, and 'Known gaps'
+for what is still open.
 
 OPTIONS:
   -y, --yolo         pass --dangerously-skip-permissions to claude (allow-all)
@@ -786,30 +788,40 @@ build_deny_paths() {
   done
 }
 
-# Populate the global write_roots array: the roots the launched process may
-# write under. Everything else is read-only (or read-denied per the deny-list).
-# The active namespace / ephemeral HOME is handled separately per platform.
+# Populate two globals: write_roots, every root the launched process may write
+# under (everything else is read-only, or read-denied per the deny-list), and
+# own_roots, the subset csb itself creates -- worktree, git common dir, launch
+# HOME. The active namespace / ephemeral HOME is handled separately per platform.
+#
+# own_roots exists for the macOS unix-socket re-allow (build_deny_wrapper): a
+# socket under a tree csb created is one the sandbox itself made, while /tmp and
+# the per-user temp dir are writable but SHARED with the host, so a socket there
+# may be a host service. Write policy cannot make that distinction; socket policy
+# must.
 # Consumes the globals worktree, claude_home, cfg_tmpdir.
 build_write_roots() {
-  write_roots=()
-  local -a cand=("$worktree")
+  write_roots=(); own_roots=()
+  local -a cand=("$worktree") own=("$worktree")
   local gc
   gc=$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
   # Commits from a linked worktree write objects/refs into the MAIN repo's git
   # dir, so it must be writable (hooks/ and config are re-denied afterwards).
-  [[ -n "$gc" ]] && cand+=("$gc")
+  [[ -n "$gc" ]] && { cand+=("$gc"); own+=("$gc"); }
   # The ephemeral HOME is a write root; the REAL HOME under --real-home is NOT
   # (writes stay default-deny -- the shell reaches the fs via --no-sandbox, not
   # by widening the write policy).
-  [[ -n "$claude_home" && -z "$ns_dir" && "$real_home" != "true" ]] && cand+=("$claude_home")
+  [[ -n "$claude_home" && -z "$ns_dir" && "$real_home" != "true" ]] \
+    && { cand+=("$claude_home"); own+=("$claude_home"); }
   [[ -n "$cfg_tmpdir" ]] && cand+=("$cfg_tmpdir")
   cand+=("/tmp")
   if [[ "$(uname -s)" == "Darwin" ]]; then
     # The per-user /var/folders/... dir (covers both the T/ temp and C/ cache
     # subdirs, which system frameworks write to) and the device tree (ptys;
-    # the TUI writes its terminal). Derived via getconf, NEVER from $TMPDIR:
-    # nix develop and stripped environments point TMPDIR at /tmp subpaths,
-    # whose parent resolves to /private — far too broad to write-allow.
+    # the TUI writes its terminal). The case below is what makes this safe, not
+    # the use of getconf: getconf itself falls back to $TMPDIR when the confstr
+    # lookup is denied (measured inside a sandbox), and TMPDIR points at a /tmp
+    # subpath under nix develop, whose parent resolves to /private — far too
+    # broad to write-allow. Anything not under /var/folders is refused.
     local dtmp dpar=""
     dtmp="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
     [[ -n "$dtmp" && -d "$dtmp" ]] && dpar="$(dirname "$(realpath "$dtmp")")"
@@ -835,6 +847,11 @@ build_write_roots() {
       *'"'*|*\\*) die "allow-write path contains a double quote or backslash (unsupported): $rp" ;;
     esac
     write_roots+=("$rp")
+  done
+  # own is a subset of cand, so the quote check above has already covered it.
+  for p in "${own[@]}"; do
+    [[ -n "$p" && -e "$p" ]] || continue
+    own_roots+=("$(realpath "$p")")
   done
 }
 
@@ -965,29 +982,43 @@ build_deny_wrapper() {
         # failed to block `open` before the blanket deny worked.
         #   mach-lookup      -- mach + XPC named services (LaunchServices/`open`,
         #                       the pasteboard, AppleEvents, the window server).
-        #                       The two DNS names are the whole whitelist: with
-        #                       them, DNS/HTTPS/claude match the unsandboxed host.
+        #                       Three names are re-allowed and no more: two for
+        #                       DNS (with them, DNS/HTTPS/claude match the
+        #                       unsandboxed host) and one for getpwuid. Without
+        #                       the third, uid->name resolution fails -- `id -un`
+        #                       and `whoami` print the raw uid, and libpq refuses
+        #                       to connect over ANY transport. It is
+        #                       opendirectoryd.LIBINFO; the .api name that probe
+        #                       rows A2-A4 cleared as unnecessary is a different
+        #                       service and does not fix it.
         #   network-outbound -- AF_UNIX connect() is this class, so denying the
         #                       class and re-allowing IP keeps egress while
         #                       cutting every host socket (nix daemon, tmux,
         #                       editor IPC, docker, ssh-agent). The two
         #                       mDNSResponder literals are load-bearing: without
         #                       them DNS fails even though its mach service is
-        #                       allowed (measured, probe rows A5 vs A7).
+        #                       allowed (measured, probe rows A5 vs A7). The
+        #                       own_roots re-allow below is what keeps the
+        #                       sandbox's OWN sockets working.
         #   mach-priv-task-port -- task_for_pid: macOS has no PID namespace, so
         #                       every host process is otherwise addressable.
-        # NOT denied: sysctl kern.proc*. It would close the kern.procargs2
-        # disclosure (other processes' argv AND environment, i.e. their
-        # secrets), but a `kern.proc` prefix deny also breaks `ps` outright --
-        # measured in-sandbox. A narrower `kern.procargs` prefix should close
-        # the leak while leaving `ps`'s process list alone; unmeasured, so it
-        # is a documented open gap rather than a shipped guess.
+        #                       Never demonstrated reachable (the OS already
+        #                       gates it on root or a debugger entitlement); it
+        #                       is free, so the class is denied anyway.
+        # NOT denied: sysctl. The kern.procargs2 disclosure (every same-uid
+        # process's argv AND environment) is NOT closeable here -- a name-prefix
+        # deny cannot match it, because the read goes through the numeric MIB
+        # {CTL_KERN, KERN_PROCARGS2, pid}, which has no string name. Measured
+        # with a compiled probe: `kern.procargs`, `kern.proc`, blanket
+        # (deny sysctl-read) and (deny sysctl*) all still leak, and the blanket
+        # forms break `sysctl` and `uname`. Documented as an unfixable gap.
         echo "(deny mach-lookup)"
         echo '(allow mach-lookup (global-name "com.apple.dnssd.service"))'
         echo '(allow mach-lookup (global-name "com.apple.mDNSResponder"))'
+        echo '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))'
         # --pasteboard: pbcopy/pbpaste, off by default. Re-allowing these was
         # measured NOT to hand LaunchServices a route back (PLAN-007 row PB);
-        # test/escape.bats keeps that a regression guard.
+        # test/escape/escape.bats keeps that a regression guard.
         if [[ "$pasteboard" == "true" ]]; then
           echo '(allow mach-lookup (global-name "com.apple.pasteboard.1"))'
           echo '(allow mach-lookup (global-name "com.apple.lsd.mapdb"))'
@@ -1000,6 +1031,16 @@ build_deny_wrapper() {
         echo '(allow network-outbound (remote ip "*:*"))'
         echo '(allow network-outbound (literal "/private/var/run/mDNSResponder"))'
         echo '(allow network-outbound (literal "/var/run/mDNSResponder"))'
+        # Unix sockets INSIDE the sandbox's own trees: a Rails tmp/sockets/
+        # puma.sock, spring, an in-tree `pg_ctl -k`. Those trees are created and
+        # owned by the sandbox, so a socket there is one the sandbox itself made
+        # -- unlike /tmp or /var/folders, which are shared with the host and
+        # therefore stay denied (measured: re-allowing /private/tmp makes a HOST
+        # socket in /tmp reachable again, which is F3's shape returning).
+        for p in "${own_roots[@]+"${own_roots[@]}"}" "$ns_real"; do
+          [[ -n "$p" ]] || continue
+          printf '(allow network-outbound (subpath "%s"))\n' "$p"
+        done
         echo "(deny mach-priv-task-port)"
         echo "(deny iokit-open)"
         # READ policy: deny-list (later rules win; the active namespace is

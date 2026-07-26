@@ -9,12 +9,7 @@
 /proc
 --unshare-pid
 --die-with-parent
---tmpfs
-/run/user/<UID>
---tmpfs
-/run/dbus
---tmpfs
-/nix/var/nix/daemon-socket
+<IPC-TMPFS>
 --tmpfs
 <HOME>
 --tmpfs

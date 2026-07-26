@@ -19,13 +19,33 @@
       that close the LaunchServices escape remove it too. It is now the opt-in
       `--pasteboard` / `pasteboard=`, default OFF -- it is a read channel around
       the whole file deny-list. See docs/PLAN-007-escape.md phase 3b.
-- [X] close the IPC sandbox escapes (docs/PLAN-007-escape.md). DONE (2026-07-25).
+- [X] close the IPC sandbox escapes (docs/PLAN-007-escape.md). DONE (2026-07-25),
+      reviewed and corrected 2026-07-26 (see that plan's ADDENDUM).
       F1/F2/F3/F4 closed. macOS denies two whole seatbelt filter classes
       (mach-lookup, network-outbound-minus-IP), which closes AF_UNIX brokering
-      as a class; Linux is per-path tmpfs and cannot be complete. Two follow-ups
-      in that plan's header: confirm the claude API column + interactive TUI
-      under the final profile, and regenerate the Linux snapshot goldens on
-      NixOS.
+      as a class; Linux is per-path tmpfs and cannot be complete.
+    * the closeout review found the darwin snapshot goldens had been regenerated
+      from INSIDE a sandbox (where `getconf DARWIN_USER_TEMP_DIR` falls back to
+      $TMPDIR), so `make test` was red on the host; Tier 2 now refuses to run in
+      there at all. The claude API round trip under the shipped profile is
+      confirmed. `sysctl kern.procargs2` was measured UNFIXABLE with seatbelt --
+      no name-prefix rule can match a numeric-MIB read -- so that trail is
+      closed, not deferred.
+    * VERIFIED on NixOS: `make test` green, `make test-update` an empty diff (the
+      Linux goldens are host-independent now, not a hand-patched guess), and F4
+      ran as a test for the first time. That run also caught the positive control
+      asserting on `/bin/echo`, absent on NixOS -- fixed, and F3/F4 hardened so a
+      missing binary can no longer read as containment.
+    * the macOS mach-lookup whitelist is THREE names: two for DNS and
+      `com.apple.system.opendirectoryd.libinfo` for getpwuid. The third was
+      missing at first, so `id -un` printed the raw uid and psql refused to
+      connect over any transport. New `test/escape/usable.bats` holds one
+      assertion per re-allowed name -- add a name, add its assertion.
+    * host services over a unix socket stay unreachable by design (postgres on
+      /tmp/.s.PGSQL.5432 included; use `-h localhost`/`PGHOST`). Sockets in the
+      sandbox's own trees work.
+    * REMAINING: the interactive TUI under the shipped profile is hand-verified
+      only, the one item never covered by automation.
 
 - [X] State as of the last session
     - csb's own `flake.nix` now exposes `devShells.default` (git + shellcheck), so
@@ -103,4 +123,6 @@
     * lower-leverage companion: opt-in localhost-only egress mode (seatbelt
       `(deny network-outbound)` + `(allow ... (remote ip "localhost:*"))`,
       verified working; hostname allowlisting is NOT natively possible and
-      would mean re-adding the removed proxy subsystem).
+      would mean re-adding the removed proxy subsystem). NOTE: PLAN-007 already
+      ships `(deny network-outbound)` + `(allow ... (remote ip "*:*"))`, so this
+      is now a one-token change to an existing line rather than new machinery.

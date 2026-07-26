@@ -15,6 +15,20 @@ load helpers
   assert_snapshot baseline "$repo"
 }
 
+@test "linux: every IPC broker path present on this host gets a --tmpfs" {
+  # The goldens collapse this block to <IPC-TMPFS> because csb emits a --tmpfs
+  # only for the paths that exist, which differs per host (a NixOS box has all
+  # three; a CI runner often has none). So assert the behaviour here instead of
+  # freezing one host's answer into a golden. See PLAN-007 F3/F4.
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS cuts sockets by profile, not by mount)"
+  local repo p; repo="$(fake_repo feature/x)"
+  dump_sandbox_snapshot "$repo"
+  assert_success
+  for p in "/run/user/$(id -u)" /run/dbus /nix/var/nix/daemon-socket; do
+    if [[ -d "$p" ]]; then assert_line "$p"; else refute_line "$p"; fi
+  done
+}
+
 @test "snapshot: --paranoid" {
   local repo; repo="$(fake_repo feature/x)"
   dump_sandbox_snapshot "$repo" --paranoid

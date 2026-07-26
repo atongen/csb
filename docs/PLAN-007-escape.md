@@ -1,14 +1,15 @@
 # plan 007 -- sandbox escapes: IPC brokering and the nix daemon
 
-IMPLEMENTED (2026-07-25), except where noted below. All open decisions are
-resolved; see "Resolution and scope" for what shipped, what is deliberately not
-fixed, and why.
+IMPLEMENTED (2026-07-25), reviewed and corrected 2026-07-26. All open decisions
+are resolved; see "Resolution and scope" for what shipped, what is deliberately
+not fixed, and why.
 
 Landed in bin/csb: the macOS filter-class denies and the two-name DNS whitelist
-(`build_deny_wrapper`, Darwin branch); the Linux `--tmpfs` mounts over
-`/run/user/<uid>`, `/run/dbus` and `/nix/var/nix/daemon-socket` (Linux branch);
-`--pasteboard` / `pasteboard=`. Plus Phase 0's README pass, regenerated
-snapshots on both platforms, and `test/escape/escape.bats` + `make test-escape`.
+(`build_deny_wrapper`, Darwin branch), plus the sandbox-owned unix-socket
+re-allow; the Linux `--tmpfs` mounts over `/run/user/<uid>`, `/run/dbus` and
+`/nix/var/nix/daemon-socket` (Linux branch); `--pasteboard` / `pasteboard=`.
+Plus Phase 0's README pass, regenerated darwin snapshots, and
+`test/escape/escape.bats` + `make test-escape`.
 
 Every macOS line is now measured, including the `network-outbound` CLASS deny,
 which took two attempts: run 4 measured it breaking DNS, run 5 found the cause
@@ -17,25 +18,24 @@ came back clean. See "Phase 1c RESULTS". AF_UNIX brokering is therefore closed
 as a class on macOS -- nix daemon, tmux, editor IPC, docker, ssh-agent -- not
 merely per path.
 
+READ THE ADDENDUM AT THE BOTTOM OF THIS FILE FIRST if you are resuming cold. It
+is the 2026-07-26 closeout review, run from an unsandboxed session, and it
+corrects several conclusions reached above -- including one rule this file
+recommends that was later measured to do nothing.
+
 STILL OPEN:
 
-1. **The deciding CLAUDE column and the interactive TUI are unmeasured under the
-   final profile.** Run 5 used `SKIP_CLAUDE=1`, and run 3's claude columns were
-   taken under A1, which did not have the network-outbound denies. The API path
-   is TCP, and run 5's `http 404` to api.anthropic.com proves TCP+TLS to that
-   host works under the exact profile -- so this is low risk, but it is
-   inference. Confirm before release:
-
-       CLAUDE_CODE_OAUTH_TOKEN=... ROWS='CTL A1 A7' \
-         ./test/manual/ipc-probe-darwin-whitelist.sh
-
-   then run a real TUI session by hand under the A7 profile. If either fails,
-   fall back to row A6 (measured clean, one line different: drop the
-   network-outbound block, deny the nix daemon socket by path instead).
-2. **The Linux snapshot goldens were hand-patched, not regenerated** (no NixOS
-   host in the session). They assume `/run/user/<uid>`, `/run/dbus` and
-   `/nix/var/nix/daemon-socket` all exist, which holds on the NixOS box but is
-   a guess. `make test-update` on NixOS confirms or corrects them.
+1. **The interactive TUI is confirmed by hand only, never by automation.** The
+   API half of this item is CLOSED: a real `claude -p` round trip under the
+   shipped profile works (addendum Part 1), which was the deciding column runs 3
+   and 5 could only infer from an `http 404`. A pty session remains a manual
+   check. The measured fallback if it ever regresses is still row A6.
+2. **The Linux snapshot goldens are unverified on NixOS.** They were hand-patched,
+   not regenerated. The host-dependence that made that risky is now removed --
+   the goldens collapse the conditional tmpfs block to an `<IPC-TMPFS>` marker
+   and a separate assertion covers which paths are really mounted (addendum D2)
+   -- so `make test-update` on NixOS should produce an EMPTY diff. Any diff is a
+   real finding.
 
 The `trusted-users` guard was dropped as redundant -- see Phase 3.
 
@@ -131,7 +131,9 @@ network namespace). See the out-of-scope list.
 |---|---|---|---|
 | `(deny mach-lookup)` + the two DNS allows (A1) | macOS | 3 lines | VERIFIED (Phase 1b run 3 + hand-run TUI) |
 | `(deny network-outbound)` + re-allow IP egress + 2 mDNSResponder socket allows | macOS | 4 lines | VERIFIED (row A7, run 5; the mDNS allows are load-bearing -- see run 4) |
-| `(deny mach-priv-task-port)`, `(deny iokit-open)`, `(deny sysctl-read (sysctl-name-prefix "kern.proc"))` | macOS | 3 lines | needs the A5 row below |
+| `(deny mach-priv-task-port)`, `(deny iokit-open)` | macOS | 2 lines | SHIPPED, measured free (rows A6/A7). Neither was ever demonstrated reachable -- see addendum Part 3 |
+| ~~`(deny sysctl-read (sysctl-name-prefix "kern.proc"))`~~ | macOS | -- | DROPPED, and later measured INEFFECTIVE anyway: no name-prefix rule can match the numeric-MIB read. See addendum D3 |
+| unix-socket re-allow scoped to the sandbox's own write roots | macOS | 4 lines | SHIPPED later, measured (addendum D4 + Tier C) |
 | `--pasteboard` / `--no-pasteboard`, default off | macOS | one flag | DECIDED; prerequisite cleared by row PB |
 | `--tmpfs /run/user/<uid>` and `--tmpfs /run/dbus` | Linux | 4 argv tokens | VERIFIED (C1/C2) |
 | `--tmpfs /nix/var/nix/daemon-socket`, unconditional | Linux | 2 argv tokens | mechanical |
@@ -152,8 +154,9 @@ as the operator. It also makes the darwin half of the old Phase 3 dead code.
   unconditionally on both platforms, and `nix develop` is the OUTER layer so
   csb's own operation never needs it. If someone needs `nix build` inside a
   sandbox, that is `--no-sandbox`, or a future flag when a real user asks. The
-  `trusted-users` guard still ships, because that configuration makes
-  in-sandbox nix root-equivalent and csb cannot detect it after the fact.
+  `trusted-users` guard was ALSO dropped, as redundant once the socket is closed
+  unconditionally -- see Phase 3 for the reasoning and for what would make it a
+  prerequisite again.
 - **Linux abstract unix sockets. ACCEPTED, UNFIXABLE HERE.** Abstract sockets
   are scoped to the network namespace, not the mount namespace, so no `--tmpfs`
   can remove them and only `--unshare-net` closes them -- which contradicts the
@@ -226,11 +229,15 @@ probed and all of which are the same shape as F3.
 
 **A6 also came back clean**, which is the useful secondary result: it isolates
 `mach-priv-task-port`, `iokit-open` and `sysctl-read kern.proc` as costing
-nothing, and it is the measured fallback if A7 ever has to be reverted.
+nothing, and it is the measured fallback if A7 ever has to be reverted. Read
+"costing nothing" narrowly -- these rows measured DNS, HTTPS and `pbpaste` only,
+which is why the `ps` breakage surfaced later and only in a live sandbox.
 
-Accepted cost of A7, now real: local dev services reached over a **unix socket**
-(a postgres `.s.PGSQL.5432`, say) are unreachable in-sandbox. TCP to localhost is
-unaffected, which is the common case.
+Accepted cost of A7, now real: services reached over a **unix socket** are
+unreachable in-sandbox -- a postgres `.s.PGSQL.5432`, say. TCP to localhost is
+unaffected, which is the common case. NOTE, added later: this also covered the
+sandbox's OWN sockets, which was not intended and is now fixed for the
+sandbox-owned write roots only. See addendum D4.
 
 Unmeasured under A7: the deciding CLAUDE column and the interactive TUI. See the
 header of this file.
@@ -946,9 +953,16 @@ macOS. Emitted after `echo "(allow default)"` (bin/csb:907):
     (allow network-outbound (remote ip "*:*"))
     (allow network-outbound (literal "/private/var/run/mDNSResponder"))
     (allow network-outbound (literal "/var/run/mDNSResponder"))
+    (allow network-outbound (subpath "<each sandbox-owned write root>"))
     (deny mach-priv-task-port)
     (deny iokit-open)
-    (deny sysctl-read (sysctl-name-prefix "kern.proc"))
+
+WHAT SHIPPED, as of the addendum: exactly the above. Two later corrections are
+folded in -- the `(deny sysctl-read (sysctl-name-prefix "kern.proc"))` line this
+section originally listed is GONE (dropped as breaking `ps`, then measured
+ineffective regardless: addendum D3), and the sandbox-owned `subpath` re-allows
+were ADDED so the class deny stops cutting the sandbox's own unix sockets
+(addendum D4).
 
 The first three lines are the A1 set, VERIFIED by Phase 1b run 3: escape
 blocked, DNS and HTTPS identical to the unsandboxed host, real claude API round
@@ -956,14 +970,14 @@ trip working, interactive TUI confirmed by hand. Do NOT add
 trustd/opendirectoryd/cfprefsd/logd -- A2-A4 measured as unnecessary, and every
 added name is surface.
 
-The remaining seven lines are the class denies from "Resolution and scope",
-VERIFIED by Phase 1c run 5 (row A7). The two mDNSResponder literals are
-load-bearing, not defensive: without them DNS fails even though the mach service
-is allowed -- that is what run 4 measured. They close, in order: AF_UNIX
-brokering as a class (the nix daemon of F3, plus tmux, editor IPC sockets,
-docker, ssh-agent -- all unprobed, all surviving A1),
-debugger attach to host processes (macOS has no PID namespace), IOKit, and
-same-uid process argv/environment disclosure via `kern.procargs2`.
+The remaining lines are the class denies from "Resolution and scope", VERIFIED by
+Phase 1c run 5 (row A7). The two mDNSResponder literals are load-bearing, not
+defensive: without them DNS fails even though the mach service is allowed -- that
+is what run 4 measured. They close, in order: AF_UNIX brokering as a class (the
+nix daemon of F3, plus tmux, editor IPC sockets, docker, ssh-agent -- all
+unprobed, all surviving A1), debugger attach to host processes (macOS has no PID
+namespace), and IOKit. The `kern.procargs2` disclosure is NOT closed and cannot
+be -- see addendum D3.
 
 Known fallout to document in Phase 4, beyond the browser login flow:
 
@@ -972,7 +986,8 @@ Known fallout to document in Phase 4, beyond the browser login flow:
 - System-configured HTTP proxies / PAC are read via a mach service, so a
   corporate proxy setup breaks. `com.apple.SystemConfiguration.configd` is the
   name to add IF that is ever reported -- not preemptively.
-- Local dev services reached over a unix socket stop working; TCP is unaffected.
+- HOST services reached over a unix socket stop working; TCP is unaffected. The
+  sandbox's own in-tree sockets keep working (addendum D4).
 
 Note the keychain stays unreachable under this profile, which is consistent with
 the README's existing position that the keychain failing closed is desirable. It
@@ -1082,7 +1097,8 @@ README:
 - new subsection on process brokering and IPC: what `open` did, what is now
   denied, and explicitly that a mach-name blacklist CANNOT be proven complete.
 - new subsection on nix inside the sandbox: `_nixbld1`, outside seatbelt, the
-  `trusted-users` cliff and its hard-error guard, that in-sandbox nix is now off
+  `trusted-users` cliff (documented only -- the guard was dropped, see Phase 3),
+  that in-sandbox nix is now off
   with no flag, and the recommended host config (`sandbox = true`,
   `sandbox-fallback = false` in `/etc/nix/nix.custom.conf`).
 - tighten the passages Phase 0 corrected: the "Known gaps" list moves from
@@ -1110,7 +1126,7 @@ Tier 2 snapshots via `--dump-sandbox`. Nothing launches
   No `nix-*` cases -- the flag is cut.
 - Tier 1: `--pasteboard` / `--no-pasteboard` precedence and profile-key tests,
   mirroring the existing paranoid cases in test/precedence.bats.
-- NEW Tier 3, KEPT (decision 5, resolved yes): `test/escape.bats` plus a
+- NEW Tier 3, KEPT (decision 5, resolved yes): `test/escape/escape.bats` plus a
   `make test-escape` target. Real launches asserting the escapes are closed:
 
       csb -s -E --here -- /usr/bin/open -g -a Calculator   # must fail
@@ -1134,8 +1150,9 @@ All five open decisions were resolved on 2026-07-25. Nothing here is blocking.
   cleared by row PB of Phase 1b run 3.
 
 1. **nix default. MOOT -- the flag is cut.** In-sandbox nix is closed
-   unconditionally on both platforms by the Phase 2 socket denies. The
-   `trusted-users` hard-error guard ships regardless of mode. See Phase 3.
+   unconditionally on both platforms by the Phase 2 socket denies, which is also
+   why the `trusted-users` hard-error guard was dropped rather than shipped:
+   there is no in-sandbox client left to escalate. See Phase 3.
 2. **IPC denies always-on, no `--allow-ipc`.** Rule: expose named capabilities,
    never expose the boundary. `--no-sandbox` is the one hatch and it announces
    itself.
@@ -1212,3 +1229,379 @@ session.
   `launchctl bootout gui/1000/csb-ipc-probe2` were run; both submissions had
   already failed, and `launchctl print gui/1000/csb-ipc-probe2` confirmed no
   such service
+
+---
+
+# ADDENDUM -- closeout review (2026-07-26, from an UNSANDBOXED session)
+
+Everything above was written from inside a csb sandbox, where `sandbox-exec`
+cannot nest and the shipped artifact cannot be exercised. This addendum was
+produced from a normal terminal, so the things the plan had to leave as
+inference are now measured. Every claim below carries its command.
+
+Nothing in the code, the README or the goldens was changed while writing this.
+It was a proposal.
+
+**STATUS: the proposal in Part 4 was accepted and implemented the same day.**
+Tiers A, B and C all shipped, including the optional item 9. `make check` is
+clean, and `make test` (81) plus `make test-escape` (8, two of them new) pass on
+aarch64-darwin.
+
+**NixOS run, same day -- header item 2 is CLOSED.** `make test` passes there and
+`make test-update` produces an EMPTY diff, which is the pass criterion D2's
+marker was introduced to create: the Linux goldens are now host-independent
+rather than a hand-patched guess. F4 also executed as a test for the first time
+and passed.
+
+That run found one bug, and it is the same bug this document has now made four
+times: **the positive control asserted on `/bin/echo`, which does not exist on
+NixOS**, so the only test whose job is to prove the harness works was itself
+broken on the platform where it mattered. Fixed to `/bin/sh -c 'echo ok'`. Two
+assertions were hardened in the same pass, because `assert_failure` alone is
+satisfied by a missing binary just as well as by containment -- exactly the trap
+Phase 1's hard requirement exists to stop:
+
+- F4 now also asserts `refute_output --partial "Running as unit"`. It had been
+  invoking `/bin/true`, which is likewise absent on NixOS, so its pass was
+  unfalsifiable.
+- F3 now also asserts `refute_output --partial "Trusted:"` -- a field the daemon
+  supplies, so its absence is the round trip failing. Note `Store URL:` CANNOT
+  serve here: nix prints it from config before connecting, so it appears in the
+  blocked output too. Measured, not assumed.
+
+**A third name was then added to the mach-lookup whitelist, because the profile
+shipped with uid->name resolution broken.** Asking a plain usability question --
+can the sandbox still reach a host postgres? -- turned it up immediately:
+
+    $ csb -s -E --here -- psql -h localhost ...
+    psql: error: local user with ID 1000 does not exist
+    $ csb -s -E --here -- id -un
+    id: cannot find name for user ID 1000          # whoami prints "1000"
+
+`getpwuid` goes through a mach service, so `(deny mach-lookup)` broke it, and
+libpq treats a missing username as fatal over EVERY transport -- TCP included,
+which is why this is not a socket-policy story. Isolated by bisecting names
+against a bare `(allow default)` control: the fix is
+`com.apple.system.opendirectoryd.libinfo`. Note the trap -- Phase 1b's A2-A4 rows
+tested `com.apple.system.opendirectoryd.api`, cleared the directory services as
+"unnecessary", and were measuring a DIFFERENT service; `.api` does not fix it.
+The three probes those rows ran (curl, dscacheutil, claude) never call
+`getpwuid`. Verified the re-allow costs nothing: `open -g -a Calculator` still
+fails with "Unable to find application" and `pbpaste` still fails.
+
+That is the second whitelist name established only by someone stumbling into the
+breakage (the first was the mDNSResponder socket literal, run 4). Both are
+invisible to Tier 1/2, which validate the profile TEXT rather than what it
+permits. So Tier 3 now has a second file, `test/escape/usable.bats`: one
+assertion per re-allowed name -- uid resolves, DNS resolves, TCP+TLS to the API
+works. **Adding a name to the whitelist means adding the assertion that
+justifies it.** `escape.bats` stays what its header says it is.
+
+Answering the original question, measured against a live Homebrew postgres:
+in-sandbox `psql -h localhost` works; `psql` with no host fails, because libpq
+falls back to `/tmp/.s.PGSQL.5432` and `/tmp` is shared with the host, so it is
+denied by design. The practical trap is that the socket is libpq's DEFAULT -- a
+Rails `database.yml` with no `host:`, or `DATABASE_URL=postgres:///db`, breaks
+in-sandbox until it names a host.
+
+The interactive TUI under the shipped profile remains a manual check -- the only
+item in this plan never verified by automation.
+
+## Part 1 -- what holds up
+
+**The Tier 3 gate passes, and this was its first ever run.**
+
+    $ make test-escape
+    ok 1 escape: open(1) cannot reach LaunchServices (F1)
+    ok 2 escape: pbpaste cannot read the host clipboard (F2)
+    ok 3 escape: --pasteboard re-allows pbpaste WITHOUT reopening F1 (row PB)
+    ok 4 escape: the nix daemon socket is unreachable (F3)
+    ok 5 escape: systemd-run --user ... (F4) # skip Linux only
+    ok 6 escape: a real launch still works (positive control)
+
+**Header item 1 is CLOSED for the API path.** A real claude round trip under the
+SHIPPED profile -- not a hand-built harness row -- works:
+
+    $ ./bin/csb -E --here --seed-creds -- -p 'reply with exactly: ok'
+    ok
+
+That is the deciding column the plan could only infer from `http 404`. The
+interactive TUI remains unmeasured by automation; it is the same profile plus a
+pty, and the operator already ran a TUI under A1 by hand.
+
+**`--pasteboard` genuinely works**, which no test asserts (see D6):
+
+    $ /usr/bin/pbpaste | wc -c                                        # 18
+    $ ./bin/csb -s -E --here --pasteboard -- bash -c '/usr/bin/pbpaste | wc -c'
+    18
+
+`make check` is clean. The Linux goldens are internally consistent with the
+bwrap argv order the code emits (the three IPC tmpfs pairs land after
+`--die-with-parent` and before `--tmpfs $real_home`), so the hand-patch was done
+correctly as far as ordering goes -- it still needs `make test-update` on NixOS
+for the existence question, which is header item 2 and D2 below.
+
+## Part 2 -- defects
+
+### D1. The darwin snapshot goldens are wrong: `make test` fails 9/9 snapshots
+
+    $ nix develop --command bats test/          # from a normal terminal
+    not ok 46..54   (every snapshot test)
+    +(allow file-write* (subpath "/private/tmp"))
+
+ROOT CAUSE, measured: the goldens were regenerated from INSIDE a csb sandbox,
+where the confstr lookup behind `getconf` is denied and libc falls back to
+`$TMPDIR`:
+
+    $ csb -s -E --here -- bash -c 'getconf DARWIN_USER_TEMP_DIR'
+    /tmp/nix-shell.SinoZu                     # dirname(realpath) = /private/tmp
+    $ getconf DARWIN_USER_TEMP_DIR            # host, and inside plain nix develop
+    /var/folders/9y/5_l9m.../T/
+
+`normalize_sandbox` derives its `<VARTMP>` placeholder the same way
+`build_write_roots` does, so inside a sandbox that placeholder silently stood for
+`/private/tmp` -- which absorbed the real `/private/tmp` write root and made it
+look like the `/var/folders` one. Confirmation from both directions:
+
+    $ csb -s -E --here -- bash -c 'bats test/snapshots.bats'   # all 10 ok
+    $ nix develop --command bats test/snapshots.bats           # 9 of 10 fail
+
+The CODE is fine. `build_write_roots`' `case` guard rejects the non-`/var/folders`
+parent and warns instead of write-allowing it, so nothing over-broad was ever
+emitted -- the guard did exactly its job. But the comment at bin/csb:810-812
+("Derived via getconf, NEVER from $TMPDIR") states the wrong reason: `getconf`
+itself falls back to `$TMPDIR`. The guard, not the choice of `getconf`, is what
+holds.
+
+Fix: `make test-update` from a normal terminal (it adds one write line to all
+nine, plus the matching `file-read*` line in the four paranoid goldens), and add
+a guard so this cannot recur -- `CSB_SANDBOX=true` is exported at bin/csb:1951,
+so the Tier 2 helper can refuse to compare or refresh when it is set. Snapshot
+goldens are a host-fingerprint artifact; they must be generated from one known
+context and that context is "a normal terminal".
+
+### D2. CI will go red on the next push to GitHub, on both runners
+
+`github/main` is still at 445ba42, so this has not run yet.
+
+- macos-latest: D1's missing line.
+- ubuntu-latest: the Linux goldens hardcode all three `--tmpfs` paths, but
+  bin/csb emits each only `[[ -d "$p" ]]`. On a GH runner `/run/user/<uid>` is
+  usually absent (no login session) and `/nix/var/nix/daemon-socket` exists only
+  after the installer step. A conditional argv cannot have an unconditional
+  golden -- structurally the same defect as D1, and it will also bite any
+  contributor whose Linux box differs from the NixOS one.
+
+Fix, in the test tier rather than the code (the conditional emission is correct
+behaviour -- bwrap cannot mkdir a mountpoint under the ro root): collapse the
+IPC tmpfs block to a single stable marker in `normalize_sandbox`, and assert the
+real thing separately -- "for each of the three broker paths that exists on this
+host, a `--tmpfs` is emitted". That is host-independent and keeps the review
+value the goldens exist for.
+
+### D3. The kern.procargs2 gap is NOT closeable by seatbelt. The trail is dead.
+
+The README and this plan both leave the door open: "a narrower `kern.procargs`
+prefix would likely do better and has not been measured." It is now measured,
+with a compiled probe reading the numeric MIB directly and a canary process
+holding `CSB_SECRET_CANARY=hunter2`:
+
+    int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };  sysctl(mib, 3, ...)
+
+    profile                                                    result
+    host, unsandboxed (control)                                7324 bytes, LEAKED
+    (allow default) alone                                      7324 bytes, LEAKED
+    the shipped IPC rules                                      7324 bytes, LEAKED
+    + (deny sysctl-read (sysctl-name-prefix "kern.procargs"))  7324 bytes, LEAKED
+    + (deny sysctl-read (sysctl-name-prefix "kern.proc"))      7324 bytes, LEAKED
+    + (deny sysctl-read)            <- blanket                 7332 bytes, LEAKED
+    + (deny sysctl*)                <- blanket                 7332 bytes, LEAKED
+
+Not even a blanket deny stops it, because `sysctl-name-prefix` matches the STRING
+name and `KERN_PROCARGS2` is reached by numeric MIB, which has no name to match.
+Meanwhile the blanket denies do break real tools:
+
+    ncpu=sysctl: sysctl fmt -1 1024 1: Operation not permitted
+    uname=uname: sysctl: Operation not p...
+
+So the line that was dropped never would have worked, and the narrower
+replacement it suggested does not work either. Two corrections follow:
+
+1. This gap belongs in the same category as Linux abstract sockets -- **open,
+   UNFIXABLE with this mechanism** -- not "open, accepted because denying it
+   broke `ps`". The README currently invites a reader to spend an afternoon on a
+   rule that cannot work.
+2. The recorded cost is also not reproducible. `/bin/ps` is setuid root, and
+   seatbelt refuses to exec a setuid binary under ANY profile -- including a bare
+   `(allow default)`:
+
+       $ sandbox-exec -f <(printf '(version 1)\n(allow default)\n') \
+           /bin/bash -c 'ps aux | wc -l'
+       1                                  # /bin/ps: Operation not permitted
+       $ csb -s -E --here -- /bin/ps aux
+       /bin/ps: Operation not permitted
+
+   `ps` does not work inside csb today, with or without the sysctl deny. The
+   `ps aux` transcript in "Live in-sandbox verification" cannot have come from
+   inside the sandbox. That is the plan's own positive-control rule catching the
+   plan -- and it is the third time in this investigation a symptom was
+   attributed to the wrong cause.
+
+### D4. In-sandbox unix sockets are cut too, and the docs imply otherwise
+
+The README says "local dev services reached over a **unix socket** stop working",
+which reads as host services. Two processes inside the SAME sandbox also cannot
+talk over one, with a positive control:
+
+    $ csb -s -E --here --no-sandbox -- <nc -lU + nc -U probe>   received=[hello]
+    $ csb -s -E --here            -- <same probe>               client-rc=1
+
+That breaks a Rails worktree's `tmp/sockets/puma.sock`, `spring`, `pg_ctl -k
+$PWD/tmp`, an in-tree `ssh -S` ControlPath, and any test suite that boots a
+service on a socket in the repo. It is the largest unadvertised cost of the
+`network-outbound` class deny.
+
+A scoped re-allow fixes it, measured (note the realpath form is the one that
+matches, which is why the mDNSResponder pair needs both spellings):
+
+    (allow network-outbound (subpath "<realpath'd write root>"))   -> works
+
+But it must NOT be applied to the shared write roots. Measured: with
+`/private/tmp` re-allowed, a HOST-side socket in that tree is reachable again
+(`rc=0`), which is F3's shape returning. So the defensible form is repo-scoped
+only -- worktree, git common dir, namespace/ephemeral HOME -- and explicitly not
+`/private/tmp`, `/private/var/folders` or `/dev`. Those trees are created and
+owned by the sandbox, so a socket in them is one the sandbox itself made.
+
+### D5. This file contradicts itself in six places
+
+- line 134: the three class denies are still marked "needs the A5 row below";
+  they were measured (A6/A7) and one of them was dropped.
+- lines 150-156: "The `trusted-users` guard still ships" -- Phase 3 (line 1060)
+  and the ships-table (line 138) both say DROPPED.
+- line 228: A6 "isolates ... `sysctl-read kern.proc` as costing nothing" --
+  contradicted 30 lines later, and A6 only measured DNS/HTTPS/pbpaste.
+- lines 940-951: the Phase 2 profile block still lists the dropped sysctl line
+  and calls the remainder "seven lines"; six shipped.
+- line 1085: Phase 4 tells the README to document "the `trusted-users` cliff and
+  its hard-error guard" -- a guard that does not exist.
+- line 1113 and bin/csb:990: `test/escape.bats`; the file is
+  `test/escape/escape.bats`.
+
+Also the header says IMPLEMENTED (2026-07-25) while the live verification and
+the commit are 2026-07-26.
+
+### D6. The PB regression guard only asserts half of what it was specified to
+
+Phase 5 called for two assertions: `--pasteboard` restores `pbpaste`, AND it does
+not reopen F1. `test/escape/escape.bats:49` implements only the second -- it runs
+`open -g -a Calculator` with the flag and asserts failure. So the flag can rot
+to a no-op silently. Part 1 shows the positive half passes today, so the
+assertion is free to add.
+
+### D7. Two doc overclaims
+
+- bin/csb:51-55 (help): "host IPC does NOT [stay reachable] (mach/XPC on macOS,
+  the session bus on Linux, unix sockets on both)". On Linux only three paths are
+  removed; unix sockets are emphatically NOT closed as a class there. The README
+  is honest about this; the help text is not.
+- README Known-gaps table lists `task_for_pid` as an escape "**closed**". It was
+  never demonstrated reachable -- see Part 3.
+
+### D8. README duplication and a dangling colon
+
+Lines 766-767 and 782-783 say the same thing about Linux having no socket filter.
+Worse, the paragraph at 782-785 ends "...which is not implemented and not
+promised:" and the colon runs straight into the `### Hardening for untrusted
+instructions` heading. Somewhere a list was lost in editing.
+
+## Part 3 -- implemented but of no measured value
+
+- **`(deny mach-priv-task-port)` and `(deny iokit-open)`.** Zero cost, zero
+  demonstrated vector. `task_for_pid` against another process already requires
+  root or a debugger entitlement on modern macOS, so this line is belt-and-braces
+  over an OS restriction rather than a fix for anything probed. KEEP both -- they
+  are free and they are what makes "these classes are deny-by-default" a true
+  statement -- but stop describing task_for_pid as a closed escape (D7).
+- **`test/manual/ipc-probe-darwin.sh`.** Its question -- is a mach-name blacklist
+  viable -- is settled, measured dead, and transcribed. It has no remaining use
+  beyond being the reproduction. Keep it or delete it; the whitelist harness
+  supersedes it. This is the only artifact in the change I would call dead weight.
+- **`test/snapshots/linux/pasteboard`.** Byte-identical to `linux/baseline`. That
+  identity IS the assertion (the flag is a documented no-op on Linux). Keep.
+- The dropped `sysctl` line and the dropped `trusted-users` guard were both
+  correctly dropped. Only their stale references remain (D5).
+
+An unasked-for dividend worth recording: `(deny network-outbound)` +
+`(allow network-outbound (remote ip "*:*"))` now ships, so docs/TODO.md's
+localhost-only egress mode is a one-token change to that allow line
+(`"localhost:*"`) rather than new machinery. Not a task -- a door that opened.
+
+## Part 4 -- proposal
+
+Same rule the plan set for itself: ship it if it is one line or one flag AND
+measured. Everything below is measured.
+
+**Tier A -- required, the tree is not green without it.**
+
+1. `make test-update` from a normal terminal; commit the nine darwin goldens.
+2. Guard Tier 2 against `CSB_SANDBOX` (bin/csb:1951) so a golden can never again
+   be generated or validated from inside a sandbox. ~2 lines in
+   `test/helpers.bash`.
+3. Make the Linux IPC tmpfs block host-independent (D2): marker in the
+   normalizer, plus one existence-driven assertion. Then `make test-update` on
+   NixOS closes header item 2.
+4. Fix D8 (the duplicate paragraph and the dangling colon).
+
+**Tier B -- docs coherence, no code.**
+
+5. Rewrite the `kern.procargs2` paragraph and table row per D3: **open,
+   unfixable with seatbelt**, with the four-variant measurement as the reason,
+   and delete the "a narrower prefix would likely do better" invitation.
+6. Correct the six internal contradictions in this file (D5) and the two
+   overclaims (D7). Fix bin/csb:990's stale test path and the comment at
+   bin/csb:810-812.
+7. Document D4's real scope: unix sockets are cut for the sandbox's own processes
+   too, not only host services -- with the Rails `tmp/sockets` case named,
+   because that is how it will actually be met.
+
+**Tier C -- optional, recommended, measured.**
+
+8. Add the missing PB positive assertion (D6). One line.
+9. Re-allow `network-outbound` on the REPO-SCOPED write roots only (D4). Three
+   lines inside the existing write-roots loop, gated to exclude the shared roots.
+   It restores in-tree unix sockets with no new host exposure, and the `nc`
+   probe from D4 belongs in `escape.bats` as its guard. Do this only if an
+   in-tree socket is something you actually want back; the honest alternative is
+   Tier B item 7 alone.
+
+**Explicitly closed, do not reopen.**
+
+- the `kern.procargs`/`kern.proc` sysctl rule, in every form (D3)
+- identifying what `open` really talks to -- already out of scope, and now moot
+  twice over
+- a per-path Linux socket list beyond the three that ship
+
+**Left open, honestly.** The interactive TUI under the shipped profile is still
+hand-verified only. The residual the plan names -- this is not a boundary against
+a hostile agent -- is unchanged, and D3 makes it slightly larger than the README
+currently admits: any process's environment is readable from inside the sandbox
+and there is no seatbelt rule that changes that.
+
+## Probe artifacts created and removed (this session)
+
+- 14 ephemeral `$TMPDIR/csb-home.*` dirs from the real launches above, REMOVED.
+  One of them held a live `.claude/.credentials.json` copied in by the
+  `--seed-creds` round trip; verified zero remaining. The 26 older ones are
+  pre-existing and were not touched -- `-E` homes are not reaped on exit, which
+  is worth its own look someday.
+- `/tmp/csbuds/` and `/tmp/csb-uds-*` unix-socket probes, REMOVED. AF_UNIX paths
+  are capped at 104 bytes, which invalidated the first run of that probe until
+  the socket was moved out of the scratch dir -- another false negative caught
+  only by its control.
+- one `env CSB_SECRET_CANARY=hunter2 sleep 300` canary and two `nc -lU`
+  listeners, killed; verified none remaining.
+- `.sb` profiles, the `procargs2` C probe and its binary, and a scratch clone of
+  the repo used for the golden regen: all under this session's scratchpad, none
+  in the repo, none in `/tmp`.
+- one nested `claude -p` API round trip (Part 1) -- it answered `ok` and exited.

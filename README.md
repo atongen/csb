@@ -746,8 +746,8 @@ normal mode. Full detail, evidence and reproductions in
 | session dbus -> `systemd-run --user` spawns a unit outside the namespace | Linux | full escape to your uid | **closed** |
 | nix daemon socket -> builds run outside the sandbox as `_nixbld1` | both | code exec outside the profile; reads anything other-readable | **closed** (in-sandbox `nix` no longer reaches the daemon at all) |
 | host unix sockets generally (tmux, editor IPC, docker, ssh-agent) | both | not exhaustively probed, but the same shape as the nix daemon | macOS: **closed as a class**. Linux: **open, accepted** |
-| `task_for_pid` / debugger attach to host processes | macOS | code injection into a process outside the sandbox | **closed** |
-| `sysctl kern.procargs2` reads other processes' argv + environment | macOS | discloses secrets from your other shells and dev servers -- disclosure, not execution | **open, accepted**: denying it broke `ps` |
+| `task_for_pid` / debugger attach to host processes | macOS | would be code injection into a process outside the sandbox | **denied as a class** -- never demonstrated reachable (the OS already gates it), so this is belt-and-braces, not a closed hole |
+| `sysctl kern.procargs2` reads other processes' argv + environment | macOS | discloses secrets from your other shells and dev servers -- disclosure, not execution | **open, unfixable** with seatbelt |
 | Linux abstract unix sockets (e.g. X11) | Linux | keystroke injection into your session | **open, unfixable** without closing network egress |
 
 The macOS fixes work by flipping whole seatbelt filter *classes* to
@@ -757,21 +757,31 @@ named services) and `network-outbound` with IP egress re-allowed (which is how
 unix sockets are governed, so it cuts every host socket at once, the nix daemon
 included).
 
-Consequences worth knowing before you upgrade: the macOS keychain, the browser
-login flow, `git`'s `osxkeychain` credential helper, system-configured HTTP
-proxies, and local dev services reached over a **unix socket** all become
-unreachable in-sandbox. TCP to localhost is unaffected, which covers most local
-services. Authenticate with `--seed-creds` or `CLAUDE_CODE_OAUTH_TOKEN`.
+Consequences worth knowing before you upgrade, on macOS: the keychain, the
+browser login flow, `git`'s `osxkeychain` credential helper, and
+system-configured HTTP proxies all become unreachable in-sandbox. Authenticate
+with `--seed-creds` or `CLAUDE_CODE_OAUTH_TOKEN`.
 
-On Linux there is no socket filter -- the only lever is removing sockets from
-the mount namespace, which is per-path and cannot be made complete.
+Unix sockets need stating precisely, because the class deny is blunt: a socket
+anywhere **outside** the sandbox's own trees is unreachable, whether or not the
+thing listening is yours. A postgres or redis on a socket in `/tmp`, a tmux
+server, `ssh-agent`, `docker.sock` -- all unreachable. TCP to localhost is
+unaffected, which covers most local services. Sockets **inside** the sandbox's
+own trees (the worktree, the git dir, the launch HOME) do work, so a Rails
+`tmp/sockets/puma.sock`, `spring`, or an in-tree `pg_ctl -k` behaves normally:
+those trees are created and owned by the sandbox, so a socket there is one the
+sandbox itself made. `/tmp` and the per-user temp dir are writable but *shared
+with the host*, so they stay denied -- re-allowing them was measured to make a
+host-side socket reachable again, which is the nix-daemon hole reopening under a
+different name.
 
-One gap is left open on purpose. macOS exposes every same-uid process's argv
-*and environment* via `sysctl kern.procargs2`, so a sandboxed agent can read
-secrets out of your other shells and dev servers. Denying the `kern.proc`
-sysctl prefix closes it and breaks `ps` outright, which is too high a price for
-a disclosure fix; a narrower `kern.procargs` prefix would likely do better and
-has not been measured. Until it is, treat anything in another process's
+One gap is open and cannot be closed here. macOS exposes every same-uid
+process's argv *and environment* via `sysctl kern.procargs2`, so a sandboxed
+agent can read secrets out of your other shells and dev servers. No seatbelt
+rule stops it: the read goes through a numeric MIB with no string name, so
+`sysctl-name-prefix` has nothing to match -- `kern.procargs`, `kern.proc`, and
+even a blanket `(deny sysctl-read)` were all measured still leaking, while the
+blanket forms break `sysctl` and `uname`. Treat anything in another process's
 environment as visible to the sandbox.
 
 "Closed" means that specific route is closed and has a test
@@ -779,10 +789,10 @@ environment as visible to the sandbox.
 exhausted: two independent escapes were found in a single afternoon by someone
 not looking hard, and only two of seatbelt's filter classes are deny-by-default.
 
-On Linux the only lever is the mount namespace, so the fix is per-path and
-cannot be made complete. Both platforms therefore keep a residual. Closing it
-would take a second boundary rather than more profile work -- which is not
-implemented and not promised:
+On Linux there is no socket filter at all -- the only lever is removing sockets
+from the mount namespace, which is per-path and cannot be made complete. Both
+platforms therefore keep a residual, and closing it would take a second boundary
+rather than more profile work.
 
 ### Hardening for untrusted instructions
 
