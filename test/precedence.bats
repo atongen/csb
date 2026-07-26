@@ -26,6 +26,94 @@ load helpers
   assert_line "paranoid=true"
 }
 
+# --- pasteboard (macOS pbcopy/pbpaste; PLAN-007 F2) --------------------------
+
+@test "pasteboard defaults off" {
+  dump_config
+  assert_success
+  assert_line "pasteboard=false"
+}
+
+@test "CLI --pasteboard beats profile pasteboard=false" {
+  write_profile p "pasteboard=false"
+  dump_config -p p --pasteboard
+  assert_success
+  assert_line "pasteboard=true"
+}
+
+@test "CLI --no-pasteboard beats profile pasteboard=true" {
+  write_profile p "pasteboard=true"
+  dump_config -p p --no-pasteboard
+  assert_success
+  assert_line "pasteboard=false"
+}
+
+@test "profile pasteboard=true applies with no CLI override" {
+  write_profile p "pasteboard=true"
+  dump_config -p p
+  assert_line "pasteboard=true"
+}
+
+# --- nix_target (which devShells.<system>.NAME to run under) -----------------
+
+@test "nix_target defaults empty, resolving to the flake's default" {
+  dump_config
+  assert_success
+  assert_line "nix_target="
+  assert_line "nix_target_effective=default"
+}
+
+@test "CLI --nix-target beats a profile nix_target=" {
+  write_profile p "nix_target=release"
+  dump_config -p p --nix-target ci
+  assert_success
+  assert_line "nix_target=ci"
+  assert_line "nix_target_effective=ci"
+}
+
+@test "CLI --no-nix-target clears every profile nix_target key" {
+  write_profile p "nix_target=ci" "nix_target_shell=dev" "nix_target_claude=rel"
+  dump_config -p p --no-nix-target
+  assert_success
+  assert_line "nix_target="
+  assert_line "nix_target_shell="
+  assert_line "nix_target_claude="
+  assert_line "nix_target_effective=default"
+}
+
+@test "profile nix_target= applies with no CLI override" {
+  write_profile p "nix_target=ci"
+  dump_config -p p
+  assert_line "nix_target_effective=ci"
+}
+
+@test "nix_target_claude beats nix_target in claude mode" {
+  write_profile p "nix_target=ci" "nix_target_claude=rel"
+  dump_config -p p
+  assert_line "nix_target_effective=rel"
+}
+
+@test "nix_target_shell beats nix_target in shell mode" {
+  write_profile p "nix_target=ci" "nix_target_shell=dev"
+  dump_config -p p -s
+  assert_line "nix_target_effective=dev"
+}
+
+@test "a mode-specific nix target does not leak into the other mode" {
+  write_profile p "nix_target_shell=dev"
+  dump_config -p p
+  assert_line "nix_target_effective=default"
+  dump_config -p p -s
+  assert_line "nix_target_effective=dev"
+}
+
+@test "--nix-target-shell only takes effect under -s" {
+  dump_config --nix-target-shell dev
+  assert_line "nix_target_effective=default"
+  dump_config --nix-target-shell dev -s
+  assert_line "nix_target_effective=dev"
+}
+
 # --- sandbox (--no-sandbox / profile sandbox=) -------------------------------
 
 @test "CLI --sandbox beats profile sandbox=false" {

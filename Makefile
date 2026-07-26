@@ -6,6 +6,8 @@
 #   make install                      # copy bin/csb into ~/bin
 #   make install BIN_DIR=~/.local/bin # ...or elsewhere
 #   make check                        # shellcheck the shell scripts
+#   make test                         # bats suite (dump-only, fast)
+#   make test-escape                  # Tier 3: real launches, run OUTSIDE csb
 #
 # `check`/`build` prefer a tool already on PATH and fall back to csb's own
 # devShell (nix develop), so they work with only Nix installed.
@@ -18,7 +20,7 @@ DEST    := $(BIN_DIR)/csb
 CSB_SELF ?= github:atongen/csb
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check test test-update build update refresh
+.PHONY: help install uninstall check test test-escape test-update build update refresh
 
 help: ## Show this help
 	@echo "csb — targets (override BIN_DIR to change the install location):"
@@ -55,6 +57,14 @@ test: ## Run the bats test suite (test/)
 		bats test/; \
 	else \
 		nix develop --command bats test/; \
+	fi
+
+test-escape: ## Tier 3: real launches asserting the PLAN-007 escapes stay closed
+	@echo "test-escape: real launches (needs nix + network); run OUTSIDE csb"
+	@if command -v bats >/dev/null 2>&1; then \
+		bats test/escape/; \
+	else \
+		nix develop --command bats test/escape/; \
 	fi
 
 test-update: ## Regenerate the Tier 2 snapshot goldens for THIS platform

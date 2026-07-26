@@ -7,3 +7,7 @@
 !/templates/home/.claude/
 # nix build output
 result
+# captured output of the manual probe harnesses: host-specific, and the results
+# that matter are transcribed into docs/PLAN-007-escape.md. The .sh harnesses
+# themselves ARE tracked -- they are the reproduction.
+/test/manual/*.out

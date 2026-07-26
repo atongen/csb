@@ -1,7 +1,31 @@
 # TODO
 
+- [X] customize devshell argument based on either shell mode or claude mode via config.
+      DONE (2026-07-25): `--nix-target NAME` (profile `nix_target=`) selects
+      `devShells.<system>.NAME`; `--nix-target-shell` / `--nix-target-claude`
+      (`nix_target_shell=` / `nix_target_claude=`) override it for one mode and
+      win when that mode runs; `--no-nix-target` clears all three. The winning
+      target also applies to `.worktreesetup.sh`. A NAMED target never falls
+      back to csb's generic devShell (which only provides `default`) -- a
+      missing one is a hard error. See README "Choosing the nix target".
+    * naming: `nix-target` is not nix's own vocabulary (nix says "installable"
+      or "flake output attribute"), but it is the right call here precisely
+      because it is looser than "devshell" -- `nix develop` resolves the name
+      as `devShells.<system>.NAME` first and falls through to a package attr,
+      so the flag is not strictly limited to devShells.
 - [X] claude statusline script should include token use count
 - [X] allow copy&paste from within a sandbox
+    * REVISED (2026-07-25): the pasteboard is a mach service, so the IPC denies
+      that close the LaunchServices escape remove it too. It is now the opt-in
+      `--pasteboard` / `pasteboard=`, default OFF -- it is a read channel around
+      the whole file deny-list. See docs/PLAN-007-escape.md phase 3b.
+- [X] close the IPC sandbox escapes (docs/PLAN-007-escape.md). DONE (2026-07-25).
+      F1/F2/F3/F4 closed. macOS denies two whole seatbelt filter classes
+      (mach-lookup, network-outbound-minus-IP), which closes AF_UNIX brokering
+      as a class; Linux is per-path tmpfs and cannot be complete. Two follow-ups
+      in that plan's header: confirm the claude API column + interactive TUI
+      under the final profile, and regenerate the Linux snapshot goldens on
+      NixOS.
 
 - [X] State as of the last session
     - csb's own `flake.nix` now exposes `devShells.default` (git + shellcheck), so

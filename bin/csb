@@ -48,8 +48,11 @@ Claude (or the -s shell) runs inside the repo's devShell with a scrubbed
 environment, a private HOME (per-repo by default), a read deny-list (~/.ssh,
 ~/.aws, the real ~/.claude, etc. — extend with --deny-read / a profile's
 deny_read=), and a write allow-list (worktree, git dir, the launch HOME, tmp —
-extend with --allow-write / a profile's allow_write=). Network and local
-services stay reachable.
+extend with --allow-write / a profile's allow_write=). Network egress stays
+open, so local services over TCP stay reachable; host IPC does NOT (mach/XPC on
+macOS, the session bus on Linux, unix sockets on both) — that is what keeps a
+host service from acting outside the sandbox on the sandbox's behalf. See the
+README's threat model, and 'Known gaps' for what is still open.
 
 OPTIONS:
   -y, --yolo         pass --dangerously-skip-permissions to claude (allow-all)
@@ -59,6 +62,11 @@ OPTIONS:
                      tool caches working; re-expose read-only paths with
                      --paranoid-allow-read, deny extra trees with
                      --paranoid-deny-read. Also via a profile's paranoid=true.
+      --pasteboard   macOS: re-allow pbcopy/pbpaste inside the sandbox. OFF by
+                     default -- the pasteboard is a read channel around the whole
+                     file deny-list (a secret copied from a password manager
+                     while an agent runs is readable by it). No-op on Linux and
+                     under --no-sandbox. Also via a profile's pasteboard=true.
       --here         no worktree: run in the current directory (quick ops).
                      Mutually exclusive with BRANCH.
 
@@ -91,6 +99,18 @@ OPTIONS:
                      --no-sandbox for a shell whose ~/.ssh, ~/.kube, ~/.aws etc.
                      resolve (e.g. a deployment). Also via a profile's
                      real_home=true.
+      --nix-target NAME  which nix target to run under: 'devShells.<system>.NAME'
+                     from the repo's own flake, instead of the 'default' one
+                     (e.g. a leaner 'ci' or 'release' closure). If the repo's
+                     flake has no such target the launch FAILS rather than
+                     silently falling back -- the generic fallback devShell only
+                     ever provides 'default'. Profile nix_target=.
+      --nix-target-shell NAME / --nix-target-claude NAME
+                     same, but for ONE launch mode only; each beats --nix-target
+                     when that mode is the one running. Profile
+                     nix_target_shell= / nix_target_claude=. Whichever target
+                     wins also applies to .worktreesetup.sh, which runs in the
+                     same devShell. --no-nix-target clears all three.
   -s, --shell        drop into an interactive bash — or run ARGS after -- as a
                      command — instead of claude, in the exact environment
                      claude would get: same worktree, devShell, env scrub,
@@ -134,7 +154,9 @@ OPTIONS:
                      Also via a profile's accent=; --no-accent untints.
   -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
                      (ns=, token_cmd=, latest=, verbose=, yolo=,
-                     paranoid=, sandbox=, real_home=, here=, ephemeral=, shell=,
+                     paranoid=, pasteboard=, sandbox=, real_home=, here=,
+                     ephemeral=, shell=, nix_target=, nix_target_shell=,
+                     nix_target_claude=,
                      seed_creds=, seed_home=, accent=, args=, keep=, setenv=,
                      deny_read=, allow_write=, paranoid_deny_read=,
                      paranoid_allow_read=).
@@ -142,9 +164,10 @@ OPTIONS:
                      values (its values win). Explicit CLI flags beat both.
                      Bare '$PROG -p NAME' (no BRANCH) launches --here; plain
                      '$PROG' still lists worktrees.
-      --no-yolo (--yodo), --no-paranoid, --sandbox, --no-real-home,
-      --no-here, --no-shell, --no-ephemeral, --no-latest, --no-verbose,
-      --no-seed-creds, --no-ns, --no-seed-home, --no-accent
+      --no-yolo (--yodo), --no-paranoid, --no-pasteboard, --sandbox,
+      --no-real-home, --no-here, --no-shell, --no-ephemeral, --no-latest,
+      --no-verbose, --no-seed-creds, --no-ns, --no-seed-home, --no-accent,
+      --no-nix-target
                      negate the corresponding option, overriding a profile
                      (or, for latest/verbose, the CSB_LATEST/CSB_VERBOSE env)
                      default for one run
@@ -334,10 +357,16 @@ process_worktreeinclude() {
 }
 
 # Resolve the devShell flake ref for DIR: the repo's own devShells.<system>.
-# default if present, else csb's generic fallback (with a warning to stderr).
+# <target> if present, else csb's generic fallback (with a warning to stderr).
 # Shared by the main launch and by run_worktreesetup's sandboxing below.
+#
+# The target is `default` unless --nix-target (or its per-mode variants, or the
+# matching profile keys) names another -- e.g. a leaner `ci` closure. A NAMED
+# target never falls back: csb's generic fallback only ever provides `default`,
+# so silently substituting it would run the wrong closure. Missing -> die.
 resolve_devshell_ref() {
-  local dir="$1" system
+  local dir="$1" system target
+  target=$(effective_nix_target)
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)              system="aarch64-darwin" ;;
     Darwin-x86_64)             system="x86_64-darwin" ;;
@@ -349,13 +378,17 @@ resolve_devshell_ref() {
   # been `git add`ed is invisible to nix develop -- the eval below treats that
   # as "no devShell" and falls back too.
   if [[ ! -f "$dir/flake.nix" ]] || \
-     { [[ -n "$system" ]] && ! nix eval "$dir#devShells.$system.default.name" >/dev/null 2>&1; }; then
+     { [[ -n "$system" ]] && ! nix eval "$dir#devShells.$system.$target.name" >/dev/null 2>&1; }; then
+    if [[ "$target" != "default" ]]; then
+      die "no devShells.$system.$target in the flake at $dir (nix target '$target')"
+    fi
     echo "$PROG: no repo devShell at $dir -- using csb's generic fallback devShell" >&2
     echo "$PROG: add devShells.default for a project toolchain (nix flake init -t $CSB_SELF; git add flake.nix)" >&2
     echo "$CSB_SELF#fallback"
     return
   fi
-  echo "$dir"
+  [[ "$target" == "default" ]] && { echo "$dir"; return; }
+  echo "$dir#$target"
 }
 
 # Source <worktree>/.worktreesetup.sh (present + executable) and dispatch to its
@@ -601,6 +634,26 @@ normalize_list_path() {
     /*)    printf '%s\n' "$val" ;;
     *)     die "$where: not an absolute or ~/ path: '$val'" ;;
   esac
+}
+
+# Echo a validated nix target (--nix-target* / profile nix_target*=), dying with
+# $2 as the source label. It is interpolated into a flake ref, so the charset is
+# restricted to what a nix attribute name needs -- no '#', quotes, or whitespace
+# can reach the nix command line.
+validate_nix_target() {
+  local val="$1" where="$2"
+  [[ "$val" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    || die "$where: invalid nix target '$val' (use letters, digits, . _ -)"
+  printf '%s\n' "$val"
+}
+
+# The nix target in effect for THIS launch: the mode-specific value if set
+# (shell vs claude), else the shared one, else the flake's `default`.
+effective_nix_target() {
+  local mode_specific
+  if [[ "$shell" == "true" ]]; then mode_specific="$nix_target_shell"
+  else                              mode_specific="$nix_target_claude"; fi
+  printf '%s\n' "${mode_specific:-${nix_target:-default}}"
 }
 
 # True when realpath'd absolute paths $1 and $2 are equal or one contains the
@@ -905,6 +958,50 @@ build_deny_wrapper() {
       {
         echo "(version 1)"
         echo "(allow default)"
+        # IPC policy (docs/PLAN-007-escape.md). The file rules below constrain
+        # syscalls; these constrain BROKERS -- a host service asked to act on the
+        # sandboxed process's behalf does its work outside the profile, as the
+        # operator. Deny by CLASS, not by service name: five guessed mach names
+        # failed to block `open` before the blanket deny worked.
+        #   mach-lookup      -- mach + XPC named services (LaunchServices/`open`,
+        #                       the pasteboard, AppleEvents, the window server).
+        #                       The two DNS names are the whole whitelist: with
+        #                       them, DNS/HTTPS/claude match the unsandboxed host.
+        #   network-outbound -- AF_UNIX connect() is this class, so denying the
+        #                       class and re-allowing IP keeps egress while
+        #                       cutting every host socket (nix daemon, tmux,
+        #                       editor IPC, docker, ssh-agent). The two
+        #                       mDNSResponder literals are load-bearing: without
+        #                       them DNS fails even though its mach service is
+        #                       allowed (measured, probe rows A5 vs A7).
+        #   mach-priv-task-port -- task_for_pid: macOS has no PID namespace, so
+        #                       every host process is otherwise addressable.
+        # NOT denied: sysctl kern.proc*. It would close the kern.procargs2
+        # disclosure (other processes' argv AND environment, i.e. their
+        # secrets), but a `kern.proc` prefix deny also breaks `ps` outright --
+        # measured in-sandbox. A narrower `kern.procargs` prefix should close
+        # the leak while leaving `ps`'s process list alone; unmeasured, so it
+        # is a documented open gap rather than a shipped guess.
+        echo "(deny mach-lookup)"
+        echo '(allow mach-lookup (global-name "com.apple.dnssd.service"))'
+        echo '(allow mach-lookup (global-name "com.apple.mDNSResponder"))'
+        # --pasteboard: pbcopy/pbpaste, off by default. Re-allowing these was
+        # measured NOT to hand LaunchServices a route back (PLAN-007 row PB);
+        # test/escape.bats keeps that a regression guard.
+        if [[ "$pasteboard" == "true" ]]; then
+          echo '(allow mach-lookup (global-name "com.apple.pasteboard.1"))'
+          echo '(allow mach-lookup (global-name "com.apple.lsd.mapdb"))'
+          echo '(allow mach-lookup (global-name "com.apple.lsd.modifydb"))'
+        fi
+        # This also closes the nix daemon socket (PLAN-007 F3) with no
+        # nix-specific rule: denying the `nix` BINARY would be worthless anyway,
+        # since /tmp is a write root and exec is unrestricted.
+        echo "(deny network-outbound)"
+        echo '(allow network-outbound (remote ip "*:*"))'
+        echo '(allow network-outbound (literal "/private/var/run/mDNSResponder"))'
+        echo '(allow network-outbound (literal "/var/run/mDNSResponder"))'
+        echo "(deny mach-priv-task-port)"
+        echo "(deny iokit-open)"
         # READ policy: deny-list (later rules win; the active namespace is
         # re-allowed under the denied ~/.csb/claudes parent).
         for p in "${deny_dirs[@]+"${deny_dirs[@]}"}"; do
@@ -978,6 +1075,17 @@ build_deny_wrapper() {
       fi
       deny_wrapper=("$bwrap_bin" --ro-bind / / --dev-bind /dev /dev --proc /proc
                     --unshare-pid --die-with-parent)
+      # IPC policy (docs/PLAN-007-escape.md). `--ro-bind / /` carries every host
+      # socket into the namespace and a read-only bind does NOT block connect(),
+      # so a broker outside the namespace will act for the sandbox as the
+      # operator: `systemd-run --user` over the session bus was a full escape.
+      # bwrap has no socket filter, so the only lever is removing the socket --
+      # per-path, and therefore NOT complete (see the README's Known gaps:
+      # abstract sockets are network-namespace scoped and unreachable this way).
+      # Skipped when absent: bwrap cannot mkdir a mountpoint under the ro root.
+      for p in "/run/user/$(id -u)" /run/dbus /nix/var/nix/daemon-socket; do
+        [[ -d "$p" ]] && deny_wrapper+=(--tmpfs "$p")
+      done
       # PARANOID reads: blank the real HOME; the write-root binds below (and the
       # namespace bind) re-expose exactly what the devShell needs to read.
       [[ "$paranoid" == "true" ]] && deny_wrapper+=(--tmpfs "$real_home")
@@ -1075,6 +1183,10 @@ apply_profile_line() {
     verbose)     profile_bool verbose   "$val" "$f:$lineno"; p_verbose="$val" ;;
     yolo)        profile_bool yolo      "$val" "$f:$lineno"; p_yolo="$val" ;;
     paranoid)    profile_bool paranoid  "$val" "$f:$lineno"; p_paranoid="$val" ;;
+    pasteboard)  profile_bool pasteboard "$val" "$f:$lineno"; p_pasteboard="$val" ;;
+    nix_target)        p_nix_target="$(validate_nix_target "$val" "profile $f:$lineno: nix_target")" ;;
+    nix_target_shell)  p_nix_target_shell="$(validate_nix_target "$val" "profile $f:$lineno: nix_target_shell")" ;;
+    nix_target_claude) p_nix_target_claude="$(validate_nix_target "$val" "profile $f:$lineno: nix_target_claude")" ;;
     sandbox)     profile_bool sandbox   "$val" "$f:$lineno"; p_sandbox="$val" ;;
     real_home)   profile_bool real_home "$val" "$f:$lineno"; p_real_home="$val" ;;
     here)        profile_bool here      "$val" "$f:$lineno"; p_here="$val" ;;
@@ -1096,7 +1208,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, sandbox, real_home, here, ephemeral, shell, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, paranoid_deny_read, paranoid_allow_read)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, paranoid_deny_read, paranoid_allow_read)" ;;
   esac
 }
 
@@ -1112,7 +1224,8 @@ load_profile() {
   [[ -f "$base" ]] || die "profile not found: $base"
   local p_ns="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
         p_shell="" p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" v \
-        p_sandbox="" p_real_home=""
+        p_sandbox="" p_real_home="" p_pasteboard="" \
+        p_nix_target="" p_nix_target_shell="" p_nix_target_claude=""
   local -a keep_list=()
 
   # Read the committed base profile, then the optional gitignored <name>.local
@@ -1167,6 +1280,17 @@ load_profile() {
   fi
   if [[ -n "$p_paranoid" && "$paranoid_cli" != "true" ]]; then
     paranoid="$p_paranoid"
+  fi
+  if [[ -n "$p_pasteboard" && "$pasteboard_cli" != "true" ]]; then
+    pasteboard="$p_pasteboard"
+  fi
+  # The three nix-target keys share one --no-nix-target reset, so one *_cli flag
+  # gates all of them: an explicit CLI target (of any kind) takes the profile's
+  # whole set out of play rather than merging with it.
+  if [[ "$nix_target_cli" != "true" ]]; then
+    [[ -n "$p_nix_target" ]]        && nix_target="$p_nix_target"
+    [[ -n "$p_nix_target_shell" ]]  && nix_target_shell="$p_nix_target_shell"
+    [[ -n "$p_nix_target_claude" ]] && nix_target_claude="$p_nix_target_claude"
   fi
   if [[ -n "$p_sandbox" && "$sandbox_cli" != "true" ]]; then
     sandbox="$p_sandbox"
@@ -1243,9 +1367,14 @@ seatbelt_profile="" # macOS: generated profile path, reaped by trap on abnormal 
 # in either direction (-X / --no-X) — CLI beats profile beats env default.
 yolo="false";       yolo_cli="false"
 paranoid="false";   paranoid_cli="false"
+pasteboard="false"; pasteboard_cli="false"  # macOS: re-allow pbcopy/pbpaste (PLAN-007 F2)
 sandbox="true";     sandbox_cli="false"  # --no-sandbox drops the fs lockdown (shell only)
 real_home="false";  real_home_cli="false"  # --real-home: use the real HOME, no redirect
 shell="false";      shell_cli="false"
+# --nix-target* / profile nix_target*=: which devShells.<system>.NAME to run
+# under. Empty -> the flake's `default`. The per-mode values win over the shared
+# one; one _cli flag covers all three (they share --no-nix-target).
+nix_target=""; nix_target_shell=""; nix_target_claude=""; nix_target_cli="false"
 here="false";       here_cli="false"
 ephemeral="false";  ephemeral_cli="false"
 ephemeral_name=""   # -E=NAME/--ephemeral=NAME: a reusable throwaway HOME under
@@ -1286,6 +1415,16 @@ while [[ $# -gt 0 ]]; do
     --no-yolo|--yodo) yolo="false"; yolo_cli="true"; shift ;;
     --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
     --no-paranoid) paranoid="false"; paranoid_cli="true"; shift ;;
+    --pasteboard) pasteboard="true"; pasteboard_cli="true"; shift ;;
+    --no-pasteboard) pasteboard="false"; pasteboard_cli="true"; shift ;;
+    --nix-target) [[ $# -ge 2 && -n "$2" ]] || die "--nix-target requires a NAME"
+      nix_target="$(validate_nix_target "$2" "--nix-target")"; nix_target_cli="true"; shift 2 ;;
+    --nix-target-shell) [[ $# -ge 2 && -n "$2" ]] || die "--nix-target-shell requires a NAME"
+      nix_target_shell="$(validate_nix_target "$2" "--nix-target-shell")"; nix_target_cli="true"; shift 2 ;;
+    --nix-target-claude) [[ $# -ge 2 && -n "$2" ]] || die "--nix-target-claude requires a NAME"
+      nix_target_claude="$(validate_nix_target "$2" "--nix-target-claude")"; nix_target_cli="true"; shift 2 ;;
+    --no-nix-target) nix_target=""; nix_target_shell=""; nix_target_claude=""
+      nix_target_cli="true"; shift ;;
     --sandbox) sandbox="true"; sandbox_cli="true"; shift ;;
     --no-sandbox) sandbox="false"; sandbox_cli="true"; shift ;;
     --real-home) real_home="true"; real_home_cli="true"; shift ;;
@@ -1485,6 +1624,11 @@ if [[ "$dump" == "config" ]]; then
   printf 'here=%s\n'                "$here"
   printf 'shell=%s\n'               "$shell"
   printf 'paranoid=%s\n'            "$paranoid"
+  printf 'pasteboard=%s\n'          "$pasteboard"
+  printf 'nix_target=%s\n'          "$nix_target"
+  printf 'nix_target_shell=%s\n'    "$nix_target_shell"
+  printf 'nix_target_claude=%s\n'   "$nix_target_claude"
+  printf 'nix_target_effective=%s\n' "$(effective_nix_target)"
   printf 'sandbox=%s\n'             "$sandbox"
   printf 'real_home=%s\n'           "$real_home"
   printf 'yolo=%s\n'                "$yolo"

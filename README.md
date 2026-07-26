@@ -15,10 +15,25 @@ three layers:
    (the worktree, tmp, ...). On Linux the process also runs in its own PID
    namespace. Details in [Filesystem sandbox](#filesystem-sandbox).
 
-**Network and host services stay open by design** so claude (and the `-s` shell)
-can reach local db/redis/etc for testing. The sandbox shrinks what can be
-read/written; it is **not** an egress firewall -- anything readable is
-exfiltratable. Read the [threat model](#threat-model) before relying on it.
+> ### READ THE [THREAT MODEL](#threat-model) FIRST
+>
+> csb assumes a **trusted operator running trusted instructions**. It exists to
+> prevent *accidents* -- accidental damage, accidental exposure of the obvious
+> credentials, work bleeding between repos. It is **not** a boundary against a
+> hostile agent or against prompt injection, and it should not be relied on as
+> one.
+>
+> Two reasons, both deliberate and both load-bearing:
+>
+> - **Network and host services stay open by design**, so claude (and the `-s`
+>   shell) can reach local db/redis/etc for testing. csb is not an egress
+>   firewall: anything readable is exfiltratable.
+> - **The sandbox constrains filesystem operations, and IPC only where it can.**
+>   A host service that acts on the sandboxed process's behalf does its work
+>   *outside* the sandbox, as you. Verified escapes of this shape existed on
+>   both platforms and are now closed, but the class is not exhausted -- see
+>   [Known gaps](#known-gaps) for what is closed, what stays open, and what is
+>   accepted as unfixable.
 
 **Decoupled by design:** the repo needs no csb-specific files. Its own
 `flake.nix` with `devShells.default` is preferred, not required -- csb falls
@@ -30,6 +45,14 @@ The claude binary comes from *csb's own* flake; the repo never imports csb.
 > so `make install` and `nix run github:atongen/csb` work out of the box. Override
 > `CSB_SELF` (`CSB_SELF=path:/path/to/csb`) only for local development against a
 > working tree.
+>
+> **Use at your own risk.** This is a single-maintainer tool with no stability
+> promise and no security guarantee (MIT, no warranty -- see `LICENSE`). Flags,
+> defaults, profile keys, the sandbox policy and the containment approach itself
+> **can and probably will change at any time**, including in ways that break
+> your setup or that tighten or loosen what the sandbox permits. Pin a rev if
+> that matters to you, read the [threat model](#threat-model) before relying on
+> it for anything, and re-read it after upgrading.
 
 ## Quickstart
 
@@ -505,10 +528,21 @@ traversal to pass through. Two chains get two levels of access:
 - **namespace / HOME chain**: ancestors are `lstat`-only (**not** listable), so
   your home directory and other namespaces cannot be enumerated.
 
-#### paranoid guarantee (and its bound)
+#### paranoid guarantee (and its bounds)
 
-`--paranoid` guarantees the sandbox **cannot read file *contents* outside the
-allow-list**. It does **not** hide the *existence and entry names* of the
+**Bound 1, and it is the important one: this is a *filesystem* guarantee, and
+the filesystem is not the only way out.** Within the filesystem policy,
+`--paranoid` makes reads default-deny. It does not by itself stop the sandboxed
+process from asking a *host service* to do work on its behalf -- work that runs
+outside the sandbox, as you, with your real HOME. The verified routes of that
+shape are closed (separately from `--paranoid`, in both modes), but the class is
+not exhausted, so treat `--paranoid` as bounding what an *accident* can read
+rather than what a determined reader can reach. See
+[Known gaps](#known-gaps).
+
+**Bound 2.** Within the filesystem policy, `--paranoid` prevents reading file
+*contents* outside the allow-list. It does **not** hide the *existence and entry
+names* of the
 directories on the worktree's own ancestor path. Concretely, for a worktree at
 `<root>/<org>/<repo>`, the sandbox can `ls` `<root>` and `<root>/<org>` and the
 other directories up the chain -- learning the names of neighbouring entries
@@ -549,6 +583,43 @@ All four read/write lists are set per launch, via CLI flags or profile vars
 | extra write root | `--allow-write` | `allow_write=` | both |
 | extra paranoid read deny | `--paranoid-deny-read` | `paranoid_deny_read=` | `--paranoid` |
 | paranoid read re-allow (read-only) | `--paranoid-allow-read` | `paranoid_allow_read=` | `--paranoid` |
+
+### `--pasteboard` (macOS)
+
+`pbcopy`/`pbpaste` are a mach service, so the IPC denies that close the
+LaunchServices escape (see [Known gaps](#known-gaps)) remove in-sandbox
+copy/paste too. `--pasteboard` (or a profile's `pasteboard=true`) puts it back. This is the only
+capability the IPC denies take away that has a flag; everything else they remove
+is listed under [Known gaps](#known-gaps).
+
+**Default off**, because the pasteboard is a read channel around the *entire*
+file deny-list: it is shared with every host app, so a secret copied out of a
+password manager while an agent is running is readable by that agent. Re-allowing
+it was measured not to reopen the escape, and `test/escape/escape.bats` keeps
+that a regression guard. No-op on Linux (an X11/Wayland concern) and under
+`--no-sandbox`.
+
+## Choosing the nix target
+
+By default csb runs in the repo's `devShells.<system>.default`. Point it at a
+different closure -- a leaner `ci`, a `release` shell -- with `--nix-target NAME`
+(profile `nix_target=`), which resolves `devShells.<system>.NAME` from the
+repo's own flake.
+
+The two launch modes can differ: `--nix-target-shell NAME` and
+`--nix-target-claude NAME` (profile `nix_target_shell=` / `nix_target_claude=`)
+each apply to one mode only and beat the shared `--nix-target` when that mode is
+the one running. `--no-nix-target` clears all three. Whichever target wins also
+applies to `.worktreesetup.sh`, which runs in the same devShell.
+
+A *named* target never falls back: if the repo's flake has no such attribute the
+launch fails, because csb's generic fallback devShell only ever provides
+`default` and silently substituting it would run the wrong closure.
+
+```sh
+csb --nix-target ci feature/foo            # both modes in devShells.<system>.ci
+csb --nix-target-shell dev --nix-target-claude ci feature/foo
+```
 
 Each flag is repeatable; profile vars accumulate across `NAME` + `NAME.local`.
 The host tmp/scratch dir is the `CSB_TMPDIR` env var (see [Quickstart](#quickstart)).
@@ -621,14 +692,17 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   directories listable -- so sibling volume/host/org/repo *names* on that one path
   are visible, though sibling *contents* stay denied. Bounded by design; see
   [`--paranoid`: ancestor traversal and what it leaks](#--paranoid-ancestor-traversal-and-what-it-leaks).
-- **Host-side trust (flake.nix/shellHook only).** All `nix` eval/build/develop,
+- **Host-side trust (flake.nix/shellHook, and see Known gaps).** All `nix` eval/build/develop,
   and the repo's `flake.nix`/`shellHook`, run on the host, **unsandboxed** --
   nix itself is out of scope for containment. `.worktreesetup.sh` is not in
   this bucket: its `up`/`down` run *inside* the deny-list wrapper, in the same
   devShell and with the same env scrub the eventual claude/`-s` launch gets
   (see [Per-repo worktree files](#per-repo-worktree-files)), so a malicious or
   agent-modified copy has no more reach than the agent's own sandboxed shell.
-  The genuinely host-side surface is `flake.nix`/`shellHook`: the worktree is
+  The host-side surface is **not** limited to these: the nix daemon socket and
+  host IPC brokers are reachable from inside the sandbox too, which is what
+  [Known gaps](#known-gaps) covers. Within the *repo's own files*, the
+  genuinely host-side surface is `flake.nix`/`shellHook`: the worktree is
   **agent-writable**, and nix reads *tracked but uncommitted* edits from a
   dirty worktree -- no commit required -- so an agent could get host execution
   on your **next launch** of that branch by editing either. Don't point csb at
@@ -636,10 +710,13 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   before relaunching a branch an agent has worked on. `.git/hooks` / `config` /
   `config.worktree` are write-denied even when absent, closing that adjacent
   host-exec path.
-- **Single layer.** The seatbelt/bwrap profile *is* the containment -- no
-  unprivileged-user boundary underneath. On macOS a second boundary means a
-  separate OS user or a VM, not a profile tweak (seatbelt has no
-  process-isolation primitive). Linux gets a PID namespace for free.
+- **Single layer, and it is a *filesystem* layer.** The seatbelt/bwrap profile
+  *is* the containment -- no unprivileged-user boundary underneath -- and it
+  filters file operations, so it is porous to anything that gets work done by
+  IPC rather than by syscall (see [Known gaps](#known-gaps)). On macOS a second
+  boundary means a separate OS user, a container or a VM, not a profile tweak
+  (seatbelt has no process-isolation primitive). Linux gets a PID namespace for
+  free.
 - **`--no-sandbox` removes the layer.** The escape-hatch shell (see
   [`--no-sandbox` and `--real-home`](#--no-sandbox-and---real-home-the-deploy-shell))
   runs with no filesystem containment at all -- it exists for operator-driven,
@@ -650,14 +727,74 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   uses the same libsandbox). The mechanism is isolated in one helper
   (`build_deny_wrapper`) if it needs replacing.
 
+### Known gaps
+
+**The sandbox constrains filesystem operations and nothing else.** Any host
+service that acts on the sandboxed process's behalf runs *outside* the sandbox,
+as your own uid, with your real HOME -- and neither `PATH` nor the env scrub is
+a boundary against reaching one (exec is unrestricted and a sandboxed process
+sets its own environment).
+
+All of these were verified against a live sandbox, in `--paranoid` as well as
+normal mode. Full detail, evidence and reproductions in
+[`docs/PLAN-007-escape.md`](docs/PLAN-007-escape.md).
+
+| Gap | Platform | Effect | Status |
+|---|---|---|---|
+| `open` -> LaunchServices launches a `/tmp` `.app` via launchd | macOS | full escape to your uid, real HOME readable | **closed** |
+| `pbpaste` reads the live host clipboard | macOS | read channel around the whole file deny-list | **closed**; opt back in with `--pasteboard` |
+| session dbus -> `systemd-run --user` spawns a unit outside the namespace | Linux | full escape to your uid | **closed** |
+| nix daemon socket -> builds run outside the sandbox as `_nixbld1` | both | code exec outside the profile; reads anything other-readable | **closed** (in-sandbox `nix` no longer reaches the daemon at all) |
+| host unix sockets generally (tmux, editor IPC, docker, ssh-agent) | both | not exhaustively probed, but the same shape as the nix daemon | macOS: **closed as a class**. Linux: **open, accepted** |
+| `task_for_pid` / debugger attach to host processes | macOS | code injection into a process outside the sandbox | **closed** |
+| `sysctl kern.procargs2` reads other processes' argv + environment | macOS | discloses secrets from your other shells and dev servers -- disclosure, not execution | **open, accepted**: denying it broke `ps` |
+| Linux abstract unix sockets (e.g. X11) | Linux | keystroke injection into your session | **open, unfixable** without closing network egress |
+
+The macOS fixes work by flipping whole seatbelt filter *classes* to
+deny-by-default rather than by blacklisting service names -- a name blacklist
+was measured ineffective. Two classes are denied: `mach-lookup` (mach and XPC
+named services) and `network-outbound` with IP egress re-allowed (which is how
+unix sockets are governed, so it cuts every host socket at once, the nix daemon
+included).
+
+Consequences worth knowing before you upgrade: the macOS keychain, the browser
+login flow, `git`'s `osxkeychain` credential helper, system-configured HTTP
+proxies, and local dev services reached over a **unix socket** all become
+unreachable in-sandbox. TCP to localhost is unaffected, which covers most local
+services. Authenticate with `--seed-creds` or `CLAUDE_CODE_OAUTH_TOKEN`.
+
+On Linux there is no socket filter -- the only lever is removing sockets from
+the mount namespace, which is per-path and cannot be made complete.
+
+One gap is left open on purpose. macOS exposes every same-uid process's argv
+*and environment* via `sysctl kern.procargs2`, so a sandboxed agent can read
+secrets out of your other shells and dev servers. Denying the `kern.proc`
+sysctl prefix closes it and breaks `ps` outright, which is too high a price for
+a disclosure fix; a narrower `kern.procargs` prefix would likely do better and
+has not been measured. Until it is, treat anything in another process's
+environment as visible to the sandbox.
+
+"Closed" means that specific route is closed and has a test
+(`make test-escape`). It does **not** mean the class of brokered escapes is
+exhausted: two independent escapes were found in a single afternoon by someone
+not looking hard, and only two of seatbelt's filter classes are deny-by-default.
+
+On Linux the only lever is the mount namespace, so the fix is per-path and
+cannot be made complete. Both platforms therefore keep a residual. Closing it
+would take a second boundary rather than more profile work -- which is not
+implemented and not promised:
+
 ### Hardening for untrusted instructions
 
 If you intend to run instructions you don't fully trust, the two real moves, in
 order of leverage:
 
-1. **A second boundary** -- a separate unprivileged OS user, or (cleaner, and the
-   documented successor to `sandbox-exec`) a lightweight VM with a controllable
-   network. Not implemented today (see `docs/PLAN-003.md`, `docs/TODO.md`).
+1. **A second boundary** -- a separate unprivileged OS user, a container, or a
+   lightweight VM with a controllable network (the last being the documented
+   successor to the deprecated `sandbox-exec`). **None of this is implemented,
+   scheduled, or promised** -- it is the direction that would be needed, sketched
+   in `docs/PLAN-003.md` and `docs/TODO.md`, and it may never be built. Assume it
+   will not be.
 2. **Restrict egress** -- not natively possible by hostname. A VM makes it
    straightforward; without one, the achievable native step is a `localhost`-only
    egress mode, useful only for tasks that don't need claude's network mid-run.

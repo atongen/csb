@@ -151,8 +151,10 @@ normalize_sandbox() {
     fi
   fi
 
-  # Linux: the bwrap binary (pinned to the CSB_BWRAP_BIN placeholder).
+  # Linux: the bwrap binary (pinned to the CSB_BWRAP_BIN placeholder), and the
+  # per-uid runtime dir csb tmpfs's to cut the session bus (PLAN-007 F4).
   prog+="s#$(_sed_escape "$CSB_BWRAP_BIN")#<BWRAP>#g;"
+  prog+="s#/run/user/[0-9][0-9]*#/run/user/<UID>#g;"
 
   printf '%s\n' "$output" | sed "$prog"
 }

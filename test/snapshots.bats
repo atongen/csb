@@ -22,6 +22,13 @@ load helpers
   assert_snapshot paranoid "$repo"
 }
 
+@test "snapshot: --pasteboard (macOS re-allows pbcopy/pbpaste; no-op on Linux)" {
+  local repo; repo="$(fake_repo feature/x)"
+  dump_sandbox_snapshot "$repo" --pasteboard
+  assert_success
+  assert_snapshot pasteboard "$repo"
+}
+
 @test "snapshot: --paranoid --paranoid-allow-read DIR" {
   local repo; repo="$(fake_repo feature/x)"
   mkdir -p "$HOME/exposed"

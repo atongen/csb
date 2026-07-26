@@ -107,6 +107,31 @@ load helpers
   assert_output --partial "invalid namespace"
 }
 
+@test "an invalid --nix-target name dies" {
+  dump_config --nix-target "bad#name"
+  assert_failure
+  assert_output --partial "invalid nix target"
+}
+
+@test "an invalid profile nix_target= dies" {
+  write_profile p "nix_target=bad name"
+  dump_config -p p
+  assert_failure
+  assert_output --partial "invalid nix target"
+}
+
+@test "--nix-target without a NAME dies" {
+  dump_config --nix-target
+  assert_failure
+  assert_output --partial "--nix-target requires a NAME"
+}
+
+@test "--nix-target-claude without a NAME dies" {
+  dump_config --nix-target-claude
+  assert_failure
+  assert_output --partial "--nix-target-claude requires a NAME"
+}
+
 @test "an invalid --accent dies" {
   dump_config --accent notacolor
   assert_failure

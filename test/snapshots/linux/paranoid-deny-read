@@ -10,6 +10,12 @@
 --unshare-pid
 --die-with-parent
 --tmpfs
+/run/user/<UID>
+--tmpfs
+/run/dbus
+--tmpfs
+/nix/var/nix/daemon-socket
+--tmpfs
 <HOME>
 --tmpfs
 <HOME>/hidden
