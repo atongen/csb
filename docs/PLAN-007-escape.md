@@ -23,6 +23,11 @@ is the 2026-07-26 closeout review, run from an unsandboxed session, and it
 corrects several conclusions reached above -- including one rule this file
 recommends that was later measured to do nothing.
 
+THEN READ THE AMENDMENT, which follows the addendum. It is dated 2026-08-03, it
+is PROPOSED rather than implemented, and it adds one defect (D9), one capability
+(`--allow-socket`), and -- the part that matters most for anyone resuming -- an
+explicit scope line for what this file is still allowed to grow into.
+
 STILL OPEN:
 
 1. **The interactive TUI is confirmed by hand only, never by automation.** The
@@ -30,12 +35,18 @@ STILL OPEN:
    shipped profile works (addendum Part 1), which was the deciding column runs 3
    and 5 could only infer from an `http 404`. A pty session remains a manual
    check. The measured fallback if it ever regresses is still row A6.
-2. **The Linux snapshot goldens are unverified on NixOS.** They were hand-patched,
-   not regenerated. The host-dependence that made that risky is now removed --
-   the goldens collapse the conditional tmpfs block to an `<IPC-TMPFS>` marker
-   and a separate assertion covers which paths are really mounted (addendum D2)
-   -- so `make test-update` on NixOS should produce an EMPTY diff. Any diff is a
-   real finding.
+2. **The Linux snapshot goldens are unverified on NixOS.** CLOSED by the NixOS
+   run recorded at the top of the addendum (`make test` passes, `make test-update`
+   produces an empty diff). Kept here because the rest of the item explains why
+   that empty diff is the pass criterion: they were hand-patched, not regenerated,
+   and the host-dependence that made that risky was removed by collapsing the
+   conditional tmpfs block to an `<IPC-TMPFS>` marker with a separate assertion
+   covering which paths are really mounted (addendum D2).
+3. **On Linux, `--allow-write` re-exposes the IPC broker paths.** The write binds
+   are emitted after the IPC tmpfs block, so an allow-write over one of the three
+   removed paths layers the host directory back on top and reopens F4. Derived
+   from argv order, not yet executed -- see amendment D9 for the two commands
+   that settle it.
 
 The `trusted-users` guard was dropped as redundant -- see Phase 3.
 
@@ -1605,3 +1616,345 @@ and there is no seatbelt rule that changes that.
   the repo used for the golden regen: all under this session's scratchpad, none
   in the repo, none in `/tmp`.
 - one nested `claude -p` API round trip (Part 1) -- it answered `ok` and exited.
+
+---
+
+# AMENDMENT -- the socket capability and the scope line (2026-08-03)
+
+STATUS: PROPOSED. Nothing below is implemented. No code, README or golden was
+changed while writing it.
+
+## Why this amendment exists
+
+Two things forced it, and only the first is a defect.
+
+1. The Linux IPC tmpfs block can be undone by `--allow-write` (D9). That is F4
+   reopening through a write flag, which is not a policy anyone chose.
+2. The operator needs the sandboxed agent to RUN THE TEST SUITE, and the dev
+   setup is unix-socket based (postgres). On macOS that is currently impossible
+   without `--no-sandbox`: the `network-outbound` class deny cuts every socket
+   outside the sandbox's own trees, and no flag re-opens one. "Switch to TCP" is
+   a real option and is being declined -- the whole host dev setup is built on
+   sockets, so csb is the thing that should bend.
+
+Behind both sits the question this amendment actually answers: the two platforms
+are drifting, every change costs two measurements and two sets of goldens, and
+there is no stated rule for what this file is still allowed to grow into. Part 9
+is that rule. It is the most important section here; D9 and `--allow-socket` are
+just the two items that fit inside it.
+
+## Part 5 -- diagnosis: the platforms are not asymmetric, they are opposite
+
+Stated once, because it explains every sync cost paid so far. (Numbered Part 5 to
+continue the addendum's Parts 1-4.)
+
+| | macOS | Linux |
+|---|---|---|
+| Default for sockets | deny (class deny, bin/csb:1030) | reachable (`--ro-bind / /`) |
+| Policy shape | ALLOW-list: `own_roots` + namespace (bin/csb:1040-1043) | DENY-list: three paths tmpfs'd (bin/csb:1127-1129) |
+| Completable in principle | yes, by construction | no -- abstract sockets are netns-scoped |
+
+The shapes are inverted, so a single flag cannot have a single mechanism, and
+every proposal has to be re-reasoned per platform. That is the sync tax, and it
+is structural rather than an artifact of how the two branches were written.
+
+**Parity is not reachable with the current mechanism.** Both directions were
+considered and both are rejected:
+
+- Make Linux an allow-list. Requires `--unshare-net` plus a userspace network
+  (pasta / slirp4netns) to keep egress. That is a new dependency and a new
+  containment mechanism -- the "second boundary" work this plan has twice
+  deferred. Out of scope, and it would supersede this file rather than extend it.
+- Widen the Linux deny-list toward `/run` wholesale. Breaks NixOS outright:
+  `/run/current-system` is the entire system closure. The three-path list is not
+  timid, it is the largest list that does not break the host.
+
+So: **stop trying to sync the DEFAULTS. Sync the predicate.**
+
+A capability flag should promise something about the path it names -- "a socket
+at this path is reachable from inside the sandbox" -- and promise nothing about
+paths it does not name. Both platforms can honor that promise. What differs is
+the residual for unnamed paths, which the README's Known-gaps table already
+states per platform and which this amendment does not change.
+
+The cost consequence is the reason to adopt the reframing rather than merely the
+tidiness: under it, the feature in Part 7 is about six lines on macOS and **zero
+on Linux**, because on Linux every path a user would name is already reachable
+except the three the flag must refuse. It is a documented no-op there, exactly
+like `pasteboard` -- and `test/snapshots/linux/pasteboard` is already byte-
+identical to `linux/baseline`, with that identity serving as the assertion
+(addendum Part 3). The precedent exists; this is the second instance of it.
+
+## Part 6 -- D9: on Linux, `--allow-write` defeats the IPC tmpfs
+
+DEFECT. Same family as D1 and D2: correct code, wrong interaction, invisible to
+the tiers that validate profile text.
+
+`build_write_roots` folds `--allow-write` / `allow_write=` into `write_roots`
+(bin/csb:840), and the Linux branch binds every write root (bin/csb:1137-1139)
+AFTER the IPC tmpfs loop (bin/csb:1127-1129). bwrap applies operations in argv
+order, so a later `--bind` over an earlier `--tmpfs` mountpoint layers the host
+directory back on top. `--allow-write /run/user/$(id -u)` therefore restores
+`/run/user/<uid>/bus` and reopens F4 -- a full escape to the operator's uid,
+re-enabled by a flag whose documented job is write policy.
+
+The argv order is not in doubt: `test/snapshots/linux/deny-read-allow-write` has
+`<IPC-TMPFS>` on line 12 and every `--bind` after it. What is NOT yet measured is
+the bwrap layering and the resulting escape. Two commands settle it, both on the
+NixOS box, and per this plan's own hard requirement the second is the one that
+counts:
+
+    # 1. argv order, from the read-only seam
+    csb -s --here --allow-write /run/user/$(id -u) --dump-sandbox | grep -n 'run/user'
+
+    # 2. the escape itself -- must NOT print "Running as unit"
+    csb -s --here --allow-write /run/user/$(id -u) -- \
+      env XDG_RUNTIME_DIR=/run/user/$(id -u) \
+          DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus \
+      /run/current-system/sw/bin/systemd-run --user --wait --unit=csb-f4w \
+      /bin/sh -c 'id -un'
+
+Clean up with `systemctl --user reset-failed csb-f4w`.
+
+**Fix: reject the overlap at capture time. Do not reorder the argv.** Reordering
+trades a silent reopen for a silent no-op, and a `--tmpfs` landing on a path the
+operator explicitly asked to be writable is its own confusion. The precedent is
+already in the code: `paranoid_allow_read` dies rather than silently resolving an
+overlap with a deny root (bin/csb:925-929, "an allow may not re-expose a denied
+path"), using `paths_overlap` (bin/csb:663-666). Same rule, same error shape,
+applied to the three broker paths. `--no-sandbox` remains the one hatch, which
+keeps resolved decision 2 intact.
+
+**Explicitly NOT a defect, so a future reader does not "fix" it too:** the same
+argv order lets a write root re-expose a `paranoid_deny_read` tmpfs
+(bin/csb:1133-1135). That one is INTENTIONAL and symmetric with macOS, where the
+write-root read re-allows deliberately sit on top of the paranoid denies so a
+broad `paranoid_deny_read=/Volumes` never locks the agent out of its own repo
+(bin/csb:900-907). Read policy is a knob and later-rule-wins is its documented
+semantics. The IPC tmpfs is not a knob -- it is the boundary, and decision 2 says
+it has no opt-out. That distinction is the whole content of this fix.
+
+Cost: ~5 lines in the capture path, one `test/precedence.bats` case asserting the
+die, one `test/escape/escape.bats` assertion that the flag does not reopen F4.
+
+## Part 7 -- `--allow-socket PATH` / `allow_socket=`
+
+The capability, scoped to a path. Directories are accepted as well as socket
+files (operator decision, 2026-08-03): `/run/postgresql` and `$PWD/tmp` are how
+this is configured in practice, and a directory also survives the service
+restarting and recreating its socket, which a file rule pinned to one name does
+not express as cleanly.
+
+Repeatable, and a profile key -- the profile key is the point. `allow_socket=` in
+a project's profile is set once and never thought about again, which is what
+turns "the agent cannot run the tests" into a non-issue.
+
+**Semantics, per platform:**
+
+- macOS. Emit, alongside the existing `own_roots` loop (bin/csb:1040-1043):
+  a directory becomes `(allow network-outbound (subpath "..."))`, anything else
+  `(allow network-outbound (literal "..."))`. That dir-vs-file split is the
+  existing idiom from `build_deny_paths` (bin/csb:783-787).
+- Linux. No-op. Every path a user would name is already reachable, and the three
+  where it would matter are refused (below). Assert it as an identity snapshot,
+  the way `linux/pasteboard` already does.
+
+**Two emission details that are load-bearing, not defensive:**
+
+1. Emit the REALPATH form. Seatbelt matches resolved paths (bin/csb:669-670, and
+   D4 measured the realpath form as the one that matches). `/tmp` resolves to
+   `/private/tmp` on macOS, so a naive `--allow-socket /tmp/.s.PGSQL.5432` that
+   emitted only the given spelling would silently do nothing -- the exact trap
+   the mDNSResponder pair at bin/csb:1032-1033 exists for. Emitting the as-given
+   spelling as a second rule is cheap belt-and-braces; whether it is ever needed
+   is UNMEASURED, and the mDNSResponder pair is the reason not to assume.
+2. Do NOT require the path to exist. A socket that appears when the test suite
+   boots its database must still be covered, and seatbelt string-matches, so a
+   rule for a nonexistent path is valid -- the git-dir denies already rely on
+   this (bin/csb:1091-1092). This is a real difference from `--allow-write`,
+   which skips nonexistent paths (bin/csb:844). Use `realpath -m` so
+   canonicalization does not need the path to exist either.
+
+**Refusal list -- `--allow-socket` may not name a path csb itself closes:**
+
+- Linux: the three broker paths (`/run/user/<uid>`, `/run/dbus`,
+  `/nix/var/nix/daemon-socket`). Same check as D9, shared.
+- macOS: the nix daemon socket (`realpath /nix/var/nix/daemon-socket/socket`).
+
+This is what keeps `make test-escape` true by construction rather than by luck:
+the F3 and F4 assertions cannot be turned into false statements by a flag. It
+also keeps decision 2 honest -- the flag exposes a named path, never the
+boundary, and `--no-sandbox` stays the only way to get a broker back.
+
+**Second refusal, from accepting directories: a DIRECTORY target may not be a
+shared write root.** Accepting directories is what makes `/run/postgresql` and
+`$PWD/tmp` work, but it also makes `allow_socket=/tmp` expressible -- and a
+`subpath` over `/tmp` is precisely what D4 measured as making host-side sockets
+reachable again, which is F3's shape returning under a different name. The rule:
+
+- refuse a DIRECTORY target that IS a shared write root -- `/tmp`,
+  `/private/tmp`, the `/var/folders` per-user dir and `/dev` on macOS,
+  `/var/tmp` on Linux (the non-`own_roots` members of `write_roots`;
+  bin/csb:815-836)
+- allow a socket FILE under one of those trees -- `/tmp/.s.PGSQL.5432` is one
+  socket the operator named, not a whole shared tree
+- allow a DIRECTORY anywhere else, including a subdirectory of a shared root
+  (`/tmp/mysockets`): narrow and named is the whole distinction
+
+The asymmetry is deliberate and is the same one `own_roots` already encodes
+(bin/csb:796-800): write policy cannot tell a host socket from a sandbox socket in
+a shared tree, so socket policy must, and the operator naming one path is the
+only signal available. Without this refusal the flag would let a single profile
+line undo the measurement D4 was written to record.
+
+Deliberately NOT refused: `docker.sock`, `SSH_AUTH_SOCK`, a tmux server socket.
+Each is operator-equivalent or root-equivalent and allowing one is a real
+decision, but a hardcoded blocklist of dangerous socket names is precisely the
+whack-a-mole this plan rejected for Linux paths and for mach service names.
+Document the three by name as "allowing this is choosing to reopen that broker"
+and let the operator choose.
+
+**Touch points**, mirroring `allow_write` exactly (the list Phase 3b established
+for `pasteboard`, updated to current line numbers):
+
+| What | Where |
+|---|---|
+| help text | bin/csb:131-132 (next to `--allow-write`), profile key list :163 |
+| capture, CLI | arg parse bin/csb:1509-1510 pattern, via `normalize_list_path` (:631) |
+| capture, profile | `profile_key` bin/csb:1244 pattern, unknown-key list :1252 |
+| var init | bin/csb:1432 pattern |
+| `--no-sandbox` inert warning | bin/csb:1586-1587 (add to the same condition) |
+| `--dump-config` emit | bin/csb:1693 pattern |
+| emission | darwin bin/csb:1040-1043; Linux none |
+| refusal check | shared with D9 |
+
+**Tests.** Per the addendum's rule -- adding a re-allow means adding the
+assertion that justifies it:
+
+- `test/escape/usable.bats`: a socket the flag allowed is connectable (the `nc
+  -lU` / `nc -U` probe shape from D4, with its positive control). Note the
+  104-byte AF_UNIX path cap that invalidated the first run of that probe.
+- `test/escape/escape.bats`: a socket NOT named stays unreachable, and the
+  refusal list holds.
+- `test/precedence.bats`: `allow_socket=` precedence and the `--allow-socket`
+  parse, mirroring the existing `allow_write` cases.
+- Snapshots: one new darwin case; one Linux identity snapshot.
+
+## Part 8 -- the relay is a FALLBACK, not the answer
+
+Read this section as two things: what to do until Part 7 ships, and the narrow
+residue that survives it. Those were conflated in the first draft of this
+amendment, which read as though the relay were a peer of the flag. It is not.
+
+**Once Part 7 ships, the normal case is one profile line and no relay:**
+
+    allow_socket=/tmp/.s.PGSQL.5432
+
+On macOS that emits the `literal` for the realpath'd form, so libpq's default
+socket path resolves onto it and `psql` with no `host:` works -- the exact case
+the addendum measured as broken. On Linux it is a no-op because the path is
+already reachable. So ONE profile line covers both hosts, with no `database.yml`
+change, no relay process, and nothing for the operator to remember per session.
+That is the concrete payoff of Part 5's reframing: the platform difference is
+absorbed by the flag being a no-op on one side, not by two mechanisms.
+
+File policy does not interfere for this path: `/tmp` is a write root
+(bin/csb:816) and `--paranoid` re-allows reads on the write roots
+(bin/csb:1061-1066), so the socket path is readable in both modes.
+
+**Where the relay still earns its place, after Part 7:**
+
+1. A socket under the REAL HOME with `--paranoid`. The read deny at bin/csb:1057
+   still covers the path, and whether a `network-outbound` allow suffices when
+   the path is read-denied is UNMEASURED (it is the one interaction Part 7 does
+   not settle). Relaying into the worktree sidesteps the question entirely rather
+   than betting on it. Measure it before recommending `allow_socket=` for a
+   HOME-relative socket under paranoid.
+2. Wanting the service without granting the path -- a narrower grant than "this
+   socket is reachable". Marginal, but it is a real difference: the relay hands
+   over one connection endpoint, the flag hands over a path.
+
+**And until Part 7 ships**, these are the macOS unblocks, needing nothing from
+this plan. On Linux nothing is needed: postgres over a socket most likely ALREADY
+works, since the NixOS default `/run/postgresql/.s.PGSQL.5432` is not one of the
+three removed paths and `/tmp` is bound rw from the host. macOS is the broken half
+-- measured in the addendum, where `psql` with no `host:` fell back to
+`/tmp/.s.PGSQL.5432` and was denied.
+
+1. Relay the socket into the worktree, host-side:
+
+       socat UNIX-LISTEN:$PWD/tmp/pg.sock,fork UNIX-CONNECT:/tmp/.s.PGSQL.5432
+
+   then `DATABASE_URL=postgres:///db?host=./tmp` in-sandbox. The worktree is an
+   `own_root`, so the socket is reachable (bin/csb:1040-1043). A host process is
+   acting for the sandbox, but it relays to exactly one service -- the blast
+   radius is postgres access, which is what is being asked for anyway. UNMEASURED
+   as written; the `own_roots` half of it is measured (addendum Tier C).
+2. Put the cluster's socket dir in the tree: `pg_ctl -k $PWD/tmp`. Already
+   documented as working (README, "Unix sockets need stating precisely").
+
+What does NOT work, so nobody spends an afternoon on it: symlinking a host socket
+into the worktree. Seatbelt matches resolved paths (bin/csb:669-670), so the rule
+is evaluated against the host target, which is denied. Reasoned from that
+comment and from D4, NOT measured.
+
+Also note the `own_roots` re-allow is path-scoped, not owner-scoped: a HOST
+process that puts its socket under the worktree is reachable from inside the
+sandbox. That is within D4's stated reasoning (those trees are csb-created) and
+is the seam workaround 1 rides on -- but it is a seam, not an accident, and it
+should be said out loud in the README rather than left implied by "a socket there
+is one the sandbox itself made".
+
+## Part 9 -- THE LINE
+
+The stopping rule for this file. Written so the next "should csb also..." answers
+itself without a fresh afternoon of measurement.
+
+**In scope, indefinitely.** Named, path-scoped capability flags that satisfy all
+four:
+
+1. one line of emission per platform (a no-op on one platform is fine, and is
+   now the expected case -- see Part 5),
+2. one `usable.bats` assertion that justifies each thing re-allowed,
+3. cannot name a path csb itself closes,
+4. expressible as a reachability predicate over a path.
+
+`--pasteboard` and `--allow-socket` are both this shape. This is the same rule
+the plan already set for itself ("one line or one flag AND measured"), with the
+fourth clause added.
+
+**Closed. Do not reopen without a new document.** Everything requiring a new
+mechanism: `--unshare-net` plus a userspace network for Linux socket parity, a
+second unprivileged OS user, a container or VM boundary. Each may be the right
+next thing; none is an extension of this file. Also still closed, from the
+addendum: the `kern.proc*` sysctl rule in every form, identifying what `open`
+talks to, and a per-path Linux socket list beyond the three that ship.
+
+**The sync test, which is the actual answer to the drift.** A proposal ships only
+if it can be stated as "this path is reachable / not reachable" on BOTH platforms.
+If it cannot be phrased that way on both, it is not a csb feature -- it is a
+request for a different containment mechanism, and it belongs in the document
+that proposes one. Clause 4 above is this test; it is restated here because it is
+the clause that does the work.
+
+Corollary worth internalizing: a flag being a NO-OP on one platform is a success
+under this rule, not a wart. It means the predicate already holds there. The
+instinct to add mechanism until both platforms emit something is what produced
+the sync tax in the first place.
+
+## Part 10 -- residuals, unchanged
+
+Nothing here narrows the residual, and the README should not read as if it does.
+
+- csb is still not a boundary against a hostile agent. `--allow-socket` widens
+  the attack surface by exactly the paths the operator names; that is the point
+  of a capability flag and it is the operator's call.
+- The `kern.procargs2` disclosure is unchanged and unfixable here (D3).
+- Linux abstract sockets are unchanged and unfixable here.
+
+One breakage worth pre-empting for the run-the-tests use case, because it is NOT
+a socket problem and will be misattributed as one: `/bin/ps` does not work
+in-sandbox at all on macOS. Seatbelt refuses to exec a setuid binary under ANY
+profile, including a bare `(allow default)` (D3, measured). Test harnesses that
+shell out to `ps` -- `spring`, `foreman`, process-manager teardown -- fail for
+that reason and no flag in this amendment changes it.
