@@ -43,6 +43,33 @@ load helpers
   assert_snapshot pasteboard "$repo"
 }
 
+@test "snapshot: --allow-socket DIR (macOS re-allows the sockets under it; no-op on Linux)" {
+  # The path is passed ALREADY realpath'd on purpose: csb emits the resolved
+  # spelling plus the as-given one when they differ, and on macOS $HOME sits under
+  # the /tmp -> /private/tmp symlink, so the as-given form would carry this run's
+  # random mktemp suffix into the golden. Both-spelling emission is asserted
+  # behaviourally below instead.
+  local repo rhome; repo="$(fake_repo feature/x)"
+  rhome="$(realpath "$HOME")"
+  mkdir -p "$rhome/sockets"
+  dump_sandbox_snapshot "$repo" --allow-socket "$rhome/sockets"
+  assert_success
+  assert_snapshot allow-socket "$repo"
+}
+
+@test "macOS: --allow-socket emits both spellings when they differ" {
+  # Seatbelt matches the RESOLVED path, so /private/tmp is the load-bearing rule;
+  # the as-given spelling is the cheap half of the mDNSResponder lesson. Asserted
+  # on the path strings rather than subpath-vs-literal, so a host that happens to
+  # run a postgres on this socket does not change the answer.
+  [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux emits nothing for this flag)"
+  local repo; repo="$(fake_repo feature/x)"
+  dump_sandbox_snapshot "$repo" --allow-socket /tmp/.s.PGSQL.5432
+  assert_success
+  assert_output --partial '"/private/tmp/.s.PGSQL.5432"'
+  assert_output --partial '"/tmp/.s.PGSQL.5432"'
+}
+
 @test "snapshot: --paranoid --paranoid-allow-read DIR" {
   local repo; repo="$(fake_repo feature/x)"
   mkdir -p "$HOME/exposed"

@@ -181,3 +181,54 @@ load helpers
   dump_sandbox "$repo" --paranoid --paranoid-allow-read "$TEST_TMP/allow"
   assert_success
 }
+
+# --- the IPC broker paths may not be re-opened by any flag (PLAN-007 D9) -----
+
+@test "an allow-write over an IPC broker path is refused" {
+  # On Linux the write binds are emitted AFTER the --tmpfs that removes the
+  # session bus, so without this check the flag would layer the host directory
+  # back on top and reopen F4. Refused on both platforms so a shared profile
+  # fails identically.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --allow-write "/run/user/$(id -u)"
+  assert_failure
+  assert_output --partial "overlaps the IPC broker path"
+}
+
+@test "an allow-socket over an IPC broker path is refused" {
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --allow-socket /run/dbus/system_bus_socket
+  assert_failure
+  assert_output --partial "overlaps the IPC broker path"
+}
+
+@test "an allow-socket naming the nix daemon socket is refused by either spelling" {
+  # The link and its target: on macOS /nix/var/nix/daemon-socket/socket resolves
+  # OUT of the broker directory to /private/var/run/nix-daemon.socket, so
+  # comparing only the resolved path would let the F3 socket back in.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --allow-socket /nix/var/nix/daemon-socket/socket
+  assert_failure
+  assert_output --partial "overlaps the IPC broker path"
+
+  dump_sandbox "$repo" --allow-socket "$(realpath -m /nix/var/nix/daemon-socket/socket)"
+  assert_failure
+  assert_output --partial "overlaps the IPC broker path"
+}
+
+@test "an allow-socket naming a whole shared write root is refused" {
+  # A subpath over /tmp makes HOST sockets reachable again, which is F3's shape
+  # returning -- the measurement own_roots exists to encode.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --allow-socket /tmp
+  assert_failure
+  assert_output --partial "is a shared write root"
+}
+
+@test "an allow-socket under a shared write root is accepted" {
+  # The positive control for the refusal above: one named socket is the point of
+  # the flag, and only the whole tree is refused.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --allow-socket /tmp/.s.PGSQL.5432
+  assert_success
+}

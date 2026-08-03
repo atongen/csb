@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
-# Tier 1: the four read/write lists accumulate from CLI flags, profile vars, and
-# both together (CLI first, then profile); leading ~/ expands to $HOME.
+# Tier 1: the five read/write/socket lists accumulate from CLI flags, profile vars,
+# and both together (CLI first, then profile); leading ~/ expands to $HOME.
 
 load helpers
 
@@ -23,12 +23,18 @@ load helpers
   assert_line "deny_read=/from/cli|/from/profile"
 }
 
-# --- each of the four lists accumulates CLI + profile ------------------------
+# --- each of the five lists accumulates CLI + profile ------------------------
 
 @test "allow_write accumulates CLI + profile" {
   write_profile p "allow_write=/from/profile"
   dump_config -p p --allow-write /from/cli
   assert_line "allow_write=/from/cli|/from/profile"
+}
+
+@test "allow_socket accumulates CLI + profile" {
+  write_profile p "allow_socket=/from/profile.sock"
+  dump_config -p p --allow-socket /from/cli.sock
+  assert_line "allow_socket=/from/cli.sock|/from/profile.sock"
 }
 
 @test "paranoid_deny_read accumulates CLI + profile" {

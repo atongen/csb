@@ -42,11 +42,18 @@ STILL OPEN:
    and the host-dependence that made that risky was removed by collapsing the
    conditional tmpfs block to an `<IPC-TMPFS>` marker with a separate assertion
    covering which paths are really mounted (addendum D2).
-3. **On Linux, `--allow-write` re-exposes the IPC broker paths.** The write binds
-   are emitted after the IPC tmpfs block, so an allow-write over one of the three
-   removed paths layers the host directory back on top and reopens F4. Derived
-   from argv order, not yet executed -- see amendment D9 for the two commands
-   that settle it.
+3. **On Linux, `--allow-write` re-exposed the IPC broker paths.** FIXED and
+   VERIFIED 2026-08-03 (csb 0.3.1): the overlap is refused at capture time on both
+   platforms, and F4 stays closed under `make test-escape` on NixOS. One nuance
+   kept honest in D9: the defect's PREMISE stays derived from argv order, because
+   the refusal now prevents building the argv that would have demonstrated it.
+   Verifying it would mean reverting the fix.
+
+The socket capability added by the amendment (`--allow-socket` / `allow_socket=`)
+is fully verified on both platforms -- see amendment Part 11. One residual there is
+UNMEASURED and deliberately untested: a socket under a tree `--paranoid`
+read-denies gets its socket allow but no read allow. Use the relay in Part 8 for
+that case until someone measures it.
 
 The `trusted-users` guard was dropped as redundant -- see Phase 3.
 
@@ -1621,8 +1628,13 @@ and there is no seatbelt rule that changes that.
 
 # AMENDMENT -- the socket capability and the scope line (2026-08-03)
 
-STATUS: PROPOSED. Nothing below is implemented. No code, README or golden was
-changed while writing it.
+STATUS: IMPLEMENTED and VERIFIED 2026-08-03, shipped in csb 0.3.1. All three test
+tiers pass on aarch64-darwin and on NixOS: `make check` clean, `make test` 89/89
+(up from 81), Tier 2 goldens generated on both platforms with an empty diff apart
+from the new case, and `make test-escape` green on both. Read "Part 11 --
+implementation notes" for what the verification actually establishes per platform,
+for the one design detail in Part 7 that was measurably insufficient as written,
+and for the single thing that remains unmeasured.
 
 ## Why this amendment exists
 
@@ -1699,10 +1711,15 @@ directory back on top. `--allow-write /run/user/$(id -u)` therefore restores
 re-enabled by a flag whose documented job is write policy.
 
 The argv order is not in doubt: `test/snapshots/linux/deny-read-allow-write` has
-`<IPC-TMPFS>` on line 12 and every `--bind` after it. What is NOT yet measured is
-the bwrap layering and the resulting escape. Two commands settle it, both on the
-NixOS box, and per this plan's own hard requirement the second is the one that
-counts:
+`<IPC-TMPFS>` on line 12 and every `--bind` after it. What was never measured is
+the bwrap layering and the resulting escape -- and now it CANNOT be, in place: the
+flag is refused before an argv is built, so the two commands below both stop at the
+refusal. The premise of this defect therefore stays DERIVED from argv order, and
+proving it would mean reverting the fix to run the second command. That is a fair
+trade rather than a gap: the fix is verified (the flag is refused on both
+platforms, F4 stays closed under `make test-escape`), and the only unproven claim
+is about behaviour that no longer exists. Recorded so nobody later reads "derived"
+as "unfixed". The commands, kept for whoever does revert:
 
     # 1. argv order, from the read-only seam
     csb -s --here --allow-write /run/user/$(id -u) --dump-sandbox | grep -n 'run/user'
@@ -1734,8 +1751,11 @@ broad `paranoid_deny_read=/Volumes` never locks the agent out of its own repo
 semantics. The IPC tmpfs is not a knob -- it is the boundary, and decision 2 says
 it has no opt-out. That distinction is the whole content of this fix.
 
-Cost: ~5 lines in the capture path, one `test/precedence.bats` case asserting the
-die, one `test/escape/escape.bats` assertion that the flag does not reopen F4.
+Cost, as built: ~5 lines in the capture path plus a shared broker list, and the
+die is asserted in `test/validation.bats` rather than `precedence.bats` (it is a
+build-time refusal, which is where that file's `--dump-sandbox` cases live). No
+`escape.bats` assertion was added: with the flag refused there is no launch to
+make, and `escape.bats`' existing F4 test already covers the boundary itself.
 
 ## Part 7 -- `--allow-socket PATH` / `allow_socket=`
 
@@ -1958,3 +1978,135 @@ in-sandbox at all on macOS. Seatbelt refuses to exec a setuid binary under ANY
 profile, including a bare `(allow default)` (D3, measured). Test harnesses that
 shell out to `ps` -- `spring`, `foreman`, process-manager teardown -- fail for
 that reason and no flag in this amendment changes it.
+
+## Part 11 -- implementation notes (2026-08-03)
+
+What shipped, what changed from the proposal above, and what is NOT yet verified.
+
+### The design detail that was wrong: the nix daemon socket is a symlink
+
+Part 7 said to refuse "the nix daemon socket (`realpath
+/nix/var/nix/daemon-socket/socket`)". Implementing only the DIRECTORY form and
+comparing resolved paths left the socket re-openable by a flag, because on macOS
+that path is a symlink pointing OUT of the broker directory:
+
+    $ realpath -m /nix/var/nix/daemon-socket/socket
+    /private/var/run/nix-daemon.socket
+
+So `--allow-socket /nix/var/nix/daemon-socket/socket` resolved clear of
+`/nix/var/nix/daemon-socket` and the overlap check passed -- a one-flag reopen of
+F3, which `make test-escape`'s F3 assertion would then have been asserting about a
+sandbox the operator could trivially widen. Caught by running the refusal through
+`--dump-sandbox` for all four spellings rather than the one the plan named.
+
+Two corrections, both shipped:
+
+- `build_ipc_brokers` appends the RESOLVED daemon socket to the broker list. It is
+  skipped by the Linux tmpfs loop, which mounts only entries that are directories.
+- `refuse_ipc_brokers` compares BOTH the path as given and its resolved form
+  against every broker. A symlink can point into a broker directory as easily as
+  out of one, and only checking one form misses one direction.
+
+Verified, all four spellings refused, and the postgres case still emitted:
+
+    $ for p in /nix/var/nix/daemon-socket/socket /nix/var/nix/daemon-socket \
+               /private/var/run/nix-daemon.socket /run/dbus; do
+        ./bin/csb --here --dump-sandbox --allow-socket "$p" 2>&1 >/dev/null \
+          | grep -c 'overlaps the IPC broker path'
+      done
+    1 1 1 1
+    $ ./bin/csb --here --dump-sandbox --allow-socket /tmp/.s.PGSQL.5432 | grep PGSQL
+    (allow network-outbound (literal "/private/tmp/.s.PGSQL.5432"))
+    (allow network-outbound (literal "/tmp/.s.PGSQL.5432"))
+
+This is the fourth time in this investigation a rule was written against the
+spelling of a path rather than its resolution. It is the same root cause as the
+mDNSResponder pair and as D4's realpath note. Treat "which spelling does the
+kernel see?" as a standing question for any new path-matched rule.
+
+### Decided during implementation
+
+- **A path that does not exist yet is treated as a DIRECTORY** (emitted as
+  `subpath`, which also covers the path itself). Part 7 only said not to require
+  existence. Without this a socket directory the test suite creates on boot would
+  get a `literal` that can never match -- a silent no-op, which is the failure mode
+  this whole plan keeps rediscovering.
+- **The shared-write-root refusal is DERIVED, not a hardcoded list**: a directory
+  target is refused when it is exactly a member of `write_roots` that is not in
+  `own_roots`. That covers `/tmp`, `/private/tmp`, the `/var/folders` per-user dir,
+  `/dev`, `/var/tmp`, `CSB_TMPDIR`, and any tree the operator write-allowed --
+  without naming any of them, and it stays correct if the write roots change.
+  Equality, not containment, so `/tmp/mysockets` is still allowed.
+- **`realpath -m` was replaced by a `canon_path` helper.** Part 7 specified
+  `realpath -m` for canonicalizing a path that need not exist. That flag is
+  GNU-only, and the primary install is `make install` copying this script into
+  `~/bin` rather than the coreutils-wrapped flake output, so it would narrow the
+  script's dependency from "a realpath on PATH" to "GNU realpath" against the
+  project's own cross-platform rule. `canon_path` realpaths the deepest existing
+  ancestor and re-appends the rest -- no flags, same answer. Checked against
+  `/tmp/.s.PGSQL.5432`, `/tmp/nope/x`, `/`, `/nope`, and the daemon-socket symlink.
+- **The D9 refusal applies on BOTH platforms**, though only Linux has the tmpfs it
+  protects. A profile shared between a mac and a NixOS box must fail identically
+  on both; a check that errors on one host and silently passes on the other is the
+  drift this amendment exists to stop.
+- `--allow-socket` emits NOTHING on Linux, as specified. The Linux branch carries
+  a comment saying so and saying why no bind is emitted for a socket under a
+  `--paranoid` tmpfs: bringing it back is precisely D9's silent re-open.
+
+### Verification -- all three tiers, both platforms (closed 2026-08-03)
+
+This was implemented from inside a csb sandbox, so Tiers 2 and 3 could not run
+where it was written -- the same limit that produced D1. Both were then run by the
+operator from normal terminals, on aarch64-darwin and on NixOS, and both pass.
+
+1. **Tier 2 goldens: generated on each platform, and the diff was EMPTY apart from
+   the new case.** That last part is the load-bearing result, not a formality: it
+   says the change adds nothing to any profile when the flag is unused. Verified
+   from the committed tree:
+   - `test/snapshots/linux/allow-socket` is byte-identical to `linux/baseline`
+     (`cmp -s` silent). The identity IS the assertion, the way `linux/pasteboard`
+     already works -- the flag is a no-op on Linux.
+   - `test/snapshots/darwin/allow-socket` is `darwin/baseline` plus exactly one
+     line, `(allow network-outbound (subpath "<HOME>/sockets"))`, in the right
+     place: after the own_roots/namespace re-allows, before
+     `(deny mach-priv-task-port)`.
+   - The darwin goldens carry `<VARTMP>`, which is the D1 canary: generated inside
+     a sandbox they would have lost it to the `getconf` fallback. Independent
+     confirmation they came from a host, on top of the `CSB_SANDBOX` guard.
+   - The goldens were NOT hand-written. Hand-patched goldens are D1 and D2.
+2. **Tier 3: `make test-escape` passes on BOTH platforms.** Stated precisely,
+   because the two platforms proved different things and the difference is the
+   design:
+   - macOS proved the capability: `usable.bats` connects to a named host socket
+     that `escape.bats` separately shows is unreachable without the flag. That
+     positive/negative pair is what Part 7 required, and it is the assertion that
+     stops the flag rotting into a silent no-op.
+   - Linux proved nothing new about the flag, correctly -- the assertion skips
+     there because the no-op has nothing to exercise. What Linux did prove is that
+     F4 stays closed with the D9 refusal in place.
+   - The pre-existing F1/F2/F3/PB assertions still pass on macOS, so neither the
+     new emission nor the shared broker list disturbed the class denies.
+
+Tier 1 additions pass on both platforms (`make test`, 89 up from 81): one
+accumulation test, and five validation tests covering the D9 refusal, the broker
+refusal by both spellings, the shared-root refusal, and the positive control that a
+socket under a shared root is accepted.
+
+**What is still unmeasured, and it is one thing.** A socket under a tree
+`--paranoid` read-denies (the real HOME) gets its `network-outbound` allow but no
+read allow, and whether that suffices was never measured -- Part 8 routes it to the
+relay instead of guessing. Nothing in the shipped tests covers it, because nothing
+should until it is measured. Everything else in this amendment is now measured on
+the platform where it does something.
+
+### Touch points, as built
+
+Same shape as the table in Part 7. `--allow-socket` / `allow_socket=` capture,
+`--dump-config` emit, the `--no-sandbox` inert-list warning, and the unknown-key
+list all mirror `allow_write`. New in bin/csb: `canon_path`, `path_in_list`
+(equality, next to `paths_overlap`), `build_ipc_brokers`, `refuse_ipc_brokers`,
+`build_socket_allows`,
+the darwin emission inside the existing `network-outbound` block, and the Linux
+tmpfs loop now iterating the shared broker list instead of an inline literal one.
+README: the socket paragraph in the threat model, the lists table, the profile-key
+example, the `.local` accumulation list. The suite's "four lists" became five.

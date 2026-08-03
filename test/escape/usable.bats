@@ -58,6 +58,27 @@ csb_run() {
   assert_output --partial "ip_address"
 }
 
+@test "usable: --allow-socket reaches a named HOST unix socket" {
+  # The flag's own point, and the other half of escape.bats' "/tmp stays denied":
+  # a dev setup built on unix sockets (postgres .s.PGSQL.5432) is unreachable
+  # under the network-outbound class deny until the operator names the path.
+  # Without this assertion the flag can rot to a silent no-op.
+  [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux leaves such sockets reachable)"
+  command -v nc >/dev/null 2>&1 || skip "no nc"
+  # AF_UNIX paths are capped near 104 bytes, so keep it short and out of TMPDIR.
+  local hostsock="/tmp/csb-as-host.$$"
+  rm -f "$hostsock"
+  /usr/bin/nc -lU "$hostsock" >/dev/null 2>&1 &
+  local listener=$!
+  sleep 1
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$REPO" \
+    "$CSB" -s -E --here --allow-socket "$hostsock" -- \
+    bash -c 'echo hi | /usr/bin/nc -U '"$hostsock"'; echo "named=$?"'
+  kill "$listener" 2>/dev/null || true
+  rm -f "$hostsock"
+  assert_output --partial "named=0"
+}
+
 @test "usable: outbound TCP+TLS to the claude API works" {
   # The point of re-allowing IP egress under the network-outbound deny. Any HTTP
   # status proves DNS + TCP + TLS; the endpoint 404s without a token, and curl

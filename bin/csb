@@ -21,7 +21,7 @@
 set -euo pipefail
 
 PROG=$(basename "$0")
-CSB_VERSION="0.3.0"
+CSB_VERSION="0.3.1"
 
 # csb supplies the claude binary from its own flake (so repos stay decoupled).
 # Default: the public GitHub remote. For local dev against a working tree,
@@ -53,8 +53,9 @@ open, so local services over TCP stay reachable; host IPC does not — mach/XPC
 and every HOST unix socket on macOS, the session/system bus and the nix daemon
 socket on Linux — so a host service cannot act outside the sandbox on the
 sandbox's behalf. Unix sockets inside the sandbox's own trees (worktree, git
-dir, launch HOME) still work. See the README's threat model, and 'Known gaps'
-for what is still open.
+dir, launch HOME) still work, and a host socket can be named with
+--allow-socket / a profile's allow_socket=. See the README's threat model, and
+'Known gaps' for what is still open.
 
 OPTIONS:
   -y, --yolo         pass --dangerously-skip-permissions to claude (allow-all)
@@ -130,6 +131,14 @@ OPTIONS:
                      the built-in floor; also via a profile's deny_read=.
       --allow-write PATH also make PATH writable, and thus readable under
                      --paranoid (both modes). Repeatable; profile allow_write=.
+      --allow-socket PATH  also allow connecting to the unix socket at PATH (a
+                     directory allows the sockets under it). For a dev service
+                     the sandbox must reach over a socket rather than TCP, e.g.
+                     allow_socket=/tmp/.s.PGSQL.5432 for postgres. macOS only --
+                     a no-op on Linux, where such sockets are already reachable.
+                     Refused for the IPC broker paths csb closes and for a whole
+                     shared write root like /tmp. Repeatable; profile
+                     allow_socket=.
       --paranoid-deny-read PATH  under --paranoid only, additionally read-deny
                      PATH (e.g. a tree outside HOME like /Volumes). Repeatable;
                      profile paranoid_deny_read=.
@@ -160,8 +169,8 @@ OPTIONS:
                      ephemeral=, shell=, nix_target=, nix_target_shell=,
                      nix_target_claude=,
                      seed_creds=, seed_home=, accent=, args=, keep=, setenv=,
-                     deny_read=, allow_write=, paranoid_deny_read=,
-                     paranoid_allow_read=).
+                     deny_read=, allow_write=, allow_socket=,
+                     paranoid_deny_read=, paranoid_allow_read=).
                      A gitignored NAME.local is layered on top for host-specific
                      values (its values win). Explicit CLI flags beat both.
                      Bare '$PROG -p NAME' (no BRANCH) launches --here; plain
@@ -665,6 +674,33 @@ paths_overlap() {
   [[ "$a" == "$b" || "$a" == "$b"/* || "$b" == "$a"/* ]]
 }
 
+# Echo the canonical form of $1 WITHOUT requiring it to exist: realpath the
+# deepest existing ancestor and re-append the rest. Needed because a socket the
+# operator names may not be bound yet at launch (a test suite starts its database
+# later), while the rule still has to be written against the resolved path.
+# `realpath -m` does this in one call but is GNU-only, and the primary install is a
+# plain copy of this script rather than the coreutils-wrapped flake output.
+canon_path() {
+  local p="$1" tail="" r
+  while [[ ! -e "$p" && "$p" != "/" ]]; do
+    tail="/$(basename "$p")$tail"
+    p="$(dirname "$p")"
+  done
+  r="$(realpath "$p")"
+  [[ -n "$tail" && "$r" == "/" ]] && r=""
+  printf '%s\n' "$r$tail"
+}
+
+# True when path $1 is exactly one of $2.. -- equality, NOT containment, so a
+# subdirectory of a listed root does not match (build_socket_allows relies on that
+# distinction: a shared write root is refused, a subdirectory of one is not).
+path_in_list() {
+  local needle="$1"; shift
+  local p
+  for p in "$@"; do [[ "$needle" == "$p" ]] && return 0; done
+  return 1
+}
+
 # Populate the global arrays deny_dirs / deny_files: built-in defaults + the
 # user lists (deny_read=/--deny-read), canonicalized (realpath — seatbelt matches
 # resolved paths; symlinked HOMEs), missing paths skipped, classified dir vs file.
@@ -855,6 +891,87 @@ build_write_roots() {
   done
 }
 
+# Populate the global ipc_brokers: the host IPC broker paths csb removes from the
+# sandbox (docs/PLAN-007-escape.md F3/F4). Linux mounts a tmpfs over each one that
+# exists; macOS closes them with the network-outbound class deny and needs no
+# per-path rule. The list is platform-INDEPENDENT because the refusals below use
+# it too: a profile shared across a mac and a Linux box must fail identically on
+# both, rather than erroring on one host and silently passing on the other.
+build_ipc_brokers() {
+  ipc_brokers=("/run/user/$(id -u)" /run/dbus /nix/var/nix/daemon-socket)
+  # The nix daemon socket is a SYMLINK out of that directory on macOS
+  # (/nix/var/nix/daemon-socket/socket -> /private/var/run/nix-daemon.socket), so
+  # the directory alone does not cover it: naming the link resolves past the
+  # refusal and hands back the F3 socket. Add the resolved target. Harmless in the
+  # Linux tmpfs loop, which mounts only the entries that are directories.
+  ipc_brokers+=("$(canon_path /nix/var/nix/daemon-socket/socket)")
+}
+
+# Die if any path in $2.. overlaps an IPC broker path, comparing BOTH the path as
+# given and its resolved form: a symlink can point into a broker directory, and on
+# macOS the nix daemon socket is a symlink pointing OUT of one. $1 labels the source.
+# On Linux the write binds are emitted AFTER the --tmpfs that removes these, so an
+# overlapping --allow-write would layer the host directory back on top and reopen
+# the session-bus escape (PLAN-007 D9). Refusing beats reordering: a --tmpfs
+# landing on a path the operator asked to be writable is its own confusion, and
+# the boundary is not a knob -- the deny/allow READ lists deliberately do let a
+# later rule win, but the IPC denies have no opt-out except --no-sandbox.
+# Reads the caller's ipc_brokers array (bash dynamic scope).
+refuse_ipc_brokers() {
+  local label="$1"; shift
+  local p rp b
+  for p in "$@"; do
+    rp=$(canon_path "$p")
+    for b in "${ipc_brokers[@]}"; do
+      if paths_overlap "$rp" "$b" || paths_overlap "$p" "$b"; then
+        die "$label '$p' overlaps the IPC broker path '$b' (csb closes it unconditionally; --no-sandbox is the only way back)"
+      fi
+    done
+  done
+  return 0
+}
+
+# Populate the globals socket_subpaths / socket_literals from allow_socket_paths:
+# unix sockets the operator named, which the macOS network-outbound class deny
+# would otherwise cut (PLAN-007 amendment Part 7). Consumes write_roots/own_roots
+# (build_write_roots) and ipc_brokers (build_ipc_brokers).
+#
+# A DIRECTORY becomes a subpath and anything else a literal, matching
+# build_deny_paths' split -- except that a path which does not exist YET is also
+# treated as a directory, so a socket dir the test suite creates on boot is
+# covered rather than silently emitting a rule that can never match. Each path is
+# emitted in BOTH spellings when they differ: seatbelt matches the resolved path
+# (/tmp -> /private/tmp), so the realpath form is the load-bearing one, and the
+# as-given form is the cheap half of the same lesson the mDNSResponder pair
+# records. Repeated allows are idempotent in seatbelt.
+build_socket_allows() {
+  socket_subpaths=(); socket_literals=()
+  local p rp
+  refuse_ipc_brokers "allow_socket" "${allow_socket_paths[@]+"${allow_socket_paths[@]}"}"
+  for p in "${allow_socket_paths[@]+"${allow_socket_paths[@]}"}"; do
+    rp=$(canon_path "$p")
+    case "$rp" in
+      *'"'*|*\\*) die "allow_socket path contains a double quote or backslash (unsupported): $rp" ;;
+    esac
+    # A whole SHARED write root is refused: /tmp and the per-user temp dir are
+    # writable but shared with the host, so a subpath over one makes host sockets
+    # reachable again -- measured, and the reason own_roots exists. A socket FILE
+    # or a subdirectory under them is one named thing and is allowed.
+    if [[ -d "$rp" ]] \
+       && path_in_list "$rp" "${write_roots[@]+"${write_roots[@]}"}" \
+       && ! path_in_list "$rp" "${own_roots[@]+"${own_roots[@]}"}"; then
+      die "allow_socket '$p' is a shared write root (name a socket or a subdirectory under it, not the whole tree)"
+    fi
+    if [[ -d "$rp" || ! -e "$rp" ]]; then
+      socket_subpaths+=("$rp")
+      [[ "$rp" == "$p" ]] || socket_subpaths+=("$p")
+    else
+      socket_literals+=("$rp")
+      [[ "$rp" == "$p" ]] || socket_literals+=("$p")
+    fi
+  done
+}
+
 # macOS seatbelt: re-allow traversal of the DENIED ancestor directories of $1,
 # walking parent-ward and stopping at the first ancestor under no deny root
 # (above that they are already reachable). A subtree re-allowed beneath a denied
@@ -894,6 +1011,12 @@ build_deny_wrapper() {
   deny_wrapper=()
   build_deny_paths
   build_write_roots
+  local -a ipc_brokers=() socket_subpaths=() socket_literals=()
+  build_ipc_brokers
+  # A write root may not re-open a broker path csb closes (PLAN-007 D9), and
+  # neither may an allow_socket (checked inside build_socket_allows).
+  refuse_ipc_brokers "allow_write" "${allow_write_paths[@]+"${allow_write_paths[@]}"}"
+  build_socket_allows
   local ns_real="" gc_real="" hooks_deny="" config_deny="" cfgwt_deny="" \
         wt_gitdir="" wt_cfgwt_deny="" real_home
   real_home=$(realpath "$HOME")
@@ -1041,6 +1164,17 @@ build_deny_wrapper() {
           [[ -n "$p" ]] || continue
           printf '(allow network-outbound (subpath "%s"))\n' "$p"
         done
+        # --allow-socket / allow_socket=: host sockets the operator named, for a
+        # dev setup built on unix sockets (a postgres .s.PGSQL.5432) that TCP would
+        # otherwise be the only way to reach. Scoped to those paths and nothing
+        # else; build_socket_allows refuses the broker paths and the shared write
+        # roots, so neither this flag nor a profile can undo the class deny.
+        for p in "${socket_subpaths[@]+"${socket_subpaths[@]}"}"; do
+          printf '(allow network-outbound (subpath "%s"))\n' "$p"
+        done
+        for p in "${socket_literals[@]+"${socket_literals[@]}"}"; do
+          printf '(allow network-outbound (literal "%s"))\n' "$p"
+        done
         echo "(deny mach-priv-task-port)"
         echo "(deny iokit-open)"
         # READ policy: deny-list (later rules win; the active namespace is
@@ -1124,9 +1258,15 @@ build_deny_wrapper() {
       # per-path, and therefore NOT complete (see the README's Known gaps:
       # abstract sockets are network-namespace scoped and unreachable this way).
       # Skipped when absent: bwrap cannot mkdir a mountpoint under the ro root.
-      for p in "/run/user/$(id -u)" /run/dbus /nix/var/nix/daemon-socket; do
+      for p in "${ipc_brokers[@]}"; do
         [[ -d "$p" ]] && deny_wrapper+=(--tmpfs "$p")
       done
+      # --allow-socket is a deliberate NO-OP here: every path it can name is
+      # already reachable, since a ro bind does not block connect() and the
+      # brokers above are refused. The one exception is a socket under a tree a
+      # tmpfs removes (the real HOME under --paranoid, a paranoid_deny_read root);
+      # no bind is emitted to bring it back, because that is exactly the silent
+      # re-open D9 fixes. Relay such a socket into the worktree instead.
       # PARANOID reads: blank the real HOME; the write-root binds below (and the
       # namespace bind) re-expose exactly what the devShell needs to read.
       [[ "$paranoid" == "true" ]] && deny_wrapper+=(--tmpfs "$real_home")
@@ -1175,8 +1315,9 @@ build_deny_wrapper() {
 
 # --- profiles ---------------------------------------------------------------------
 #
-# Read/write lists are profile vars (deny_read=, allow_write=, paranoid_deny_read=,
-# paranoid_allow_read=) + the matching CLI flags; the tmp dir is CSB_TMPDIR. The
+# Read/write/socket lists are profile vars (deny_read=, allow_write=, allow_socket=,
+# paranoid_deny_read=, paranoid_allow_read=) + the matching CLI flags; the tmp dir
+# is CSB_TMPDIR. The
 # old machine-wide config (~/.config/csb/{config,deny,allow-write}) is no longer
 # read.
 
@@ -1242,6 +1383,7 @@ apply_profile_line() {
     keep)        p_keep+=" $val" ;;
     deny_read)           deny_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: deny_read")") ;;
     allow_write)         allow_write_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: allow_write")") ;;
+    allow_socket)        allow_socket_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: allow_socket")") ;;
     paranoid_deny_read)  paranoid_deny_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: paranoid_deny_read")") ;;
     paranoid_allow_read) paranoid_allow_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: paranoid_allow_read")") ;;
     setenv)
@@ -1249,7 +1391,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, paranoid_deny_read, paranoid_allow_read)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, allow_socket, paranoid_deny_read, paranoid_allow_read)" ;;
   esac
 }
 
@@ -1430,6 +1572,7 @@ reseed="false"      # --reseed: overwrite existing files when seeding the HOME
 cfg_tmpdir="${CSB_TMPDIR:-}"  # host scratch/temp dir (was config tmpdir=)
 deny_read_paths=()           # --deny-read / profile deny_read=: extra read denies (both modes)
 allow_write_paths=()         # --allow-write / profile allow_write=: extra write roots (both modes)
+allow_socket_paths=()        # --allow-socket / profile allow_socket=: reachable unix sockets (macOS; no-op on Linux)
 paranoid_deny_read_paths=()  # --paranoid-deny-read / profile paranoid_deny_read=: extra denies (paranoid)
 paranoid_allow_read_paths=() # --paranoid-allow-read / profile paranoid_allow_read=: read re-allows (paranoid)
 seed_home=""        # --seed-home / profile seed_home=; empty -> ~/.config/csb/home
@@ -1508,6 +1651,8 @@ while [[ $# -gt 0 ]]; do
       deny_read_paths+=("$(normalize_list_path "$2" "--deny-read")"); shift 2 ;;
     --allow-write) [[ $# -ge 2 && -n "$2" ]] || die "--allow-write requires a PATH"
       allow_write_paths+=("$(normalize_list_path "$2" "--allow-write")"); shift 2 ;;
+    --allow-socket) [[ $# -ge 2 && -n "$2" ]] || die "--allow-socket requires a PATH"
+      allow_socket_paths+=("$(normalize_list_path "$2" "--allow-socket")"); shift 2 ;;
     --paranoid-deny-read) [[ $# -ge 2 && -n "$2" ]] || die "--paranoid-deny-read requires a PATH"
       paranoid_deny_read_paths+=("$(normalize_list_path "$2" "--paranoid-deny-read")"); shift 2 ;;
     --paranoid-allow-read) [[ $# -ge 2 && -n "$2" ]] || die "--paranoid-allow-read requires a PATH"
@@ -1584,9 +1729,10 @@ fi
 # are inert. They commonly ride in from a profile, so note rather than error.
 if [[ "$sandbox" != "true" ]]; then
   if [[ "$paranoid" == "true" || ${#deny_read_paths[@]} -gt 0 || ${#allow_write_paths[@]} -gt 0 \
+        || ${#allow_socket_paths[@]} -gt 0 \
         || ${#paranoid_deny_read_paths[@]} -gt 0 || ${#paranoid_allow_read_paths[@]} -gt 0 ]]; then
     echo "$PROG: warning: --no-sandbox drops the filesystem sandbox; --paranoid and the" >&2
-    echo "  deny-read / allow-write lists have no effect in this mode" >&2
+    echo "  deny-read / allow-write / allow-socket lists have no effect in this mode" >&2
   fi
 fi
 
@@ -1691,6 +1837,7 @@ if [[ "$dump" == "config" ]]; then
   printf 'setenv=%s\n'              "$(join_bar "${dump_setenv_names[@]+"${dump_setenv_names[@]}"}")"
   printf 'deny_read=%s\n'           "$(join_bar "${deny_read_paths[@]+"${deny_read_paths[@]}"}")"
   printf 'allow_write=%s\n'         "$(join_bar "${allow_write_paths[@]+"${allow_write_paths[@]}"}")"
+  printf 'allow_socket=%s\n'        "$(join_bar "${allow_socket_paths[@]+"${allow_socket_paths[@]}"}")"
   printf 'paranoid_deny_read=%s\n'  "$(join_bar "${paranoid_deny_read_paths[@]+"${paranoid_deny_read_paths[@]}"}")"
   printf 'paranoid_allow_read=%s\n' "$(join_bar "${paranoid_allow_read_paths[@]+"${paranoid_allow_read_paths[@]}"}")"
   exit 0

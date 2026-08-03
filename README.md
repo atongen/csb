@@ -248,6 +248,7 @@ keep=COLORTERM DIRENV_LOG_FORMAT          # space-separated, appended to --keep
 setenv=CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1 # repeatable; injected post-scrub
 deny_read=~/notes                         # as --deny-read: extra read deny (both modes); repeatable
 allow_write=~/scratch                     # as --allow-write: extra write root (both modes); repeatable
+allow_socket=/tmp/.s.PGSQL.5432           # as --allow-socket: reachable unix socket (macOS); repeatable
 paranoid_deny_read=/Volumes               # as --paranoid-deny-read: extra deny under --paranoid; repeatable
 paranoid_allow_read=~/ref                 # as --paranoid-allow-read: re-expose read-only under --paranoid;
                                           # repeatable; rejected if it overlaps a deny
@@ -262,7 +263,8 @@ and `seed_creds=` is ignored with a warning (a shell runs no claude).
 **Host-specific overlay.** A profile `NAME` can have a sibling, gitignored
 `NAME.local` layered on top after it is read: same syntax/sections, but its
 scalar values win and its list values (`keep=`, `setenv=`, `deny_read=`,
-`allow_write=`, `paranoid_deny_read=`, `paranoid_allow_read=`) accumulate.
+`allow_write=`, `allow_socket=`, `paranoid_deny_read=`, `paranoid_allow_read=`)
+accumulate.
 Commit portable profiles
 to a dotfiles repo; keep host-specific values (a `token_cmd=` path, a
 `seed_home=`) in the uncommitted `.local`. Precedence: base -> `.local`
@@ -574,13 +576,14 @@ not the symlinked path, that determines what leaks.
 
 ### Where the lists live
 
-All four read/write lists are set per launch, via CLI flags or profile vars
+All five read/write/socket lists are set per launch, via CLI flags or profile vars
 (no machine-wide config file) -- add-only, absolute or leading-`~/` paths:
 
 | List | CLI flag | Profile var | Modes |
 |---|---|---|---|
 | extra read deny | `--deny-read` | `deny_read=` | both |
 | extra write root | `--allow-write` | `allow_write=` | both |
+| reachable unix socket (macOS) | `--allow-socket` | `allow_socket=` | both |
 | extra paranoid read deny | `--paranoid-deny-read` | `paranoid_deny_read=` | `--paranoid` |
 | paranoid read re-allow (read-only) | `--paranoid-allow-read` | `paranoid_allow_read=` | `--paranoid` |
 
@@ -763,17 +766,34 @@ system-configured HTTP proxies all become unreachable in-sandbox. Authenticate
 with `--seed-creds` or `CLAUDE_CODE_OAUTH_TOKEN`.
 
 Unix sockets need stating precisely, because the class deny is blunt: a socket
-anywhere **outside** the sandbox's own trees is unreachable, whether or not the
-thing listening is yours. A postgres or redis on a socket in `/tmp`, a tmux
-server, `ssh-agent`, `docker.sock` -- all unreachable. TCP to localhost is
+anywhere **outside** the sandbox's own trees is unreachable by default, whether or
+not the thing listening is yours. A postgres or redis on a socket in `/tmp`, a
+tmux server, `ssh-agent`, `docker.sock` -- all unreachable. TCP to localhost is
 unaffected, which covers most local services. Sockets **inside** the sandbox's
 own trees (the worktree, the git dir, the launch HOME) do work, so a Rails
 `tmp/sockets/puma.sock`, `spring`, or an in-tree `pg_ctl -k` behaves normally:
 those trees are created and owned by the sandbox, so a socket there is one the
 sandbox itself made. `/tmp` and the per-user temp dir are writable but *shared
-with the host*, so they stay denied -- re-allowing them was measured to make a
-host-side socket reachable again, which is the nix-daemon hole reopening under a
-different name.
+with the host*, so they stay denied -- re-allowing them wholesale was measured to
+make a host-side socket reachable again, which is the nix-daemon hole reopening
+under a different name.
+
+Name the exceptions with `--allow-socket PATH` (repeatable) or a profile's
+`allow_socket=`. A directory allows the sockets under it; a path that does not
+exist yet is treated as one, so a socket the test suite creates on boot is
+covered. This is the flag for a dev setup built on unix sockets rather than TCP
+-- `allow_socket=/tmp/.s.PGSQL.5432` makes an in-sandbox `psql` with no `host:`
+work, and the same profile line is a no-op on Linux, where such sockets are
+already reachable. Two things it will not do, both refused with an error rather
+than silently ignored: it cannot name a whole shared write root (`/tmp`, the
+per-user temp dir), only a socket or a subdirectory under one; and it cannot name
+a path csb closes -- the nix daemon socket by either spelling, `/run/user/<uid>`,
+`/run/dbus`. `--allow-write` is refused for those same broker paths, since on
+Linux a write bind would otherwise be layered back over the tmpfs that removes
+them. Widening this is a real decision: naming `docker.sock`, `ssh-agent`, or a
+tmux socket hands back a broker that can act as you, outside the sandbox. On
+Linux a socket under a tree `--paranoid` blanks (the real HOME, a
+`paranoid_deny_read` root) stays unreachable and this flag does not change that.
 
 One gap is open and cannot be closed here. macOS exposes every same-uid
 process's argv *and environment* via `sysctl kern.procargs2`, so a sandboxed
