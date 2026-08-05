@@ -8,7 +8,7 @@
 # Usage: csb --help    Design, threat model, and config: README.md and docs/.
 #
 # Env: CSB_SELF   flake ref csb pulls the claude binary from (default: the
-#                 public GitHub remote; override with CSB_SELF=path:/path/to/csb).
+#                 private remote; override with CSB_SELF=path:/path/to/csb).
 #      CSB_LATEST non-empty defaults -L/--latest on.
 #      CSB_LATEST_TTL seconds to reuse a cached upstream claude-code rev under
 #                 -L/--latest before re-checking (default 86400 = daily; 0 =
@@ -24,9 +24,9 @@ PROG=$(basename "$0")
 CSB_VERSION="0.3.1"
 
 # csb supplies the claude binary from its own flake (so repos stay decoupled).
-# Default: the public GitHub remote. For local dev against a working tree,
+# Default: the private remote. For local dev against a working tree,
 # override: CSB_SELF=path:/path/to/csb csb ...
-CSB_SELF="${CSB_SELF:-github:atongen/csb}"
+CSB_SELF="${CSB_SELF:-git+ssh://git@git.grandrew.com/atongen/csb.git}"
 
 CSB_NS_ROOT="$HOME/.csb/claudes"
 CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"

@@ -41,10 +41,10 @@ back to a generic devShell otherwise (see [What a repo needs](#what-a-repo-needs
 The claude binary comes from *csb's own* flake; the repo never imports csb.
 
 > **Status.** Verified end-to-end on `aarch64-darwin` (seatbelt) and on NixOS
-> (bubblewrap). Published at `github:atongen/csb`, which is `CSB_SELF`'s default,
-> so `make install` and `nix run github:atongen/csb` work out of the box. Override
-> `CSB_SELF` (`CSB_SELF=path:/path/to/csb`) only for local development against a
-> working tree.
+> (bubblewrap). **Not published:** csb lives on a private remote, which is
+> `CSB_SELF`'s default, and nix must be able to fetch it (ssh access) at launch.
+> Override `CSB_SELF` (`CSB_SELF=path:/path/to/csb`) for local development
+> against a working tree, or point it at your own fork's remote.
 >
 > **Use at your own risk.** This is a single-maintainer tool with no stability
 > promise and no security guarantee (MIT, no warranty -- see `LICENSE`). Flags,
@@ -69,8 +69,9 @@ box); `csb` shells out to `nix`.
 Five environment variables tune csb:
 
 - **`CSB_SELF`** -- the flake ref csb pulls its claude binary (and, on Linux,
-  bubblewrap) from. Defaults to the public GitHub remote `github:atongen/csb`.
-  For local development against a working tree, override per-invocation:
+  bubblewrap) from. Defaults to the private remote
+  `git+ssh://git@git.grandrew.com/atongen/csb.git`, so a launch needs ssh access
+  to it. For local development against a working tree, override per-invocation:
   `CSB_SELF=path:/path/to/csb csb ...`.
 - **`CSB_LATEST`** -- if set (non-empty), defaults `-L/--latest` on: re-lock the
   `claude-code` flake input to its upstream HEAD instead of the rev pinned in
@@ -862,8 +863,11 @@ For a project-specific toolchain, expose a standard `flake.nix` with
 fallback. Scaffold a minimal standalone dev flake with:
 
 ```sh
-nix flake init -t github:atongen/csb
+nix flake init -t "$CSB_SELF"
 ```
+
+(the same command `csb` prints when a repo has no `devShells.default`; `CSB_SELF`
+defaults to the private remote -- see [Environment](#quickstart))
 
 csb dogfoods itself: its own `flake.nix` exposes a `devShells.default` (git +
 shellcheck), so `csb --here` runs claude on the csb repo like any other.

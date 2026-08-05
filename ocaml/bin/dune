@@ -1,0 +1,3 @@
+(executable
+ (name csb_config_cli)
+ (libraries csb_config))

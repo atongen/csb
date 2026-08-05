@@ -17,10 +17,15 @@ DEST    := $(BIN_DIR)/csb
 
 # Flake ref csb pulls the claude binary from; mirrors bin/csb's CSB_SELF default.
 # Override to refresh a different remote: make refresh CSB_SELF=path:/path/to/csb
-CSB_SELF ?= github:atongen/csb
+CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check test test-escape test-update build update refresh
+.PHONY: help install uninstall check test test-escape test-update build update refresh \
+        ocaml-build ocaml-test
+
+# The OCaml config-resolution layer (docs/PLAN-007-agent-sandbox-again.md s13).
+OCAML_DIR  := ocaml
+CSB_CONFIG := $(OCAML_DIR)/_build/default/bin/csb_config_cli.exe
 
 help: ## Show this help
 	@echo "csb — targets (override BIN_DIR to change the install location):"
@@ -74,6 +79,22 @@ test-update: ## Regenerate the Tier 2 snapshot goldens for THIS platform
 		nix develop --command env SNAPSHOT_UPDATE=1 bats test/; \
 	fi
 	@echo "test-update: regenerated test/snapshots/$$(uname -s | tr 'A-Z' 'a-z')/ - review the diff"
+
+ocaml-build: ## Build csb-config (dune, ocaml/)
+	@if command -v dune >/dev/null 2>&1; then \
+		dune build --root $(OCAML_DIR); \
+	else \
+		nix develop --command dune build --root $(OCAML_DIR); \
+	fi
+	@echo "ocaml-build: $(CSB_CONFIG)"
+
+ocaml-test: ocaml-build ## Config-layer oracle: the bats config tests against csb-config
+	@echo "ocaml-test: WIP - fails until csb-config parses flags/profiles"
+	@if command -v bats >/dev/null 2>&1; then \
+		CSB=$(CSB_CONFIG) bats test/precedence.bats test/lists.bats; \
+	else \
+		nix develop --command env CSB=$(CSB_CONFIG) bats test/precedence.bats test/lists.bats; \
+	fi
 
 build: ## Build the csb package from the flake (nix build .#csb)
 	@nix build .#csb

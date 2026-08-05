@@ -7,6 +7,8 @@
 !/templates/home/.claude/
 # nix build output
 result
+# dune build tree for bin/csb-config
+/ocaml/_build/
 # captured output of the manual probe harnesses: host-specific, and the results
 # that matter are transcribed into docs/PLAN-007-escape.md. The .sh harnesses
 # themselves ARE tracked -- they are the reproduction.

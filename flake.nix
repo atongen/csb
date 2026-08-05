@@ -61,7 +61,21 @@
               # bats + assertion libraries for `make test` (docs/PLAN-005-tests.md).
               # withLibraries sets BATS_LIB_PATH so `bats_load_library` resolves them.
               (pkgs.bats.withLibraries (p: [ p.bats-support p.bats-assert ]))
+
+              # OCaml toolchain for the config-resolution layer under ocaml/
+              # (docs/PLAN-007-agent-sandbox-again.md section 13). cmdliner is the
+              # CLI parser; yojson emits the JSON handoff the nix side consumes.
+              pkgs.ocamlPackages.ocaml
+              pkgs.dune_3
+              pkgs.ocamlPackages.cmdliner
+              pkgs.ocamlPackages.yojson
+              pkgs.ocamlformat
             ];
+
+            # dune resolves cmdliner/yojson through OCAMLPATH.
+            OCAMLPATH = pkgs.lib.makeSearchPath
+              "lib/ocaml/${pkgs.ocamlPackages.ocaml.version}/site-lib"
+              [ pkgs.ocamlPackages.cmdliner pkgs.ocamlPackages.yojson ];
 
             # `csb -s` launches a fresh interactive bash with a redirected HOME,
             # so expose the bash-completion entry script for an interactive rc to

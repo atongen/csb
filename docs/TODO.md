@@ -82,12 +82,14 @@
       non-overwriting (`--reseed` to overwrite). Seeds before the onboarding
       .claude.json so a template-provided one is merged. See README "Seeding the
       sandbox HOME". (env/auth config was already covered by profiles.)
-- [x] publish to the public distribution home. DONE: the repo is pushed to
-      `github.com/atongen/csb`, which is CSB_SELF's default (bin/csb, Makefile,
-      flake template hint, README), so `make install` and `nix run
-      github:atongen/csb` work out of the box for outside users. A CSB_SELF
-      override (a local `path:` checkout) is now only needed for local
-      development against a working tree.
+- [x] publish to the public distribution home. DONE, then REVERSED (2026-08-05):
+      csb is not published. CSB_SELF's default (bin/csb, Makefile, README, flake
+      template hint) is the private remote
+      `git+ssh://git@git.grandrew.com/atongen/csb.git`, so a launch needs ssh
+      access to it; a `path:` override remains the way to run against a local
+      working tree. Reason: the agent-sandbox rebase is proceeding without
+      resolving that project's AI-use license clause, so the tool stays private
+      and unredistributed -- see docs/PLAN-007-agent-sandbox-again.md section 0.
 - [ ] revisit the deny-list defaults after the first month of use (blacklist
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch
