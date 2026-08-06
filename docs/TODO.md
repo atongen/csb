@@ -87,9 +87,10 @@
       template hint) is the private remote
       `git+ssh://git@git.grandrew.com/atongen/csb.git`, so a launch needs ssh
       access to it; a `path:` override remains the way to run against a local
-      working tree. Reason: the agent-sandbox rebase is proceeding without
-      resolving that project's AI-use license clause, so the tool stays private
-      and unredistributed -- see docs/PLAN-007-agent-sandbox-again.md section 0.
+      working tree. Reason: operator choice -- csb stays private and
+      unredistributed for now, and licensing implications are deferred (the
+      agent-sandbox rebase that raised the question was since rejected on
+      technical grounds). See docs/PLAN-007-agent-sandbox-again.md appendix A.1.
 - [ ] revisit the deny-list defaults after the first month of use (blacklist
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch

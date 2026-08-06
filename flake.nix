@@ -63,8 +63,8 @@
               (pkgs.bats.withLibraries (p: [ p.bats-support p.bats-assert ]))
 
               # OCaml toolchain for the config-resolution layer under ocaml/
-              # (docs/PLAN-007-agent-sandbox-again.md section 13). cmdliner is the
-              # CLI parser; yojson emits the JSON handoff the nix side consumes.
+              # (docs/PLAN-007-agent-sandbox-again.md section 9). cmdliner is a
+              # candidate CLI parser; yojson serializes the bash <-> OCaml seam.
               pkgs.ocamlPackages.ocaml
               pkgs.dune_3
               pkgs.ocamlPackages.cmdliner

@@ -1,5 +1,5 @@
 (* csb-config -- csb's config-resolution layer (docs/PLAN-007-agent-sandbox-again.md
-   section 13).
+   section 9).
 
    Milestone 1 (this file): emit the resolved DEFAULT config in bin/csb's
    --dump-config wire format, so the two implementations can be diffed for the

@@ -23,7 +23,7 @@ CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
 .PHONY: help install uninstall check test test-escape test-update build update refresh \
         ocaml-build ocaml-test
 
-# The OCaml config-resolution layer (docs/PLAN-007-agent-sandbox-again.md s13).
+# The OCaml config-resolution layer (docs/PLAN-007-agent-sandbox-again.md s9).
 OCAML_DIR  := ocaml
 CSB_CONFIG := $(OCAML_DIR)/_build/default/bin/csb_config_cli.exe
 
