@@ -1,0 +1,65 @@
+# Default egress allowlist for csb-proxy: the hosts Claude Code needs.
+#
+# Derived from Anthropic's documented network requirements, not guessed:
+# https://code.claude.com/docs/en/network-config
+# Rationale per host, and the droppable ones, are in
+# docs/PLAN-007-agent-sandbox-again.md section 9a.
+#
+# Format: one host per line; `#` comments and blank lines ignored. A leading
+# `*.` matches subdomains only, so list a bare parent domain separately when it
+# is also wanted.
+#
+# Transitional: this becomes the built-in default (config layer 1) once
+# csb-config owns config resolution. Until then csb-proxy reads it directly, and
+# it is re-read only at startup.
+
+# --- required -----------------------------------------------------------------
+# API requests, WebFetch domain safety check, feature flags.
+api.anthropic.com
+# OAuth token exchange, refresh and revocation. Required even for claude.ai
+# sign-ins -- omitting it yields a session that dies when the token expires.
+platform.claude.com
+
+# --- required when seeding host session credentials (--seed-creds) ------------
+claude.ai
+
+# --- recommended: documentation lookups --------------------------------------
+# claude-code-guide and pre-approved WebFetch requests.
+code.claude.com
+claude.com
+
+# --- optional ----------------------------------------------------------------
+# /release-notes changelog feed.
+raw.githubusercontent.com
+# Plugin metadata for /plugin; signed artifact uploads.
+storage.googleapis.com
+
+# --- opt in if you use claude.ai MCP connectors ------------------------------
+# claude.ai-hosted MCP connectors (mcp__claude_ai_* tools) route through this
+# host; with it denied they fail. Uncomment to enable them, or set
+# ENABLE_CLAUDEAI_MCP_SERVERS=false so nothing attempts it.
+# mcp-proxy.anthropic.com
+
+# This list assumes the companion env below. Without it claude ATTEMPTS the
+# omitted hosts and surfaces a denial as a user-visible error -- a measured
+# example: denying downloads.claude.ai produces a persistent
+# "Auto-update failed - Run claude doctor" banner. Keep the two in sync, or a
+# tight allowlist trains you to ignore real errors.
+#
+#   DISABLE_AUTOUPDATER=1                        # downloads.claude.ai
+#   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1   # the datadoghq.com hosts
+#   ENABLE_CLAUDEAI_MCP_SERVERS=false            # mcp-proxy.anthropic.com
+#                                                # (omit if you want connectors)
+#
+# Deliberately NOT listed (see section 9a). Each was OBSERVED being attempted
+# and denied in a real session (2026-08-06):
+#   downloads.claude.ai            update check; csb pins claude via nix, so an
+#                                  update would target a read-only store path
+#   http-intake.logs.us5.datadoghq.com   telemetry
+#   mcp.us5.datadoghq.com          telemetry; NOT in Anthropic's documented
+#                                  host table -- found only by running this
+# Documented but never attempted here:
+#   browser-intake-us5-datadoghq.com  error reports (rollout-gated)
+#   formulae.brew.sh               homebrew installs only
+#   registry.npmjs.org             npm/bun installs only
+#   bridge.claudeusercontent.com   Claude in Chrome

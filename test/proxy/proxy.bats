@@ -94,3 +94,52 @@ have_net() {
   run via_proxy https://comment/
   [[ "$output" == *403* ]]
 }
+
+# A denied CONNECT reaches the agent only as an opaque transport error, so the
+# decision log has to be readable from inside the sandbox for it to self-diagnose.
+@test "--log-file adds a sandbox-readable sink without silencing stderr" {
+  local d; d="$(mktemp -d "${TMPDIR:-/tmp}/csb-proxy-logtest.XXXXXX")"
+  printf 'api.anthropic.com\n' >"$d/allow"
+  mkfifo "$d/f"
+  "$PROXY" "$d/allow" --log-file "$d/decisions" >"$d/out" 2>"$d/stderr" &
+  local pid=$! port
+  # stdout is the port channel, so read it directly rather than via the fifo.
+  until [[ -s "$d/out" ]]; do :; done
+  port="$(head -1 <"$d/out")"
+  curl -sS -x "http://127.0.0.1:$port" -o /dev/null --max-time 20 \
+    https://nixos.org/ 2>/dev/null || true
+  kill "$pid" 2>/dev/null
+  # the agent-readable sink has it...
+  grep -q 'DENY host not allowed: nixos.org' "$d/decisions"
+  # ...and the operator still sees it live on stderr
+  grep -q 'DENY host not allowed: nixos.org' "$d/stderr"
+  # the real invariant: stdout carries ONLY the port
+  [[ "$(wc -l <"$d/out" | tr -d ' ')" == "1" ]]
+  [[ "$port" =~ ^[0-9]+$ ]]
+  rm -rf "$d"
+}
+
+# The tunnel must not corrupt or truncate. A buffering or short-write bug in the
+# pump would show up here and nowhere else in this file.
+@test "tunnelled bytes are identical to a direct fetch" {
+  have_net || skip "no network"
+  local url=https://raw.githubusercontent.com/NixOS/nixpkgs/master/pkgs/top-level/all-packages.nix
+  curl -sS --max-time 45 -o "$DIR/direct" "$url"
+  curl -sS -x "http://127.0.0.1:$PORT" --max-time 45 -o "$DIR/proxied" "$url"
+  [[ -s "$DIR/direct" ]]
+  cmp -s "$DIR/direct" "$DIR/proxied"
+}
+
+# claude opens several connections at once; a thread-per-connection bug would
+# serialize or cross-talk here.
+@test "concurrent tunnels all succeed" {
+  have_net || skip "no network"
+  local pids=() rc=0
+  for _ in 1 2 3 4 5 6 7 8; do
+    curl -sS -x "http://127.0.0.1:$PORT" -o /dev/null --max-time 45 \
+      https://raw.githubusercontent.com/NixOS/nixpkgs/master/README.md &
+    pids+=($!)
+  done
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  [[ "$rc" -eq 0 ]]
+}

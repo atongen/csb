@@ -10,6 +10,7 @@
 #   make test-escape                  # Tier 3: real launches, run OUTSIDE csb
 #   make ocaml-build                  # build csb-config + csb-proxy (dune)
 #   make test-proxy                   # egress-proxy tests (real proxy + curl)
+#   make proxy-run                    # run csb-proxy in the foreground
 #
 # `check`/`build` prefer a tool already on PATH and fall back to csb's own
 # devShell (nix develop), so they work with only Nix installed.
@@ -23,12 +24,20 @@ CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
 
 .DEFAULT_GOAL := help
 .PHONY: help install uninstall check test test-escape test-update test-proxy build update refresh \
-        ocaml-build ocaml-test
+        ocaml-build ocaml-test proxy-run
 
 # The OCaml config-resolution layer (docs/PLAN-007-agent-sandbox-again.md s9).
 OCAML_DIR  := ocaml
 CSB_CONFIG := $(OCAML_DIR)/_build/default/bin/csb_config_cli.exe
 CSB_PROXY  := $(OCAML_DIR)/_build/default/bin/csb_proxy_cli.exe
+# Egress allowlist csb-proxy serves; override to test a different set:
+#   make proxy-run PROXY_ALLOW=/tmp/my-hosts
+PROXY_ALLOW ?= templates/allowed-hosts
+# Decision log csb-proxy also writes (stderr keeps streaming either way). A path
+# the SANDBOX can read, so a denied fetch is self-diagnosable rather than an
+# opaque transport error -- see docs/PLAN-007-agent-sandbox-again.md s7 item 4.
+# TMPDIR may or may not carry a trailing slash; normalize either form.
+PROXY_LOG ?= $(patsubst %/,%,$(or $(TMPDIR),/tmp))/csb-proxy.log
 
 help: ## Show this help
 	@echo "csb — targets (override BIN_DIR to change the install location):"
@@ -89,8 +98,16 @@ ocaml-build: ## Build csb-config + csb-proxy (dune, ocaml/)
 	else \
 		nix develop --command dune build --root $(OCAML_DIR); \
 	fi
-	@echo "ocaml-build: $(CSB_CONFIG)"
-	@echo "ocaml-build: $(CSB_PROXY)"
+	@echo "ocaml-build: $(CSB_CONFIG)" >&2
+	@echo "ocaml-build: $(CSB_PROXY)" >&2
+
+proxy-run: ocaml-build ## Run csb-proxy in the foreground (port on stdout, decisions on stderr)
+	@echo "proxy-run: allowlist $(PROXY_ALLOW); the first line below is the port. Ctrl-C to stop." >&2
+	@echo "proxy-run: decisions also logged to $(PROXY_LOG)" >&2
+	@echo "proxy-run: then, in another terminal:" >&2
+	@echo "  export HTTPS_PROXY=http://127.0.0.1:<port> NO_PROXY=localhost,127.0.0.1" >&2
+	@echo "  claude --debug        # /status should show the Proxy row" >&2
+	@exec $(CSB_PROXY) "$(PROXY_ALLOW)" --log-file "$(PROXY_LOG)"
 
 test-proxy: ocaml-build ## Egress-proxy tests (real proxy + curl; not in `make test`)
 	@if command -v bats >/dev/null 2>&1; then \

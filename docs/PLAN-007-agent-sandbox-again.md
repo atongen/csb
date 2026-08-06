@@ -331,6 +331,44 @@ and rewriting the precedence tests twice.
 2. **No HTTP-method filtering** and no plaintext inspection (non-MITM).
 3. **Domain allowlists are coarse.** Allowing `github.com` allows gists and raw.
    An allowlist raises exfiltration cost; it does not close the channel.
+4. **WebFetch is largely amputated, and this is the biggest usability cost.**
+   The tool fetches operator- and agent-chosen URLs, which by definition are not
+   on a fixed allowlist -- so under egress filtering it works only for listed
+   domains. For a research-heavy workflow that is most of its value. The same
+   applies to any agent-initiated fetch of documentation, changelogs, or package
+   metadata. This was missed in the first several drafts of this plan: the cost
+   was framed as lost method/path granularity, when the sharper cost is losing a
+   tool in daily use. Mitigations, none free:
+   - Per-project `allowed_hosts` (section 5) covers *known* domains, not
+     exploratory reading.
+   - A wildcard entry (`*`) for a read-only escape hatch defeats the point.
+   - Accept it: the agent asks the operator to add a host, which is a real
+     workflow tax measured in interruptions.
+   **Failure mode MEASURED (2026-08-06).** A denied WebFetch does not report a
+   policy denial. curl sees `CONNECT tunnel failed, response 403`; claude's
+   client surfaces only `Error: Socket is closed` -- indistinguishable from a
+   network fault. Observed sequence: WebFetch fails, the agent retries, fails
+   again, shells out to curl to diagnose its own sandbox, then interrupts the
+   operator to ask for an allowlist entry. **One fetch cost about four
+   exchanges.** Not a blocker; considerably worse than a papercut, because the
+   error misattributes policy as flakiness.
+
+   Mitigated, and **the mitigation is measured, not assumed (2026-08-06)**: the
+   decision log lives on the launcher's stderr, *outside* the sandbox, so the
+   agent cannot read the one artifact that explains its failure.
+   `csb-proxy --log-file PATH` adds a second sink (stderr keeps streaming for the
+   operator), and a sandboxed agent asked to read that path after a denied fetch
+   successfully diagnosed its own denial. So the four-exchange sequence above
+   collapses to one step, given two things P2 must wire:
+
+   - point `--log-file` inside the sandbox's readable tree (the launch HOME);
+   - a line in the repo's `CLAUDE.md`: "a transport error on a fetch may be an
+     egress denial; check `<path>`".
+
+   The policy is not secret, so exposing it costs nothing. Note the underlying
+   error string is unfixable here -- `Socket is closed` comes from claude's own
+   client -- so making the *explanation* reachable is the whole of the available
+   remedy.
 4. **Linux asymmetry for a while.** macOS gets egress control first. Part 9 warns
    about exactly this drift; the alternative is blocking a cheap win on the
    expensive half.
@@ -348,7 +386,9 @@ and rewriting the precedence tests twice.
   port handshake + refusal log; 8/8 in `make test-proxy`. Verified with curl, not
   with claude -- see section 10 item 1.
 - **P2 -- macOS wiring.** Pin line 8 to the proxy port, `allowed_ports` rules,
-  proxy env, `--dump-sandbox` updates, snapshot regen.
+  proxy env (including `NO_PROXY=localhost,127.0.0.1`), `--dump-sandbox` updates,
+  snapshot regen. Start the proxy from the launcher **outside** the sandbox, and
+  point `--log-file` inside it so denials are self-diagnosable (section 7 item 4).
 - **P3 -- config surface.** Layers 2-3 with union semantics (section 5), which is
   Phase B of section 9.
 - **P4 -- Linux netns.** `--unshare-net` + pasta + nftables, plus NixOS
@@ -499,25 +539,216 @@ paths with spaces. `yojson` stays for that seam; nix never sees it.
 
 ---
 
+## 9a. Approach validation (2026-08-06) -- the blocking questions are answered
+
+Before P2, the two questions that could have invalidated the whole approach were
+"does claude use an HTTP proxy at all" and "which hosts does it need". Both are
+now settled from Anthropic's own documentation
+(<https://code.claude.com/docs/en/network-config>), plus empirical proxy runs.
+
+### Claude Code supports exactly this proxy shape
+
+> "Claude Code respects standard proxy environment variables."
+> "Lowercase variants also work, and Claude Code uses the first one that's set in
+> the order `https_proxy`, `HTTPS_PROXY`, `http_proxy`, `HTTP_PROXY`."
+> "Claude Code does not support SOCKS proxies."
+
+An `HTTP_PROXY`-style CONNECT proxy is the supported configuration; SOCKS -- which
+we were never going to build -- is the unsupported one. The proxy URL is also
+**validated at startup**: an unparseable value stops launch naming the variable,
+so a misconfiguration fails loudly rather than silently going direct.
+
+Verification path for a real session, straight from the docs: `/status` shows a
+**Proxy** row with the active URL (and marks an unparseable one as ignored), and
+`claude --debug` writes to `~/.claude/debug/<session-id>.txt`.
+
+### The MITM decision is further confirmed
+
+The docs describe a whole configuration surface that exists only to make TLS
+interception work: `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CERT_STORE`
+(`bundled,system` by default), and mTLS client cert/key/passphrase variables.
+Non-MITM means csb touches **none** of it. Enterprise TLS-inspection proxies are
+documented as needing their root CA in the OS trust store; we avoid that entirely.
+
+### Empirically validated against the real endpoints
+
+All eight relevant documented hosts tunnel, with every status coming from the
+host rather than the proxy, and zero DENY entries:
+
+    api.anthropic.com 404   claude.ai 403      claude.com 200
+    platform.claude.com 200 downloads.claude.ai 403
+    storage.googleapis.com 400  raw.githubusercontent.com 301  code.claude.com 302
+
+    POST https://api.anthropic.com/v1/messages -> 401   # full TLS+HTTP round trip
+
+Byte integrity and concurrency are now regression tests (10/10 in
+`make test-proxy`): a 334 KB transfer through the tunnel is `cmp`-identical to a
+direct fetch and completes in ~0.1s, and 8 simultaneous tunnels all succeed.
+
+### An evidence-based default allowlist
+
+Derived from the docs' "Network access requirements" table rather than guessed:
+
+| host | why | needed by csb? |
+|---|---|---|
+| `api.anthropic.com` | API requests, WebFetch safety check, feature flags | **required** |
+| `platform.claude.com` | OAuth token exchange/refresh/revocation | **required** -- see below |
+| `claude.ai` | claude.ai account auth | required with `--seed-creds` |
+| `code.claude.com` | doc lookups (claude-code-guide, pre-approved WebFetch) | recommended |
+| `claude.com` | sign-in redirect; pre-approved doc lookups | recommended |
+| `raw.githubusercontent.com` | `/release-notes` changelog | optional |
+| `storage.googleapis.com` | plugin metadata, artifact upload | optional |
+| `downloads.claude.ai` | native installer/auto-updater | **droppable** -- csb pins claude via nix |
+| `mcp-proxy.anthropic.com` | claude.ai MCP connectors | droppable via `ENABLE_CLAUDEAI_MCP_SERVERS=false` |
+| `*.datadoghq.com` (2 hosts) | optional telemetry / error reports | droppable via `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` |
+| `formulae.brew.sh`, `registry.npmjs.org` | homebrew / npm installs | not applicable (nix install) |
+| `bridge.claudeusercontent.com` | Claude in Chrome | not applicable |
+
+**The non-obvious one:** `platform.claude.com` is required *even for claude.ai
+sign-ins*, because OAuth token exchange and refresh go there. csb authenticates
+with `CLAUDE_CODE_OAUTH_TOKEN`, which needs refresh -- so omitting this host
+would produce a session that works until the token expires and then fails in a
+confusing way. Exactly the class of bug an evidence-based list prevents.
+
+Minimum viable pair: `api.anthropic.com` + `platform.claude.com`.
+
+### Two design consequences
+
+- **`NO_PROXY` must exempt loopback.** With `HTTPS_PROXY` set, an HTTP client
+  reaching an `allowed_ports` service (a dev server on `localhost:3000`) would be
+  routed to the proxy and refused. Set
+  `NO_PROXY=localhost,127.0.0.1` so loopback bypasses it; seatbelt still governs
+  which ports are reachable, so this loosens nothing. Non-HTTP clients (postgres,
+  redis) never read the variable and are unaffected.
+- **The proxy must not buffer.** Claude runs a byte-level streaming watchdog that
+  aborts a response after 180s of no bytes on the direct API, counting SSE
+  keep-alive pings. The current unbuffered 64 KB read/write pump satisfies this;
+  any future change that adds a buffering layer would break long, quiet streams.
+
+The list ships as `templates/allowed-hosts` and is what `make proxy-run` serves.
+Transitional: it becomes the built-in default (config layer 1) once csb-config
+owns config resolution.
+
+**Invariant worth stating, because violating it is silent:** the proxy's stdout
+carries *only* the port. Anything else a launcher reads as the port and then
+fails with a nonsense proxy URL -- which is exactly what happened when
+`make ocaml-build`'s progress echoes went to stdout and `make proxy-run`
+inherited them. Build and status output belongs on stderr; stdout is the
+handshake channel.
+
+### Real-session result (2026-08-06) -- CONFIRMED
+
+An interactive claude session was run with `HTTPS_PROXY` pointed at
+`make proxy-run`. The proxy log shows fourteen `ALLOW api.anthropic.com:443`
+entries: **claude's client honors `HTTPS_PROXY` and its real API traffic,
+streaming included, goes through the tunnel.** The blocking question is closed.
+
+Four hosts were attempted and denied, all of them ones this plan had predicted
+droppable:
+
+| denied host | predicted? | outcome |
+|---|---|---|
+| `http-intake.logs.us5.datadoghq.com` | yes, telemetry | harmless |
+| `mcp.us5.datadoghq.com` | **no -- undocumented** | harmless |
+| `downloads.claude.ai` | yes, updater | **user-visible error banner** |
+| `mcp-proxy.anthropic.com` | yes, MCP connectors | breaks claude.ai connectors |
+
+Three findings worth keeping:
+
+1. **`mcp.us5.datadoghq.com` is absent from Anthropic's documented host table.**
+   The docs list two datadoghq hosts; this is a third. The documented list is
+   therefore necessary but not sufficient, which is the retroactive justification
+   for running this empirically instead of trusting the table.
+2. **A denied host can surface as a user-facing error.** Denying
+   `downloads.claude.ai` produces a persistent
+   `"Auto-update failed - Run claude doctor"` banner. Functionally harmless -- csb
+   pins claude via nix, so a successful update would target a read-only store
+   path -- but a false alarm that teaches the operator to ignore real errors.
+   **The fix is to stop claude attempting it, not to allow the host:**
+   `DISABLE_AUTOUPDATER=1`. Confirmed live in the installed binary
+   (`grep -ac DISABLE_AUTOUPDATER` on `.claude-unwrapped` -> 11), alongside the
+   `autoUpdates` settings key.
+3. **The allowlist and its companion env are one unit.** A tight list without
+   `DISABLE_AUTOUPDATER` / `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` /
+   `ENABLE_CLAUDEAI_MCP_SERVERS=false` produces exactly the noise above. These
+   belong in the shipped defaults as `setenv=` entries when config layers land
+   (section 5), not as operator folklore.
+
+`mcp-proxy.anthropic.com` is an operator decision, not a technical one:
+claude.ai-hosted connectors (`mcp__claude_ai_*` tools) route through it, so
+denying it disables them. Left commented in `templates/allowed-hosts`.
+
+Two things this run did NOT establish:
+
+- **`platform.claude.com` was never contacted**, so its "required" status is
+  untested -- the token did not need refreshing. Not disproven; it would surface
+  at expiry as a session that works and then stops. Keep it listed.
+- **Enforcement.** Traffic used the proxy because `HTTPS_PROXY` was set, not
+  because anything forced it. That is P2.
+
+### The remaining gap: enforcement
+
+The docs say claude honors the proxy and the run above confirms it, but nothing
+yet *compels* it.
+
+One run, two terminals, no csb changes needed:
+
+    # terminal 1 -- port is the first stdout line, decisions stream on stderr
+    make proxy-run
+
+    # terminal 2, with the port from above
+    export HTTPS_PROXY="http://127.0.0.1:$PORT" NO_PROXY=localhost,127.0.0.1
+    curl -sS -x "$HTTPS_PROXY" -o /dev/null -w '%{http_code}\n' https://api.anthropic.com/  # 404 = healthy
+    curl -sS -x "$HTTPS_PROXY" https://example.com/                                          # 403 = enforcing
+    claude --debug
+
+In the session: `/status` must show the **Proxy** row with that URL -- if it is
+absent or marked invalid, claude is not using the proxy and nothing else matters.
+Then exercise the network (any prompt hits `api.anthropic.com`; a WebFetch and
+`/release-notes` reach the optional hosts) and watch terminal 1. **Every `DENY`
+line names a host the allowlist is missing** -- that is the run doing its job, not
+failing. Add it and restart (the file is read once, at startup).
+
+Run it unsandboxed first: it isolates "does claude honor the proxy" from every
+csb variable. The integration check afterwards is one line, since csb scrubs the
+environment:
+
+    HTTPS_PROXY="http://127.0.0.1:$PORT" NO_PROXY=localhost,127.0.0.1 \
+      csb --here -k HTTPS_PROXY -k NO_PROXY
+
+That works today, before P2, because the current profile still permits all egress
+including loopback. What it does **not** prove is enforcement -- nothing stops
+claude going direct if it chose to. Enforcement is what P2 adds by pinning the
+profile to the proxy port, and the post-P2 check is that
+`curl https://example.com` from inside the sandbox fails at the *network* layer
+rather than returning the proxy's 403.
+
+If claude hangs instead of erroring, read terminal 1 first: a refused CONNECT
+surfaces as a client-side error some libraries retry quietly, so the proxy log is
+the source of truth. `claude --debug` writes the client's own view to
+`~/.claude/debug/<session-id>.txt`.
+
+---
+
 ## 10. Open questions, each with the command that answers it
 
-1. **Proxy under real claude.** P1 proves the *tunnel* works -- curl completes a
-   real TLS round-trip through it. What is NOT proven: that claude's Node client
-   honors `HTTPS_PROXY` for its API calls and its own fetches, and that it copes
-   with DNS being unavailable. Node does not read `HTTPS_PROXY` natively -- it
-   depends on what the client library does -- so this is the one remaining
-   behavior that could invalidate the approach. Run a real session with the proxy
-   in front and an allow-nothing list, then read the refusal log (which also
-   answers item 2).
-2. **Which hosts does claude actually need?** Capture from the refusal log with
-   an allow-nothing list, then build the default from evidence rather than
-   guessing.
-3. **Linux F4 re-measure.** `bats test/escape/escape.bats` on NixOS with
+1. **Proxy under real claude -- LARGELY ANSWERED, see section 9a.** Claude Code
+   documents support for `HTTPS_PROXY`-style CONNECT proxies, and all the
+   documented hosts tunnel correctly. Residual: one confirmation run showing the
+   `/status` Proxy row populated and an empty refusal log.
+2. **Which hosts does claude need -- ANSWERED.** Documented, not guessed; the
+   evidence-based default allowlist is in section 9a.
+3. **Does DNS actually need to be denied, or merely unused?** The proxy resolves,
+   so the sandbox needs no DNS. Whether removing the `mDNSResponder` allows breaks
+   anything unrelated (git, tooling) is unmeasured -- keep them until P2 is
+   working, then remove and re-run `make test-proxy` plus a real session.
+4. **Linux F4 re-measure.** `bats test/escape/escape.bats` on NixOS with
    `--unshare-net`, to see whether the abstract-socket residual closes.
-4. **Does anything legitimate need plain HTTP?** Section 2 refuses non-CONNECT
+5. **Does anything legitimate need plain HTTP?** Section 2 refuses non-CONNECT
    requests outright. Verify against a real session before committing to it.
 
-Resolved: `-E` stays and error-on-both is approved (section 9).
+Resolved: `-E` stays and error-on-both is approved (section 9); proxy support and
+the host list are settled (section 9a).
 
 ---
 

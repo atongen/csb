@@ -2,7 +2,31 @@
    allowlist here IS the egress policy. TLS is tunnelled, never terminated:
    destination control needs the CONNECT target, not the payload. *)
 
-let log fmt = Printf.eprintf ("[csb-proxy] " ^^ fmt ^^ "\n%!")
+(* Decisions always go to stderr, for whoever is watching the launcher, and
+   additionally to any sink added with add_log_sink -- a file the SANDBOX can
+   read. Both are needed: a denied CONNECT reaches the agent only as an opaque
+   transport error ("Socket is closed"), so without a readable log it cannot tell
+   a policy denial from a network fault, while redirecting away from stderr would
+   blind the operator. Threads share the channels, hence the mutex; ksprintf
+   formats before locking so the lock spans only the writes. *)
+let log_mutex = Mutex.create ()
+let log_sinks = ref [ stderr ]
+let add_log_sink oc = log_sinks := oc :: !log_sinks
+
+let log fmt =
+  Printf.ksprintf
+    (fun s ->
+      let line = "[csb-proxy] " ^ s ^ "\n" in
+      Mutex.lock log_mutex;
+      List.iter
+        (fun oc ->
+          try
+            output_string oc line;
+            flush oc
+          with Sys_error _ -> ())
+        !log_sinks;
+      Mutex.unlock log_mutex)
+    fmt
 
 type decision =
   | Allow of string * int
