@@ -450,9 +450,23 @@ and rewriting the precedence tests twice.
   If that class recurs, a third dump seam for the launch environment is the
   answer; once is not enough evidence to add one.
 
-  **Outstanding handoff:** new Tier-2 goldens for the filtered profile must be
-  generated on a host (`test/helpers.bash:195` refuses inside csb, and D1 is why),
-  on both platforms.
+  **Tier-2 goldens: DONE (2026-08-06), generated on both hosts.**
+  `darwin/filter-egress` is `darwin/baseline` with line 8 replaced by exactly two
+  rules (`localhost:<PROXY_PORT>` and `localhost:5432`) -- the blanket allow is
+  *replaced*, not supplemented, so no ordering can let the wildcard win.
+  `linux/filter-egress` is byte-identical to `linux/baseline`, and that identity
+  is the Linux assertion. The commit was `+72 / -0`: every pre-existing golden
+  verified unchanged on both platforms, which is the load-bearing result -- the
+  flag adds nothing to any profile when unused.
+
+  **csb-proxy resolution: DONE.** `ocaml/dune-project` defines a `csb-tools`
+  package whose `public_names` install as `csb-proxy` and `csb-config`;
+  `packages.csb-tools` (`ocamlPackages.buildDunePackage`) exposes it, and csb
+  resolves `"$CSB_SELF#csb-tools"` at launch exactly as it resolves `#bwrap` on
+  Linux. `CSB_PROXY_BIN` remains the verbatim override for tests and
+  working-tree builds, mirroring `CSB_BWRAP_BIN`. In-tree artifact names are
+  unchanged, so the Makefile paths still hold, and `--dump-sandbox` still
+  resolves nothing (the placeholder keeps that seam nix-free).
 - **P3 -- config surface.** Layers 2-3 with union semantics (section 5), which is
   Phase B of section 9.
 - **P4 -- Linux netns.** `--unshare-net` + pasta + nftables, plus NixOS

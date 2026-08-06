@@ -1,3 +1,5 @@
 (executables
  (names csb_config_cli csb_proxy_cli)
+ (public_names csb-config csb-proxy)
+ (package csb-tools)
  (libraries csb_config))

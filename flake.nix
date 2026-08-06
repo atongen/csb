@@ -38,6 +38,16 @@
           # (`nix develop <repo> --command ... claude`) — supplied from csb's
           # flake so consuming repos stay decoupled from csb.
           claude = pkgs.claude-code;
+
+          # The OCaml helpers under ocaml/: csb-proxy (egress allowlist proxy,
+          # resolved at launch under --filter-egress) and csb-config (config
+          # resolution). csb resolves this to a store path the same way it
+          # resolves #bwrap, so an installed csb needs nothing on PATH.
+          csb-tools = pkgs.ocamlPackages.buildDunePackage {
+            pname = "csb-tools";
+            version = "0.1.0";
+            src = ./ocaml;
+          };
         } // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           # Deny-list wrapper on Linux. csb resolves this to a store path at
           # launch so the sandbox doesn't depend on bubblewrap being installed

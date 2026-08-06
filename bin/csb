@@ -17,6 +17,8 @@
 #                 quiet: routine status + nix progress suppressed).
 #      CSB_BWRAP_BIN (Linux) use this bwrap binary verbatim instead of building
 #                 it via nix (keeps --dump-sandbox / tests hermetic).
+#      CSB_PROXY_BIN use this csb-proxy binary verbatim instead of resolving
+#                 "$CSB_SELF#csb-tools" (same purpose, for --filter-egress).
 
 set -euo pipefail
 
@@ -1083,9 +1085,16 @@ start_egress_proxy() {
     return 0
   fi
   local bin fifo
-  bin="${CSB_PROXY_BIN:-$(command -v csb-proxy 2>/dev/null || true)}"
+  # CSB_PROXY_BIN overrides with a verbatim path (keeps tests and a working-tree
+  # build hermetic); otherwise resolve it from csb's own flake, the same way
+  # #bwrap is resolved on Linux, so an installed csb needs nothing on PATH.
+  if [[ -n "${CSB_PROXY_BIN:-}" ]]; then
+    bin="$CSB_PROXY_BIN"
+  else
+    bin="$(nix build "$CSB_SELF#csb-tools" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/csb-proxy"
+  fi
   [[ -n "$bin" && -x "$bin" ]] \
-    || die "--filter-egress needs csb-proxy on PATH or CSB_PROXY_BIN set (build it with 'make ocaml-build')"
+    || die "--filter-egress could not resolve csb-proxy (tried $CSB_SELF#csb-tools; override with CSB_PROXY_BIN)"
   [[ ${#allow_host_list[@]} -gt 0 ]] \
     || die "--filter-egress with an empty host allowlist would block all egress: add --allow-host, a profile allow_host=, or $CSB_CONFIG_DIR/allowed-hosts"
   proxy_allow_file="$(mktemp "${TMPDIR:-/tmp}/csb-allow.XXXXXX")"

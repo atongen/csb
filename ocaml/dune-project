@@ -1,1 +1,9 @@
 (lang dune 3.0)
+(name csb-tools)
+
+; One package holding both helper binaries. Installed names are csb-proxy and
+; csb-config (see bin/dune public_names); the in-tree build artifacts keep their
+; module-derived .exe names, which is what the Makefile paths use.
+(package
+ (name csb-tools)
+ (synopsis "csb helper binaries: egress allowlist proxy and config resolution"))
