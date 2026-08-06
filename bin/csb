@@ -139,6 +139,24 @@ OPTIONS:
                      Refused for the IPC broker paths csb closes and for a whole
                      shared write root like /tmp. Repeatable; profile
                      allow_socket=.
+      --filter-egress    route the sandbox's HTTPS egress through csb-proxy and
+                     allow ONLY the hosts named by --allow-host / a profile's
+                     allow_host= / \$XDG_CONFIG_HOME/csb/allowed-hosts. The
+                     sandbox profile is what enforces it: the proxy's loopback
+                     port becomes the only reachable IP endpoint, so a client
+                     that ignores HTTPS_PROXY reaches nothing. macOS only for
+                     now -- a warning and no filtering on Linux, which needs a
+                     network namespace. OFF by default: filtering breaks
+                     WebFetch for any host not on the list. Also via a
+                     profile's filter_egress=true.
+      --allow-host HOST  under --filter-egress, allow egress to HOST. A leading
+                     '*.' matches subdomains only, so list a bare parent domain
+                     separately when you want both. Repeatable; accumulates with
+                     the config file and a profile's allow_host=.
+      --allow-port PORT  under --filter-egress, also allow host-local TCP to
+                     localhost:PORT (a dev server, postgres over TCP) -- traffic
+                     the CONNECT proxy cannot carry. Repeatable; profile
+                     allow_port=.
       --paranoid-deny-read PATH  under --paranoid only, additionally read-deny
                      PATH (e.g. a tree outside HOME like /Volumes). Repeatable;
                      profile paranoid_deny_read=.
@@ -170,12 +188,14 @@ OPTIONS:
                      nix_target_claude=,
                      seed_creds=, seed_home=, accent=, args=, keep=, setenv=,
                      deny_read=, allow_write=, allow_socket=,
+                     filter_egress=, allow_host=, allow_port=,
                      paranoid_deny_read=, paranoid_allow_read=).
                      A gitignored NAME.local is layered on top for host-specific
                      values (its values win). Explicit CLI flags beat both.
                      Bare '$PROG -p NAME' (no BRANCH) launches --here; plain
                      '$PROG' still lists worktrees.
       --no-yolo (--yodo), --no-paranoid, --no-pasteboard, --sandbox,
+      --no-filter-egress,
       --no-real-home, --no-here, --no-shell, --no-ephemeral, --no-latest,
       --no-verbose, --no-seed-creds, --no-ns, --no-seed-home, --no-accent,
       --no-nix-target
@@ -647,6 +667,41 @@ normalize_list_path() {
   esac
 }
 
+# Echo a validated egress host (--allow-host / profile allow_host=), dying with
+# $2 as the source label. A leading '*.' matches subdomains only. The charset is
+# what a DNS name needs and nothing else: the value reaches the proxy through a
+# file, so no quote or whitespace can smuggle a second entry onto a line.
+validate_host() {
+  local val="$1" where="$2"
+  [[ "$val" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+    || die "$where: not a hostname or *.suffix pattern: '$val'"
+  printf '%s\n' "$val"
+}
+
+# Echo a validated TCP port (--allow-port / profile allow_port=).
+validate_port() {
+  local val="$1" where="$2"
+  [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 && "$val" -le 65535 ]] \
+    || die "$where: not a port from 1 to 65535: '$val'"
+  printf '%s\n' "$val"
+}
+
+# Append $CSB_CONFIG_DIR/allowed-hosts (if present) to allow_host_list. Same
+# add-only shape as the deny file: entries accumulate, a parse error aborts the
+# launch rather than silently launching with a shorter allowlist.
+read_allowed_hosts_file() {
+  local f="$CSB_CONFIG_DIR/allowed-hosts" line lineno=0
+  [[ -f "$f" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" ]] || continue
+    allow_host_list+=("$(validate_host "$line" "$f:$lineno")")
+  done <"$f"
+}
+
 # Echo a validated nix target (--nix-target* / profile nix_target*=), dying with
 # $2 as the source label. It is interpolated into a flake ref, so the charset is
 # restricted to what a nix attribute name needs -- no '#', quotes, or whitespace
@@ -1007,6 +1062,53 @@ emit_ancestor_metadata() {
 # active namespace, and build_write_roots for the write policy. sandbox-exec is
 # deprecated-but-stable (nix's own darwin sandbox uses the same libsandbox); if
 # it ever disappears, this helper is the single place to swap the mechanism.
+# Set proxy_port for the profile's one IP-egress rule. Under --filter-egress the
+# proxy runs OUTSIDE the sandbox, as the operator, and the sandbox reaches it on
+# loopback and nothing else. Under --dump-sandbox nothing is started: a
+# placeholder keeps the seam hermetic and its goldens stable.
+#
+# Linux is a no-op for now. bwrap has no socket filter, so HTTP_PROXY there is
+# advisory -- a process can dial out directly and ignore it. Enforcement needs a
+# network namespace (P4); emitting a loopback-only rule without one would LOOK
+# like filtering while enforcing nothing, which is worse than declining.
+start_egress_proxy() {
+  [[ "$filter_egress" == "true" ]] || return 0
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "$PROG: warning: --filter-egress is macOS-only for now; egress is NOT filtered on this platform" >&2
+    filter_egress="false"
+    return 0
+  fi
+  if [[ -n "$dump" ]]; then
+    proxy_port="<PROXY_PORT>"
+    return 0
+  fi
+  local bin fifo
+  bin="${CSB_PROXY_BIN:-$(command -v csb-proxy 2>/dev/null || true)}"
+  [[ -n "$bin" && -x "$bin" ]] \
+    || die "--filter-egress needs csb-proxy on PATH or CSB_PROXY_BIN set (build it with 'make ocaml-build')"
+  [[ ${#allow_host_list[@]} -gt 0 ]] \
+    || die "--filter-egress with an empty host allowlist would block all egress: add --allow-host, a profile allow_host=, or $CSB_CONFIG_DIR/allowed-hosts"
+  proxy_allow_file="$(mktemp "${TMPDIR:-/tmp}/csb-allow.XXXXXX")"
+  printf '%s\n' "${allow_host_list[@]}" >"$proxy_allow_file"
+  # The decision log goes in the launch HOME so the SANDBOX can read it: a denied
+  # CONNECT reaches the agent as an opaque transport error, and this file is the
+  # only way it can tell policy from packet loss.
+  proxy_log="${claude_home:-${TMPDIR:-/tmp}}/csb-proxy.log"
+  fifo="$(mktemp -u "${TMPDIR:-/tmp}/csb-proxyport.XXXXXX")"
+  mkfifo "$fifo"
+  # Decisions arrive on the proxy's stderr; appending it to the log keeps one
+  # writer (and captures a failed start, which --log-file would not). stdout is
+  # the port channel and must stay clean. The proxy's own --log-file exists for
+  # `make proxy-run`, where stderr is the operator's live view instead.
+  "$bin" "$proxy_allow_file" >"$fifo" 2>>"$proxy_log" &
+  proxy_pid=$!
+  proxy_port="$(head -1 <"$fifo")"
+  rm -f "$fifo"
+  [[ "$proxy_port" =~ ^[0-9]+$ ]] \
+    || die "csb-proxy did not report a port (see $proxy_log)"
+  vecho "$PROG: egress filtered via csb-proxy on 127.0.0.1:$proxy_port (${#allow_host_list[@]} hosts); log: $proxy_log"
+}
+
 build_deny_wrapper() {
   deny_wrapper=()
   build_deny_paths
@@ -1094,7 +1196,7 @@ build_deny_wrapper() {
       # file after csb is gone; the temp dir reaps it eventually (paths only,
       # no secrets).
       seatbelt_profile="$profile"
-      trap 'rm -f "$seatbelt_profile"' EXIT
+      trap 'rm -f "$seatbelt_profile" "$proxy_allow_file"; [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null' EXIT
       {
         echo "(version 1)"
         echo "(allow default)"
@@ -1151,7 +1253,24 @@ build_deny_wrapper() {
         # nix-specific rule: denying the `nix` BINARY would be worthless anyway,
         # since /tmp is a write root and exec is unrestricted.
         echo "(deny network-outbound)"
-        echo '(allow network-outbound (remote ip "*:*"))'
+        # --filter-egress: the ONLY reachable IP endpoint becomes csb-proxy on
+        # loopback, so every host the agent reaches is one the allowlist named.
+        # Unfiltered, IP egress stays wide open (the historical default).
+        # Enforcement is structural, not cooperative: HTTP_PROXY tells a client
+        # where to go, but this rule is what leaves it nowhere else.
+        if [[ "$filter_egress" == "true" ]]; then
+          printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$proxy_port"
+          # --allow-port: host-local TCP services (a dev server, postgres over
+          # TCP) the proxy cannot carry, since it speaks CONNECT to public names.
+          for p in "${allow_port_list[@]+"${allow_port_list[@]}"}"; do
+            printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$p"
+          done
+        else
+          echo '(allow network-outbound (remote ip "*:*"))'
+        fi
+        # Kept under filtering too: the proxy resolves names, but removing these
+        # was never measured, and DNS is not the egress channel -- the IP rule
+        # above is. See PLAN-007-agent-sandbox-again.md s10 item 3.
         echo '(allow network-outbound (literal "/private/var/run/mDNSResponder"))'
         echo '(allow network-outbound (literal "/var/run/mDNSResponder"))'
         # Unix sockets INSIDE the sandbox's own trees: a Rails tmp/sockets/
@@ -1384,6 +1503,9 @@ apply_profile_line() {
     deny_read)           deny_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: deny_read")") ;;
     allow_write)         allow_write_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: allow_write")") ;;
     allow_socket)        allow_socket_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: allow_socket")") ;;
+    filter_egress)       profile_bool filter_egress "$val" "$f:$lineno"; p_filter_egress="$val" ;;
+    allow_host)          allow_host_list+=("$(validate_host "$val" "profile $f:$lineno: allow_host")") ;;
+    allow_port)          allow_port_list+=("$(validate_port "$val" "profile $f:$lineno: allow_port")") ;;
     paranoid_deny_read)  paranoid_deny_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: paranoid_deny_read")") ;;
     paranoid_allow_read) paranoid_allow_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: paranoid_allow_read")") ;;
     setenv)
@@ -1391,7 +1513,7 @@ apply_profile_line() {
         || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
       profile_setenv+=("$val")
       ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, allow_socket, paranoid_deny_read, paranoid_allow_read)" ;;
+    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, allow_socket, filter_egress, allow_host, allow_port, paranoid_deny_read, paranoid_allow_read)" ;;
   esac
 }
 
@@ -1407,7 +1529,7 @@ load_profile() {
   [[ -f "$base" ]] || die "profile not found: $base"
   local p_ns="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
         p_shell="" p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" v \
-        p_sandbox="" p_real_home="" p_pasteboard="" \
+        p_sandbox="" p_real_home="" p_pasteboard="" p_filter_egress="" \
         p_nix_target="" p_nix_target_shell="" p_nix_target_claude=""
   local -a keep_list=()
 
@@ -1466,6 +1588,9 @@ load_profile() {
   fi
   if [[ -n "$p_pasteboard" && "$pasteboard_cli" != "true" ]]; then
     pasteboard="$p_pasteboard"
+  fi
+  if [[ -n "$p_filter_egress" && "$filter_egress_cli" != "true" ]]; then
+    filter_egress="$p_filter_egress"
   fi
   # The three nix-target keys share one --no-nix-target reset, so one *_cli flag
   # gates all of them: an explicit CLI target (of any kind) takes the profile's
@@ -1573,6 +1698,15 @@ cfg_tmpdir="${CSB_TMPDIR:-}"  # host scratch/temp dir (was config tmpdir=)
 deny_read_paths=()           # --deny-read / profile deny_read=: extra read denies (both modes)
 allow_write_paths=()         # --allow-write / profile allow_write=: extra write roots (both modes)
 allow_socket_paths=()        # --allow-socket / profile allow_socket=: reachable unix sockets (macOS; no-op on Linux)
+# Egress filtering (docs/PLAN-007-agent-sandbox-again.md P2). OFF by default:
+# turning it on amputates WebFetch for unlisted hosts, so it is opted into.
+filter_egress="false"; filter_egress_cli="false"
+allow_host_list=()           # --allow-host / profile allow_host= (+ $CSB_CONFIG_DIR/allowed-hosts)
+allow_port_list=()           # --allow-port / profile allow_port=: host-local TCP ports
+proxy_port=""                # resolved at launch; a placeholder under --dump-sandbox
+proxy_pid=""                 # reaped by the launch trap
+proxy_allow_file=""          # temp file csb-proxy reads the allowlist from
+proxy_log=""                 # decision log, inside the launch HOME so the agent can read it
 paranoid_deny_read_paths=()  # --paranoid-deny-read / profile paranoid_deny_read=: extra denies (paranoid)
 paranoid_allow_read_paths=() # --paranoid-allow-read / profile paranoid_allow_read=: read re-allows (paranoid)
 seed_home=""        # --seed-home / profile seed_home=; empty -> ~/.config/csb/home
@@ -1653,6 +1787,12 @@ while [[ $# -gt 0 ]]; do
       allow_write_paths+=("$(normalize_list_path "$2" "--allow-write")"); shift 2 ;;
     --allow-socket) [[ $# -ge 2 && -n "$2" ]] || die "--allow-socket requires a PATH"
       allow_socket_paths+=("$(normalize_list_path "$2" "--allow-socket")"); shift 2 ;;
+    --filter-egress) filter_egress="true"; filter_egress_cli="true"; shift ;;
+    --no-filter-egress) filter_egress="false"; filter_egress_cli="true"; shift ;;
+    --allow-host) [[ $# -ge 2 && -n "$2" ]] || die "--allow-host requires a HOST"
+      allow_host_list+=("$(validate_host "$2" "--allow-host")"); shift 2 ;;
+    --allow-port) [[ $# -ge 2 && -n "$2" ]] || die "--allow-port requires a PORT"
+      allow_port_list+=("$(validate_port "$2" "--allow-port")"); shift 2 ;;
     --paranoid-deny-read) [[ $# -ge 2 && -n "$2" ]] || die "--paranoid-deny-read requires a PATH"
       paranoid_deny_read_paths+=("$(normalize_list_path "$2" "--paranoid-deny-read")"); shift 2 ;;
     --paranoid-allow-read) [[ $# -ge 2 && -n "$2" ]] || die "--paranoid-allow-read requires a PATH"
@@ -1705,6 +1845,10 @@ if [[ -n "$profile_name" ]]; then
   load_profile
 fi
 
+# The user-global host allowlist is add-only, like the deny file: it accumulates
+# with --allow-host and a profile's allow_host=, and never removes an entry.
+read_allowed_hosts_file
+
 # Bare `csb -p NAME` (no BRANCH) launches --here rather than falling into list
 # mode: a profile is a launch config, and plain `csb` still lists. Suppressed
 # when the CLI or the profile said otherwise (--no-here / here=false).
@@ -1733,6 +1877,10 @@ if [[ "$sandbox" != "true" ]]; then
         || ${#paranoid_deny_read_paths[@]} -gt 0 || ${#paranoid_allow_read_paths[@]} -gt 0 ]]; then
     echo "$PROG: warning: --no-sandbox drops the filesystem sandbox; --paranoid and the" >&2
     echo "  deny-read / allow-write / allow-socket lists have no effect in this mode" >&2
+  fi
+  if [[ "$filter_egress" == "true" ]]; then
+    echo "$PROG: warning: --filter-egress needs the sandbox to enforce it (the profile is what" >&2
+    echo "  leaves the proxy as the only reachable endpoint); egress is NOT filtered here" >&2
   fi
 fi
 
@@ -1838,6 +1986,9 @@ if [[ "$dump" == "config" ]]; then
   printf 'deny_read=%s\n'           "$(join_bar "${deny_read_paths[@]+"${deny_read_paths[@]}"}")"
   printf 'allow_write=%s\n'         "$(join_bar "${allow_write_paths[@]+"${allow_write_paths[@]}"}")"
   printf 'allow_socket=%s\n'        "$(join_bar "${allow_socket_paths[@]+"${allow_socket_paths[@]}"}")"
+  printf 'filter_egress=%s\n'      "$filter_egress"
+  printf 'allow_host=%s\n'         "$(join_bar "${allow_host_list[@]+"${allow_host_list[@]}"}")"
+  printf 'allow_port=%s\n'         "$(join_bar "${allow_port_list[@]+"${allow_port_list[@]}"}")"
   printf 'paranoid_deny_read=%s\n'  "$(join_bar "${paranoid_deny_read_paths[@]+"${paranoid_deny_read_paths[@]}"}")"
   printf 'paranoid_allow_read=%s\n' "$(join_bar "${paranoid_allow_read_paths[@]+"${paranoid_allow_read_paths[@]}"}")"
   exit 0
@@ -2146,7 +2297,30 @@ env_overrides+=(
 # the wrapper entirely (shell-only, enforced above): the launch degrades to
 # `env ... path_shim cmd`, giving the shell full host filesystem access.
 if [[ "$sandbox" == "true" ]]; then
+  start_egress_proxy
   build_deny_wrapper
+  # Must come after start_egress_proxy: proxy_port does not exist until it runs.
+  # These tell a proxy-aware client where the proxy is; the profile above is what
+  # makes it the only reachable endpoint. NO_PROXY exempts loopback so an
+  # --allow-port service is dialled directly rather than refused by the proxy,
+  # which only speaks CONNECT to public names.
+  if [[ "$filter_egress" == "true" && -n "$proxy_port" ]]; then
+    env_overrides+=(
+      "HTTPS_PROXY=http://127.0.0.1:$proxy_port"
+      "HTTP_PROXY=http://127.0.0.1:$proxy_port"
+      "https_proxy=http://127.0.0.1:$proxy_port"
+      "http_proxy=http://127.0.0.1:$proxy_port"
+      "NO_PROXY=localhost,127.0.0.1"
+      "no_proxy=localhost,127.0.0.1"
+      "CSB_PROXY_LOG=$proxy_log"
+    )
+  elif [[ "$filter_egress" == "true" && -z "$dump" ]]; then
+    # Unreachable unless this block is moved above start_egress_proxy again. It
+    # was, once: the profile enforced correctly and the env was never injected,
+    # so the sandbox had no egress at all and nothing said why. Fail loudly
+    # rather than hand back a silently isolated sandbox.
+    die "internal: filter_egress is on but no proxy port was resolved"
+  fi
 else
   deny_wrapper=()
   [[ -n "$dump" ]] \

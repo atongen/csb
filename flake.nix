@@ -56,6 +56,7 @@
               pkgs.neovim            # editor for interactive shell work
               pkgs.shellcheck
               pkgs.jq                # statusline template parses claude's session JSON
+              pkgs.curl              # exercising csb-proxy (macOS has /usr/bin/curl; NixOS does not)
               pkgs.bashInteractive   # `complete`/readline — mkShell's default bash lacks progcomp
               pkgs.bash-completion   # programmable Tab completion (git, etc.)
               # bats + assertion libraries for `make test` (docs/PLAN-005-tests.md).
@@ -120,7 +121,7 @@
       });
 
       # `nix flake init -t "$CSB_SELF"` scaffolds a consuming repo (CSB_SELF
-      # defaults to the public GitHub remote; see bin/csb).
+      # defaults to the private remote; see bin/csb).
       templates.default = {
         path = ./templates/repo;
         description = "Repo flake: a standalone devShell that csb runs claude in";

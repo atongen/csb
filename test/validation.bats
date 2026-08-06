@@ -232,3 +232,74 @@ load helpers
   dump_sandbox "$repo" --allow-socket /tmp/.s.PGSQL.5432
   assert_success
 }
+
+# --- egress filtering (docs/PLAN-007-agent-sandbox-again.md P2) ---------------
+
+@test "an invalid --allow-host is refused" {
+  dump_config --allow-host 'bad host'
+  assert_failure
+  assert_output --partial "not a hostname or *.suffix pattern"
+}
+
+@test "an --allow-host with a quote is refused" {
+  dump_config --allow-host 'a"b.com'
+  assert_failure
+  assert_output --partial "not a hostname or *.suffix pattern"
+}
+
+@test "an out-of-range --allow-port is refused" {
+  dump_config --allow-port 99999
+  assert_failure
+  assert_output --partial "not a port from 1 to 65535"
+}
+
+@test "a non-numeric --allow-port is refused" {
+  dump_config --allow-port abc
+  assert_failure
+  assert_output --partial "not a port from 1 to 65535"
+}
+
+@test "a bad host in the allowed-hosts file aborts the launch" {
+  printf 'ok.example.com\nnot a host\n' >"$XDG_CONFIG_HOME/csb/allowed-hosts"
+  dump_config
+  assert_failure
+  assert_output --partial "not a hostname or *.suffix pattern"
+}
+
+@test "--filter-egress pins egress to the proxy port and nothing else" {
+  [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host api.anthropic.com
+  assert_success
+  assert_line '(allow network-outbound (remote ip "localhost:<PROXY_PORT>"))'
+  refute_line '(allow network-outbound (remote ip "*:*"))'
+}
+
+@test "without --filter-egress egress stays open" {
+  [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo"
+  assert_success
+  assert_line '(allow network-outbound (remote ip "*:*"))'
+  refute_line '(allow network-outbound (remote ip "localhost:<PROXY_PORT>"))'
+}
+
+@test "--allow-port emits a loopback rule only under --filter-egress" {
+  [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-port 5432
+  assert_success
+  assert_line '(allow network-outbound (remote ip "localhost:5432"))'
+  dump_sandbox "$repo" --allow-port 5432
+  assert_success
+  refute_line '(allow network-outbound (remote ip "localhost:5432"))'
+}
+
+@test "--filter-egress on Linux warns and filters nothing" {
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS enforces via the seatbelt profile)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host api.anthropic.com
+  assert_success
+  assert_output --partial "--filter-egress is macOS-only for now"
+  refute_output --partial "network-outbound"
+}

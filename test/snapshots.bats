@@ -15,6 +15,20 @@ load helpers
   assert_snapshot baseline "$repo"
 }
 
+# --filter-egress replaces the blanket IP-egress allow with the proxy port and the
+# named local ports. The port is emitted as the stable <PROXY_PORT> placeholder in
+# dump mode, so no proxy starts and the golden is reproducible. On Linux this
+# golden is byte-identical to `baseline` -- the flag declines rather than emitting
+# a rule bwrap cannot enforce, and that identity IS the assertion (same shape as
+# linux/pasteboard and linux/allow-socket).
+@test "snapshot: --filter-egress (proxy port + allowed local port)" {
+  local repo; repo="$(fake_repo feature/x)"
+  dump_sandbox_snapshot "$repo" --filter-egress \
+    --allow-host api.anthropic.com --allow-port 5432
+  assert_success
+  assert_snapshot filter-egress "$repo"
+}
+
 @test "linux: every IPC broker path present on this host gets a --tmpfs" {
   # The goldens collapse this block to <IPC-TMPFS> because csb emits a --tmpfs
   # only for the paths that exist, which differs per host (a NixOS box has all

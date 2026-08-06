@@ -358,12 +358,14 @@ and rewriting the precedence tests twice.
    agent cannot read the one artifact that explains its failure.
    `csb-proxy --log-file PATH` adds a second sink (stderr keeps streaming for the
    operator), and a sandboxed agent asked to read that path after a denied fetch
-   successfully diagnosed its own denial. So the four-exchange sequence above
-   collapses to one step, given two things P2 must wire:
+   successfully diagnosed its own denial. **P2 wired it and it is confirmed in the
+   real topology:** the log lands in the launch HOME, `CSB_PROXY_LOG` names it in
+   the sandbox env, and `cat "$CSB_PROXY_LOG"` from inside shows the ALLOW/DENY
+   lines. So the four-exchange sequence above collapses to one step, given the
+   one remaining piece:
 
-   - point `--log-file` inside the sandbox's readable tree (the launch HOME);
    - a line in the repo's `CLAUDE.md`: "a transport error on a fetch may be an
-     egress denial; check `<path>`".
+     egress denial; check `$CSB_PROXY_LOG`".
 
    The policy is not secret, so exposing it costs nothing. Note the underlying
    error string is unfixable here -- `Socket is closed` comes from claude's own
@@ -385,10 +387,72 @@ and rewriting the precedence tests twice.
 - **P1 -- proxy. DONE (2026-08-05).** OCaml CONNECT proxy + allowlist matching +
   port handshake + refusal log; 8/8 in `make test-proxy`. Verified with curl, not
   with claude -- see section 10 item 1.
-- **P2 -- macOS wiring.** Pin line 8 to the proxy port, `allowed_ports` rules,
-  proxy env (including `NO_PROXY=localhost,127.0.0.1`), `--dump-sandbox` updates,
-  snapshot regen. Start the proxy from the launcher **outside** the sandbox, and
-  point `--log-file` inside it so denials are self-diagnosable (section 7 item 4).
+- **P2 -- macOS wiring. IMPLEMENTED (2026-08-06), one handoff outstanding.**
+  `--filter-egress` / `--no-filter-egress` (profile `filter_egress=`),
+  `--allow-host HOST` (profile `allow_host=`, plus an add-only
+  `$XDG_CONFIG_HOME/csb/allowed-hosts`), `--allow-port PORT` (profile
+  `allow_port=`). `start_egress_proxy` runs csb-proxy **outside** the sandbox,
+  reads its port off stdout through a FIFO, and the profile's single IP-egress
+  rule becomes that port plus any `--allow-port`. Proxy env
+  (`HTTPS_PROXY`/`HTTP_PROXY` + lowercase, `NO_PROXY=localhost,127.0.0.1`,
+  `CSB_PROXY_LOG`) is injected post-scrub; the decision log lands in the launch
+  HOME so the agent can read it; the EXIT trap reaps the proxy and its temp
+  allowlist.
+
+  **OFF by default.** Turning it on amputates WebFetch for unlisted hosts
+  (section 7 item 4), so it is opted into per run or per profile. Consequence
+  worth keeping: the unfiltered profile is byte-identical to before, so the 17
+  existing goldens stay valid.
+
+  Fails closed in three places: `--filter-egress` with an empty allowlist is an
+  error rather than a total blackhole; a missing csb-proxy is an error naming
+  `make ocaml-build`; `--no-sandbox` warns that egress is NOT filtered, because
+  the profile is the enforcement and without it `HTTPS_PROXY` is advisory.
+  Linux warns and disables itself rather than emitting a loopback-only rule that
+  would *look* like filtering while enforcing nothing (P4).
+
+  `--dump-sandbox` emits `localhost:<PROXY_PORT>` -- a placeholder, so the seam
+  starts no proxy and stays hermetic and snapshot-able.
+
+  **VERIFIED END-TO-END on aarch64-darwin (2026-08-06)**, from
+  `csb -v --shell --here --filter-egress` with the host list in
+  `~/.config/csb/allowed-hosts`:
+
+      $ env | grep -i proxy
+      HTTPS_PROXY=http://127.0.0.1:57066        (+ lowercase, HTTP_PROXY)
+      NO_PROXY=localhost,127.0.0.1              (+ lowercase)
+      CSB_PROXY_LOG=~/.csb/claudes/repo-<key>/csb-proxy.log
+      $ curl https://api.anthropic.com/                     -> 404
+      $ curl https://example.com/                           -> 403 CONNECT tunnel failed
+      $ curl --noproxy '*' https://api.anthropic.com/        -> Couldn't connect to server
+      $ cat "$CSB_PROXY_LOG"
+      [csb-proxy] ALLOW api.anthropic.com:443
+      [csb-proxy] DENY host not allowed: example.com
+
+  Four claims, all discharged. The third is the one that matters: **the ALLOWED
+  host also fails on a direct dial.** That is the difference between advisory and
+  enforced -- the sandbox has no independent egress capability at all, so the
+  allowlist is applied at the only reachable endpoint rather than depending on a
+  client choosing to honor `HTTPS_PROXY`. A proxy-unaware or hostile client
+  reaches nothing. The fourth: the decision log is readable from *inside* the
+  sandbox in the real topology, so section 7 item 4's mitigation works where it
+  is meant to.
+
+  **One bug this found, worth keeping as a shape.** The env-injection block sat
+  above `start_egress_proxy`, so `proxy_port` was empty, the block silently
+  skipped, and the result was a *correctly enforced* sandbox with no way to reach
+  the proxy and nothing explaining why. A silently isolated sandbox is the same
+  failure class `PLAN-007-escape.md` keeps rediscovering: a no-op that reads as
+  working code. Fixed by ordering, plus a `die` if the condition ever recurs.
+  Note why the suite could not catch it: `--dump-config` covers resolved config
+  and `--dump-sandbox` covers the profile, but the `env_overrides` array between
+  them is invisible to both. Launch-path ordering is only testable by launching.
+  If that class recurs, a third dump seam for the launch environment is the
+  answer; once is not enough evidence to add one.
+
+  **Outstanding handoff:** new Tier-2 goldens for the filtered profile must be
+  generated on a host (`test/helpers.bash:195` refuses inside csb, and D1 is why),
+  on both platforms.
 - **P3 -- config surface.** Layers 2-3 with union semantics (section 5), which is
   Phase B of section 9.
 - **P4 -- Linux netns.** `--unshare-net` + pasta + nftables, plus NixOS

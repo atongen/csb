@@ -66,6 +66,9 @@ let to_lines c =
     ("deny_read", joined c.deny_read);
     ("allow_write", joined c.allow_write);
     ("allow_socket", joined c.allow_socket);
+    ("filter_egress", string_of_bool c.filter_egress);
+    ("allow_host", joined c.allow_hosts);
+    ("allow_port", joined (List.map string_of_int c.allow_ports));
     ("paranoid_deny_read", joined c.paranoid_deny_read);
     ("paranoid_allow_read", joined c.paranoid_allow_read);
   ]

@@ -64,6 +64,9 @@ type t = {
   deny_read : string list;
   allow_write : string list;
   allow_socket : string list;
+  filter_egress : bool;
+  allow_hosts : string list;
+  allow_ports : int list;
   paranoid_deny_read : string list;
   paranoid_allow_read : string list;
 }
@@ -109,6 +112,9 @@ let default =
     deny_read = [];
     allow_write = [];
     allow_socket = [];
+    filter_egress = false;
+    allow_hosts = [];
+    allow_ports = [];
     paranoid_deny_read = [];
     paranoid_allow_read = [];
   }
