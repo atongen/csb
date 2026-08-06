@@ -242,7 +242,7 @@ OPTIONS:
                      token per line (Linux) — then exit before any launch, seeding,
                      or token_cmd. Drive it with --here in a git repo.
   -h, --help         show this help
-  -V, --version      print the version and exit
+      --version      print the version and exit
 EOF
 }
 
@@ -1302,7 +1302,7 @@ build_deny_wrapper() {
         fi
         # Kept under filtering too: the proxy resolves names, but removing these
         # was never measured, and DNS is not the egress channel -- the IP rule
-        # above is. See PLAN-007-agent-sandbox-again.md s10 item 3.
+        # above is. See PLAN-008-proxy.md s10 item 3.
         echo '(allow network-outbound (literal "/private/var/run/mDNSResponder"))'
         echo '(allow network-outbound (literal "/var/run/mDNSResponder"))'
         # Unix sockets INSIDE the sandbox's own trees: a Rails tmp/sockets/
@@ -1730,7 +1730,7 @@ cfg_tmpdir="${CSB_TMPDIR:-}"  # host scratch/temp dir (was config tmpdir=)
 deny_read_paths=()           # --deny-read / profile deny_read=: extra read denies (both modes)
 allow_write_paths=()         # --allow-write / profile allow_write=: extra write roots (both modes)
 allow_socket_paths=()        # --allow-socket / profile allow_socket=: reachable unix sockets (macOS; no-op on Linux)
-# Egress filtering (docs/PLAN-007-agent-sandbox-again.md P2). OFF by default:
+# Egress filtering (docs/PLAN-008-proxy.md P2). OFF by default:
 # turning it on amputates WebFetch for unlisted hosts, so it is opted into.
 filter_egress="false"; filter_egress_cli="false"
 allow_host_list=()           # --allow-host / profile allow_host= (+ $CSB_CONFIG_DIR/allowed-hosts)
@@ -1758,7 +1758,7 @@ csb_ephemeral="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    -V|--version) echo "$PROG $CSB_VERSION"; exit 0 ;;
+    --version) echo "$PROG $CSB_VERSION"; exit 0 ;;
     -d|--delete) mode="delete"; shift ;;
     --list-ns) mode="list_ns"; shift ;;
     -y|--yolo) yolo="true"; yolo_cli="true"; shift ;;

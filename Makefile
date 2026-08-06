@@ -9,6 +9,8 @@
 #   make test                         # bats suite (dump-only, fast)
 #   make test-escape                  # Tier 3: real launches, run OUTSIDE csb
 #   make ocaml-build                  # build csb-config + csb-proxy (dune)
+#   make ocaml-test                   # the bats config tests against csb-config
+#   make test-parity                  # bin/csb vs csb-config on the same argv
 #   make test-proxy                   # egress-proxy tests (real proxy + curl)
 #   make proxy-run                    # run csb-proxy in the foreground
 #
@@ -23,10 +25,10 @@ DEST    := $(BIN_DIR)/csb
 CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check test test-escape test-update test-proxy build update refresh \
-        ocaml-build ocaml-test proxy-run
+.PHONY: help install uninstall check test test-escape test-update test-proxy test-parity \
+        build update refresh ocaml-build ocaml-test proxy-run
 
-# The OCaml config-resolution layer (docs/PLAN-007-agent-sandbox-again.md s9).
+# The OCaml config-resolution layer (docs/PLAN-008-proxy.md s9).
 OCAML_DIR  := ocaml
 CSB_CONFIG := $(OCAML_DIR)/_build/default/bin/csb_config_cli.exe
 CSB_PROXY  := $(OCAML_DIR)/_build/default/bin/csb_proxy_cli.exe
@@ -35,7 +37,7 @@ CSB_PROXY  := $(OCAML_DIR)/_build/default/bin/csb_proxy_cli.exe
 PROXY_ALLOW ?= templates/allowed-hosts
 # Decision log csb-proxy also writes (stderr keeps streaming either way). A path
 # the SANDBOX can read, so a denied fetch is self-diagnosable rather than an
-# opaque transport error -- see docs/PLAN-007-agent-sandbox-again.md s7 item 4.
+# opaque transport error -- see docs/PLAN-008-proxy.md s7 item 4.
 # TMPDIR may or may not carry a trailing slash; normalize either form.
 PROXY_LOG ?= $(patsubst %/,%,$(or $(TMPDIR),/tmp))/csb-proxy.log
 
@@ -116,12 +118,23 @@ test-proxy: ocaml-build ## Egress-proxy tests (real proxy + curl; not in `make t
 		nix develop --command bats test/proxy/; \
 	fi
 
+# Every Tier-1 test that reaches csb only through --dump-config. The
+# dump-sandbox tag marks the rest: those need the profile generator, which
+# lives in bin/csb.
+OCAML_ORACLE := --filter-tags '!dump-sandbox' test/precedence.bats test/lists.bats test/validation.bats
+
 ocaml-test: ocaml-build ## Config-layer oracle: the bats config tests against csb-config
-	@echo "ocaml-test: WIP - fails until csb-config parses flags/profiles"
 	@if command -v bats >/dev/null 2>&1; then \
-		CSB=$(CSB_CONFIG) bats test/precedence.bats test/lists.bats; \
+		CSB=$(CSB_CONFIG) bats $(OCAML_ORACLE); \
 	else \
-		nix develop --command env CSB=$(CSB_CONFIG) bats test/precedence.bats test/lists.bats; \
+		nix develop --command env CSB=$(CSB_CONFIG) bats $(OCAML_ORACLE); \
+	fi
+
+test-parity: ocaml-build ## Differential oracle: bin/csb vs csb-config on the same argv
+	@if command -v bats >/dev/null 2>&1; then \
+		bats test/parity/; \
+	else \
+		nix develop --command bats test/parity/; \
 	fi
 
 build: ## Build the csb package from the flake (nix build .#csb)

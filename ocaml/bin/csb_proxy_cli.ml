@@ -1,4 +1,4 @@
-(* csb-proxy -- the egress allowlist proxy (docs/PLAN-007-agent-sandbox-again.md
+(* csb-proxy -- the egress allowlist proxy (docs/PLAN-008-proxy.md
    section 2).
 
      csb-proxy ALLOWLIST_FILE [--allow-port N]... [--log-file PATH]

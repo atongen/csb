@@ -155,6 +155,7 @@ load helpers
 
 # --- build-time validations (via --dump-sandbox) -----------------------------
 
+# bats test_tags=dump-sandbox
 @test "a path with a double quote is refused" {
   local repo qdir; repo="$(fake_repo)"
   # The path must exist on disk: build_deny_paths skips nonexistent paths before
@@ -166,6 +167,7 @@ load helpers
   assert_output --partial "double quote or backslash"
 }
 
+# bats test_tags=dump-sandbox
 @test "a paranoid-allow-read overlapping a deny root is refused" {
   local repo; repo="$(fake_repo)"
   mkdir -p "$TEST_TMP/deny/sub"
@@ -175,6 +177,7 @@ load helpers
   assert_output --partial "overlaps deny root"
 }
 
+# bats test_tags=dump-sandbox
 @test "a non-overlapping paranoid-allow-read is accepted" {
   local repo; repo="$(fake_repo)"
   mkdir -p "$TEST_TMP/allow"
@@ -184,6 +187,7 @@ load helpers
 
 # --- the IPC broker paths may not be re-opened by any flag (PLAN-007 D9) -----
 
+# bats test_tags=dump-sandbox
 @test "an allow-write over an IPC broker path is refused" {
   # On Linux the write binds are emitted AFTER the --tmpfs that removes the
   # session bus, so without this check the flag would layer the host directory
@@ -195,6 +199,7 @@ load helpers
   assert_output --partial "overlaps the IPC broker path"
 }
 
+# bats test_tags=dump-sandbox
 @test "an allow-socket over an IPC broker path is refused" {
   local repo; repo="$(fake_repo)"
   dump_sandbox "$repo" --allow-socket /run/dbus/system_bus_socket
@@ -202,6 +207,7 @@ load helpers
   assert_output --partial "overlaps the IPC broker path"
 }
 
+# bats test_tags=dump-sandbox
 @test "an allow-socket naming the nix daemon socket is refused by either spelling" {
   # The link and its target: on macOS /nix/var/nix/daemon-socket/socket resolves
   # OUT of the broker directory to /private/var/run/nix-daemon.socket, so
@@ -216,6 +222,7 @@ load helpers
   assert_output --partial "overlaps the IPC broker path"
 }
 
+# bats test_tags=dump-sandbox
 @test "an allow-socket naming a whole shared write root is refused" {
   # A subpath over /tmp makes HOST sockets reachable again, which is F3's shape
   # returning -- the measurement own_roots exists to encode.
@@ -225,6 +232,7 @@ load helpers
   assert_output --partial "is a shared write root"
 }
 
+# bats test_tags=dump-sandbox
 @test "an allow-socket under a shared write root is accepted" {
   # The positive control for the refusal above: one named socket is the point of
   # the flag, and only the whole tree is refused.
@@ -233,7 +241,7 @@ load helpers
   assert_success
 }
 
-# --- egress filtering (docs/PLAN-007-agent-sandbox-again.md P2) ---------------
+# --- egress filtering (docs/PLAN-008-proxy.md P2) ---------------
 
 @test "an invalid --allow-host is refused" {
   dump_config --allow-host 'bad host'
@@ -266,6 +274,7 @@ load helpers
   assert_output --partial "not a hostname or *.suffix pattern"
 }
 
+# bats test_tags=dump-sandbox
 @test "--filter-egress pins egress to the proxy port and nothing else" {
   [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
   local repo; repo="$(fake_repo)"
@@ -275,6 +284,7 @@ load helpers
   refute_line '(allow network-outbound (remote ip "*:*"))'
 }
 
+# bats test_tags=dump-sandbox
 @test "without --filter-egress egress stays open" {
   [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
   local repo; repo="$(fake_repo)"
@@ -284,6 +294,7 @@ load helpers
   refute_line '(allow network-outbound (remote ip "localhost:<PROXY_PORT>"))'
 }
 
+# bats test_tags=dump-sandbox
 @test "--allow-port emits a loopback rule only under --filter-egress" {
   [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
   local repo; repo="$(fake_repo)"
@@ -295,6 +306,7 @@ load helpers
   refute_line '(allow network-outbound (remote ip "localhost:5432"))'
 }
 
+# bats test_tags=dump-sandbox
 @test "--filter-egress on Linux warns and filters nothing" {
   [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS enforces via the seatbelt profile)"
   local repo; repo="$(fake_repo)"

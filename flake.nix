@@ -56,6 +56,9 @@
                 !(type == "directory" && pkgs.lib.hasSuffix "_build" path)
                 && !(pkgs.lib.hasSuffix ".install" path);
             };
+            # csb-config parses its flag surface with cmdliner; the proxy needs
+            # only unix + threads, which ship with the compiler.
+            buildInputs = [ pkgs.ocamlPackages.cmdliner ];
           };
         } // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           # Deny-list wrapper on Linux. csb resolves this to a store path at
@@ -83,8 +86,8 @@
               (pkgs.bats.withLibraries (p: [ p.bats-support p.bats-assert ]))
 
               # OCaml toolchain for the config-resolution layer under ocaml/
-              # (docs/PLAN-007-agent-sandbox-again.md section 9). cmdliner is a
-              # candidate CLI parser; yojson serializes the bash <-> OCaml seam.
+              # (docs/PLAN-008-proxy.md section 9). cmdliner parses csb-config's
+              # flag surface; yojson serializes the bash <-> OCaml seam.
               pkgs.ocamlPackages.ocaml
               pkgs.dune_3
               pkgs.ocamlPackages.cmdliner

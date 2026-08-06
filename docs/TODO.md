@@ -90,7 +90,7 @@
       working tree. Reason: operator choice -- csb stays private and
       unredistributed for now, and licensing implications are deferred (the
       agent-sandbox rebase that raised the question was since rejected on
-      technical grounds). See docs/PLAN-007-agent-sandbox-again.md appendix A.1.
+      technical grounds). See docs/PLAN-008-proxy.md appendix A.1.
 - [ ] revisit the deny-list defaults after the first month of use (blacklist
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch

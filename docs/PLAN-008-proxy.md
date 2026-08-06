@@ -1,18 +1,16 @@
-# plan 007-again -- csb's own egress control (allowed hosts + allowed ports)
+# plan 008 -- csb's own egress control (allowed hosts + allowed ports)
 
 Status: **DECIDED (2026-08-05) -- build it in csb, do not rebase on
-agent-sandbox.nix.** The filename is historical: this started as a feasibility
-study for rebasing csb on
+agent-sandbox.nix.** This started as a feasibility study for rebasing csb on
 [agent-sandbox.nix](https://github.com/archie-judd/agent-sandbox.nix) and ended
 by rejecting it. That evaluation is retained as Appendix A because it is the
-reason for the decision, and because it is the file `flake.nix`, `Makefile`, and
-`ocaml/bin/csb_config_cli.ml` point at.
+reason for the decision.
 
 Verified against upstream `HEAD` and against `bin/csb` on 2026-08-05.
 
 ---
 
-## Handoff (written 2026-08-06, for a fresh context)
+## Handoff (updated 2026-08-06, for a fresh context)
 
 Read this, then section 0, then section 9. Sections 1-8 are the design; the
 appendices are decision record and can be skipped until something questions the
@@ -24,10 +22,11 @@ decision itself.
 |---|---|
 | P1 -- `csb-proxy` (CONNECT allowlist proxy, OCaml) | **DONE**, 11/11 in `make test-proxy` |
 | P2 -- macOS wiring (`--filter-egress`) | **DONE**, verified end-to-end on aarch64-darwin; goldens on both platforms |
-| `packages.csb-tools` flake output | **DONE**; an installed csb resolves csb-proxy with no PATH dependency |
+| `packages.csb-tools` flake output | **DONE**; an installed csb resolves csb-proxy with no PATH dependency. `nix build .#csb-tools` green on aarch64-darwin 2026-08-06, with cmdliner |
 | `csb-config` milestone 1 (default config parity) | **DONE**, byte-identical to bash |
-| `csb-config` milestone 2 (the parser) | **NEXT. Not started.** |
-| P3 -- layered INI config, union-for-lists | designed (section 5), not started |
+| `csb-config` milestone 2 (the parser) | **DONE (2026-08-06)**, 73/73 in `make ocaml-test` |
+| parity tier (`make test-parity`) | **DONE**, 63/63; scaffolding, delete it with the bash resolution path |
+| P3 -- layered INI config, union-for-lists | designed (section 5), not started; Phase B |
 | P4 -- Linux netns so `--filter-egress` enforces there | not started; the big one |
 
 ### The expected numbers -- run these first to detect drift
@@ -35,37 +34,55 @@ decision itself.
     make check          # shellcheck clean
     make test           # 99 ok   (Tier 1+2; snapshots SKIP inside csb, by design)
     make test-proxy     # 11 ok   (needs network for 2 of them; rest are offline)
-    make ocaml-test     # 12 ok / 34 not ok  -- EXPECTED, this is the Phase A scoreboard
+    make ocaml-test     # 73 ok   (Phase A is complete; this is the whole oracle)
+    make test-parity    # 63 ok   (bin/csb vs csb-config on the same argv)
     diff <(./bin/csb --dump-config) <(./ocaml/_build/default/bin/csb_config_cli.exe)
                         # must be empty: 37 keys, byte-identical
 
-If `make test` is not 99 or the parity diff is non-empty, something regressed --
-fix that before starting anything new.
+If any of those five moves, something regressed -- fix that before starting
+anything new.
 
 ### The immediate next task
 
-Write `csb-config`'s parser so `make ocaml-test` goes 12/46 -> 46/46. Everything
-needed is decided and spiked; see section 9 for the evidence.
+Phase A is done. The recommended next step is **adoption**, because until it
+lands Phase A has bought nothing: `csb-config` passes all 73 tests and
+**nothing calls it** -- `bin/csb` still resolves its own config, so the two
+implementations can now drift silently. The strangler-fig step (section 9,
+"Adoption") closes that: `bin/csb` shells out and reads `KEY=VALUE` back with a
+plain `while IFS='=' read -r k v` loop -- **never `eval` the child's output** --
+keeping git/nix/exec in bash.
 
-- **cmdliner 2.x** (`Cmd` API -- `Term.eval` is gone), plus a ~10-line argv
-  pre-pass for the one flag with optional-value semantics (`-E` / `-E=NAME`),
-  because `~vopt` steals the `BRANCH` positional. Six argv shapes are tabulated
-  in section 9 with bash's exact answers -- match them.
-- **`-X --no-X` in one invocation is an ERROR** (operator-approved), not
-  last-wins. That is what makes cmdliner viable at all: it cannot see
-  cross-option ordering.
-- The 12 currently-passing tests are the ones whose expectation equals the
-  default config. They are free; do not read them as progress.
-- `validation.bats`'s ~21 dump-config tests join `make ocaml-test` once the
-  parser can produce csb's die messages. **28 of 30 validation tests assert
-  csb's exact error text** -- reproduce the strings, do not invent them.
-- The three P2 keys (`filter_egress`, `allow_host`, `allow_port`) exist in the
-  OCaml types but only as defaults; the parser must populate them, including
-  list accumulation across config file + profile + CLI (bash order is
-  CLI-first: see `--dump-config` with all three sources set).
+After that, two independent halves, in either order:
 
-This task is fully doable in-session: 46 black-box tests, no nix, no launch, no
-operator handoff. That is unusual here -- prefer it over work that needs the host.
+- **P3 / Phase B (section 5), in OCaml, in-session.** Config layers 2-3 with
+  union-for-lists. `csb-config` owns the whole resolution, so this is additive:
+  one more layer between the built-in defaults and the profile, and the INI
+  section-header parse. No nix, no launch, no operator handoff.
+- **P4 (section 4), on a NixOS host.** `--unshare-net` + pasta + nftables so
+  `--filter-egress` enforces on Linux instead of disabling itself. Cannot be
+  done from inside a csb sandbox at all.
+
+### The parity tier, and its expiry date
+
+`test/parity/parity.bats` (`make test-parity`, 63 ok) runs one argv through
+both implementations and requires identical stdout+stderr and exit status,
+normalizing only each binary's own `basename $0` prefix. It reuses
+`helpers.bash`'s isolated HOME, so a case is one line.
+
+It earns its place by being a *different kind* of test from the other 73: those
+encode an expected value someone typed, so each costs a decision; this one
+takes bin/csb's answer at run time as the expectation, so a case costs nothing
+and the grammar's corners get swept rather than its centre. That is how the
+`--accent --` divergence surfaced, and the bottom of the file pins it.
+
+**It is scaffolding. Delete it with the bash resolution path** -- once `bin/csb`
+delegates to `csb-config`, it compares csb-config to itself and asserts nothing.
+
+### No decisions left open
+
+`-V` was dropped from `bin/csb` (operator, 2026-08-06) rather than restored in
+csb-config: cmdliner owns `--version` and offers no short form, so removal is
+what makes the two agree. `--version` is unchanged.
 
 ### What cannot be done from inside a csb sandbox
 
@@ -79,7 +96,7 @@ operator handoff. That is unusual here -- prefer it over work that needs the hos
   end-to-end `--filter-egress` check are host-side.
 - Network egress DOES work in here, which is why `make test-proxy` is meaningful.
 
-### Landmines, all of which cost a round-trip this session
+### Landmines, each of which cost a round-trip
 
 1. **Wrap an error only by ADDING context, never replacing it.** Cost three
    round-trips: `Socket is closed` masking a 403; the proxy log living outside
@@ -87,7 +104,11 @@ operator handoff. That is unusual here -- prefer it over work that needs the hos
    `path '/Users/atongen/src' is a symlink` for a full turn.
 2. **Do not wrap `run` around a bats helper that already calls `run`**
    (`dump_config`, `dump_sandbox` both do). It silently swallows exit status.
-   Call them bare, like the rest of the suite.
+   Call them bare, like the rest of the suite. The related trap, one tier over:
+   **a bats test body runs under `errexit`**, so `out="$(thing_that_dies)"`
+   aborts the test at that line rather than recording the status. Every die
+   path in `parity.bats` needed `&& rc=0 || rc=$?`. The tell is a failure with
+   no diagnostic output -- the code that would have printed it never ran.
 3. **Scope `--dump-sandbox` assertions by platform.** Linux emits bwrap argv with
    no seatbelt syntax at all; three tests failed on NixOS for this.
 4. **A `path:` flake ref must be physical.** nix refuses a symlinked ancestor.
@@ -105,6 +126,25 @@ operator handoff. That is unusual here -- prefer it over work that needs the hos
 9. **Silent no-ops are this repo's recurring failure mode.** Prefer a loud error,
    and when a flag is a deliberate no-op on a platform, assert that it says so
    (see the Linux `--filter-egress` test).
+10. **cmdliner decides its own diagnostic styling at module-initialization
+    time**, from `NO_COLOR`/`TERM`, which is before any `main` can correct the
+    environment. Its `unknown option` error therefore arrives with SGR escapes
+    *inside* the phrase, and `assert_output --partial "unknown option"` fails on
+    bytes nobody can see. `Cli.eval` renders cmdliner's errors into a buffer and
+    unstyles them when stderr is not a tty. Anything else that greps a child's
+    stderr will meet this again.
+11. **A flake builds from the git tree, so a NEW source file is invisible to
+    `nix build` until it is `git add`ed.** Edits to tracked files are picked up
+    from the working tree, which makes the failure mode specific and confusing:
+    the new *contents* of a tracked file compile against the *absent* new
+    modules beside it, and nix reports "Unbound module Cli" for a file sitting
+    right there on disk. `git add` is enough; no commit is needed. Third entry
+    in this file's flake-ref family, after 4 and 5.
+12. **A test the port cannot answer must be excluded by a tag, not by a copy.**
+    `make ocaml-test` runs `--filter-tags '!dump-sandbox'`, so a new
+    `--dump-config` test joins the oracle automatically and a new
+    `--dump-sandbox` test breaks it loudly until tagged. Duplicating the file
+    would have let the two drift.
 
 ### Conventions that are not obvious from the code
 
@@ -616,22 +656,20 @@ strongest *now*, against known-good behavior.
 
 `csb-config` implements exactly `--dump-config`: a pure function
 `(argv, config files, env) -> KEY=VALUE`. No git, no nix, no exec, no writes.
-`bin/csb:1799-1844` is the whole spec -- **34 keys** in fixed order, booleans as
-`true`/`false`, lists joined with `|`, `token_cmd` as `present`/`absent`,
+`bin/csb`'s dump block is the whole spec -- **37 keys** in fixed order, booleans
+as `true`/`false`, lists joined with `|`, `token_cmd` as `present`/`absent`,
 `setenv` as VAR names only. `helpers.bash` confirms it "exits before repo
 lookup".
 
 Acceptance: `CSB=./csb-config` makes `lists.bats` (10) + `precedence.bats` (36)
-plus the ~21 dump-config tests in `validation.bats` pass **unchanged** -- ~67
+plus the 27 dump-config tests in `validation.bats` pass **unchanged** -- 73
 tests, none needing nix, a launch, or a repo. That tier runs *inside* a csb
 sandbox (`make test` is 99/99 green in one), unlike Tiers 2-3.
 
-**Baseline: `make ocaml-test` is 12/46 (2026-08-06.)** The target currently runs
-`precedence.bats` + `lists.bats`; `validation.bats`'s dump-config subset joins it
-once the parser exists to produce csb's die messages. The 12 passing are exactly
-the cases whose expectation equals the default config, so they are what a stub
-cannot get wrong -- not evidence of correctness. Driving 46/46 is Phase A, and
-the number is the progress metric.
+**`make ocaml-test` is 73/73 (2026-08-06).** The target selects the oracle by
+tag (`--filter-tags '!dump-sandbox'`) across all three files rather than naming
+tests, so the 12 `validation.bats` cases that need the sandbox-profile
+generator -- which lives in `bin/csb`, not here -- are the only ones excluded.
 
 ### Milestone 1 -- VERIFIED (2026-08-05)
 
@@ -724,11 +762,70 @@ So cmdliner is taken, for generated `--help` (replacing 177 lines of drift-prone
 hand-maintained usage prose -- plan-002 phase 4 already had to re-audit it),
 shell completion (csb has none today), and man pages. The hand-written
 HOME-choice explainer survives as a `~man` `S_DESCRIPTION` block. The dump
-contract stays at 34 keys; no goldens churn.
+contract stays at 37 keys; no goldens churn.
+
+### Milestone 2 -- BUILT (2026-08-06). 73/73.
+
+`lib/{err,env,lines,validate,profile,cli,resolve}.ml`, ~700 lines, driving
+`make ocaml-test` from 12/46 to 73/73 with **no test file's assertions
+touched** (the only edit to `test/` was a `# bats test_tags=dump-sandbox`
+line above the 12 tests that need the profile generator).
+
+The layering that came out of it, and it is the part worth keeping: three
+partial layers -- `Env.t`, `Profile.t`, `Cli.t` -- fold into the one
+`Types.t`. Only `Types.t` makes invalid states unrepresentable; the layers
+above it are deliberately full of `option`, because "the operator did not
+say" is the distinction the whole precedence chain is made of. `Cli.t` spells
+it as `'a option` for a flag pair and `Untouched | Cleared | Set of 'a` for a
+valued option with a `--no-` reset -- which is exactly bash's `$x` plus
+`$x_cli`, minus the chance of reading one without the other.
+
+Four decisions the tests forced, none of them anticipated by the spike:
+
+1. **The argv pre-pass got a second job.** Splitting at `--` cannot be left to
+   cmdliner (it folds the tail into the `BRANCH` positional and forgets where
+   the separator was), so the pre-pass owns both that and `-E=NAME`. Splitting
+   naively at the first `--` breaks `--accent --`, which bash accepts as a
+   value; the pre-pass therefore skips the token after a value-taking option,
+   the same way bash's `shift 2` does.
+2. **Optional values are modelled, not sentinelled.** `Arg.opt ~vopt:(Some
+   None) (some (some string))` gives `string option option`: `None` absent,
+   `Some None` named with no value, `Some (Some v)` valued. That third state is
+   what lets csb's own "`--nix-target` requires a NAME" fire instead of
+   cmdliner's phrasing, with no magic string standing in for "missing".
+3. **cmdliner's own diagnostics needed unstyling** -- landmine 10.
+4. **Two more `mutually exclusive` cases**, both extending the operator-approved
+   error-on-both rule to pairs the spike did not enumerate: `--nix-target` with
+   `--no-nix-target`, and `-d/--delete` with `--list-ns` (bash is last-wins on
+   both, which cmdliner cannot see).
+
+**Checked by differential sweep, not by inspection.** 41 argv/profile/env
+shapes were run through both binaries against one isolated HOME and diffed,
+including all six `-E` rows above, three-source list accumulation, and eleven
+die paths. Every output matched but for `basename $0` in the message prefix --
+and one case the bats suite does not reach, which is how it was found.
+
+Three known divergences from bash, all supersets or dead corners, none covered
+by a test:
+
+- **A value that looks like an option.** `--accent --` sets the accent to `--`
+  in bash; cmdliner applies its own end-of-options rule first and reports
+  "`--accent` requires a COLOR". The same shape covers `--deny-read --foo` and
+  friends. Both implementations exit 1 naming the same flag in every such case,
+  which is why the pre-pass does not canonicalize short options to
+  `--opt=value` to close it: no *valid* csb value begins with `-`, so the only
+  reachable difference is the wording of an error.
+- `--opt=value` is accepted for every valued option; bash accepts it only for
+  `-E=`/`--ephemeral=` and calls the rest an unknown option.
+- `allow_port` is an `int`, so a leading-zero port dumps normalized (`0080` ->
+  `80`) where bash echoes it back verbatim.
+
+(`-V` was a fourth until it was dropped from `bin/csb`; the two now agree on
+`--version` alone.)
 
 ### Phases
 
-- **A:** reproduce today exactly; ~67 tests pass unchanged.
+- **A: DONE (2026-08-06).** Reproduce today exactly; 73 tests pass unchanged.
 - **B:** add config layers 2-3 with union-for-lists (section 5). Additive.
 - **C:** revisit `-p` after real use.
 
