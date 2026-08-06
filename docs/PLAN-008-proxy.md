@@ -12,6 +12,122 @@ Verified against upstream `HEAD` and against `bin/csb` on 2026-08-05.
 
 ---
 
+## Handoff (written 2026-08-06, for a fresh context)
+
+Read this, then section 0, then section 9. Sections 1-8 are the design; the
+appendices are decision record and can be skipped until something questions the
+decision itself.
+
+### Where the work stands
+
+| piece | state |
+|---|---|
+| P1 -- `csb-proxy` (CONNECT allowlist proxy, OCaml) | **DONE**, 11/11 in `make test-proxy` |
+| P2 -- macOS wiring (`--filter-egress`) | **DONE**, verified end-to-end on aarch64-darwin; goldens on both platforms |
+| `packages.csb-tools` flake output | **DONE**; an installed csb resolves csb-proxy with no PATH dependency |
+| `csb-config` milestone 1 (default config parity) | **DONE**, byte-identical to bash |
+| `csb-config` milestone 2 (the parser) | **NEXT. Not started.** |
+| P3 -- layered INI config, union-for-lists | designed (section 5), not started |
+| P4 -- Linux netns so `--filter-egress` enforces there | not started; the big one |
+
+### The expected numbers -- run these first to detect drift
+
+    make check          # shellcheck clean
+    make test           # 99 ok   (Tier 1+2; snapshots SKIP inside csb, by design)
+    make test-proxy     # 11 ok   (needs network for 2 of them; rest are offline)
+    make ocaml-test     # 12 ok / 34 not ok  -- EXPECTED, this is the Phase A scoreboard
+    diff <(./bin/csb --dump-config) <(./ocaml/_build/default/bin/csb_config_cli.exe)
+                        # must be empty: 37 keys, byte-identical
+
+If `make test` is not 99 or the parity diff is non-empty, something regressed --
+fix that before starting anything new.
+
+### The immediate next task
+
+Write `csb-config`'s parser so `make ocaml-test` goes 12/46 -> 46/46. Everything
+needed is decided and spiked; see section 9 for the evidence.
+
+- **cmdliner 2.x** (`Cmd` API -- `Term.eval` is gone), plus a ~10-line argv
+  pre-pass for the one flag with optional-value semantics (`-E` / `-E=NAME`),
+  because `~vopt` steals the `BRANCH` positional. Six argv shapes are tabulated
+  in section 9 with bash's exact answers -- match them.
+- **`-X --no-X` in one invocation is an ERROR** (operator-approved), not
+  last-wins. That is what makes cmdliner viable at all: it cannot see
+  cross-option ordering.
+- The 12 currently-passing tests are the ones whose expectation equals the
+  default config. They are free; do not read them as progress.
+- `validation.bats`'s ~21 dump-config tests join `make ocaml-test` once the
+  parser can produce csb's die messages. **28 of 30 validation tests assert
+  csb's exact error text** -- reproduce the strings, do not invent them.
+- The three P2 keys (`filter_egress`, `allow_host`, `allow_port`) exist in the
+  OCaml types but only as defaults; the parser must populate them, including
+  list accumulation across config file + profile + CLI (bash order is
+  CLI-first: see `--dump-config` with all three sources set).
+
+This task is fully doable in-session: 46 black-box tests, no nix, no launch, no
+operator handoff. That is unusual here -- prefer it over work that needs the host.
+
+### What cannot be done from inside a csb sandbox
+
+`CSB_SANDBOX=true` in the environment means all of this needs the operator:
+
+- **`nix` is absent.** No flake builds, no `nix eval`.
+- **Tier-2 snapshots skip** (`test/helpers.bash:195`, and D1 in
+  `PLAN-007-escape.md` is why: goldens made in here are wrong AND compare equal).
+  Regeneration is `make test-update` from a normal terminal, on both platforms.
+- **No real launch** -- sandbox-exec cannot nest, so `make test-escape` and any
+  end-to-end `--filter-egress` check are host-side.
+- Network egress DOES work in here, which is why `make test-proxy` is meaningful.
+
+### Landmines, all of which cost a round-trip this session
+
+1. **Wrap an error only by ADDING context, never replacing it.** Cost three
+   round-trips: `Socket is closed` masking a 403; the proxy log living outside
+   the sandbox; and worst, my own handler swallowing nix's stderr, which hid
+   `path '/Users/atongen/src' is a symlink` for a full turn.
+2. **Do not wrap `run` around a bats helper that already calls `run`**
+   (`dump_config`, `dump_sandbox` both do). It silently swallows exit status.
+   Call them bare, like the rest of the suite.
+3. **Scope `--dump-sandbox` assertions by platform.** Linux emits bwrap argv with
+   no seatbelt syntax at all; three tests failed on NixOS for this.
+4. **A `path:` flake ref must be physical.** nix refuses a symlinked ancestor.
+   `bin/csb` now canonicalizes it; `repo_key` had already learned this.
+5. **A bare git `CSB_SELF` resolves the remote's DEFAULT branch.** A new flake
+   output on a feature branch is simply absent. Use `?ref=<branch>` or `path:`.
+6. **The proxy's stdout carries ONLY the port.** Build/status chatter belongs on
+   stderr; `make ocaml-build` violated this and broke `make proxy-run`.
+7. **`TMPDIR` may or may not end in a slash.** Normalize.
+8. **No seam covers the launch environment.** `--dump-config` covers resolved
+   config, `--dump-sandbox` covers the profile, and `env_overrides` between them
+   is invisible to both -- an ordering bug there produced a silently isolated
+   sandbox. A `die` guards that specific case now. If the class recurs, a third
+   dump seam is the answer; once is not enough evidence.
+9. **Silent no-ops are this repo's recurring failure mode.** Prefer a loud error,
+   and when a flag is a deliberate no-op on a platform, assert that it says so
+   (see the Linux `--filter-egress` test).
+
+### Conventions that are not obvious from the code
+
+- **The operator does all git.** Do not commit, branch, or push.
+- **ASCII only** in every file.
+- `make check` AND `make test` before calling anything done.
+- Prefer the read-only seams (`--dump-config`, `--dump-sandbox`) over reasoning
+  about the launch path; they are why Tier 1 is trustworthy.
+- Code comments describe the present only -- no history, no "was", no dates.
+  Narrative belongs in docs like this one.
+- `--filter-egress` is **OFF by default** and should stay that way until the
+  WebFetch cost (section 7 item 4) is judged acceptable; it is not a bug.
+
+### Open questions with no answer yet
+
+Section 10 is the live list. The two that matter most: whether removing the
+`mDNSResponder` allows under filtering breaks anything (DNS is unused there, the
+proxy resolves), and whether `platform.claude.com` is truly required -- it is
+listed on documentation grounds but has never been observed in a refusal log,
+and would only surface at token expiry.
+
+---
+
 ## 0. The decision
 
 Give csb per-host egress filtering by writing the missing pieces ourselves,
@@ -508,7 +624,14 @@ lookup".
 Acceptance: `CSB=./csb-config` makes `lists.bats` (10) + `precedence.bats` (36)
 plus the ~21 dump-config tests in `validation.bats` pass **unchanged** -- ~67
 tests, none needing nix, a launch, or a repo. That tier runs *inside* a csb
-sandbox (`make test` is 89/89 green in one), unlike Tiers 2-3.
+sandbox (`make test` is 99/99 green in one), unlike Tiers 2-3.
+
+**Baseline: `make ocaml-test` is 12/46 (2026-08-06.)** The target currently runs
+`precedence.bats` + `lists.bats`; `validation.bats`'s dump-config subset joins it
+once the parser exists to produce csb's die messages. The 12 passing are exactly
+the cases whose expectation equals the default config, so they are what a stub
+cannot get wrong -- not evidence of correctness. Driving 46/46 is Phase A, and
+the number is the progress metric.
 
 ### Milestone 1 -- VERIFIED (2026-08-05)
 

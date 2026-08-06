@@ -29,6 +29,13 @@ CSB_VERSION="0.3.1"
 # Default: the private remote. For local dev against a working tree,
 # override: CSB_SELF=path:/path/to/csb csb ...
 CSB_SELF="${CSB_SELF:-git+ssh://git@git.grandrew.com/atongen/csb.git}"
+# A path: ref must be PHYSICAL: nix refuses one with a symlinked ancestor
+# ("path '/Users/you/src' is a symlink"), and a symlinked source tree is a
+# common layout. Left as given when the directory does not exist, so the error
+# stays nix's. Same resolution repo_key does for namespace identity.
+case "$CSB_SELF" in
+  path:/*) CSB_SELF="path:$(cd "${CSB_SELF#path:}" 2>/dev/null && pwd -P || printf '%s' "${CSB_SELF#path:}")" ;;
+esac
 
 CSB_NS_ROOT="$HOME/.csb/claudes"
 CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"
@@ -1091,10 +1098,26 @@ start_egress_proxy() {
   if [[ -n "${CSB_PROXY_BIN:-}" ]]; then
     bin="$CSB_PROXY_BIN"
   else
-    bin="$(nix build "$CSB_SELF#csb-tools" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/csb-proxy"
+    local out=""
+    # Tolerate the failure so the hint below replaces nix's bare attribute error:
+    # a git+ssh CSB_SELF with no ?ref= resolves the remote's DEFAULT branch, so a
+    # new output living on a feature branch is simply absent.
+    # nix's own stderr is left visible: it names the actual cause (a missing
+    # attribute, an eval error, a build failure), and hiding it behind a generic
+    # hint costs more than the hint adds.
+    out="$(nix build "$CSB_SELF#csb-tools" "${nix_quiet[@]+"${nix_quiet[@]}"}" \
+             --no-link --print-out-paths || true)"
+    if [[ -z "$out" ]]; then
+      echo "$PROG: could not build csb-proxy from $CSB_SELF#csb-tools (nix error above)" >&2
+      echo "  a git remote CSB_SELF resolves its DEFAULT branch: add ?ref=<branch> for an" >&2
+      echo "  output that is not merged yet. Otherwise: CSB_SELF=path:/path/to/csb, or" >&2
+      echo "  set CSB_PROXY_BIN to a csb-proxy built with 'make ocaml-build'." >&2
+      die "--filter-egress could not resolve csb-proxy"
+    fi
+    bin="$out/bin/csb-proxy"
   fi
-  [[ -n "$bin" && -x "$bin" ]] \
-    || die "--filter-egress could not resolve csb-proxy (tried $CSB_SELF#csb-tools; override with CSB_PROXY_BIN)"
+  [[ -x "$bin" ]] \
+    || die "--filter-egress resolved csb-proxy to a non-executable path: $bin"
   [[ ${#allow_host_list[@]} -gt 0 ]] \
     || die "--filter-egress with an empty host allowlist would block all egress: add --allow-host, a profile allow_host=, or $CSB_CONFIG_DIR/allowed-hosts"
   proxy_allow_file="$(mktemp "${TMPDIR:-/tmp}/csb-allow.XXXXXX")"

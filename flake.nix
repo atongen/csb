@@ -46,7 +46,16 @@
           csb-tools = pkgs.ocamlPackages.buildDunePackage {
             pname = "csb-tools";
             version = "0.1.0";
-            src = ./ocaml;
+            # A `path:` flake ref copies the directory verbatim -- .gitignore does
+            # not apply -- so the local dune tree would land in the store carrying
+            # absolute host paths. Exclude it.
+            src = pkgs.lib.cleanSourceWith {
+              name = "csb-tools-src";
+              src = ./ocaml;
+              filter = path: type:
+                !(type == "directory" && pkgs.lib.hasSuffix "_build" path)
+                && !(pkgs.lib.hasSuffix ".install" path);
+            };
           };
         } // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           # Deny-list wrapper on Linux. csb resolves this to a store path at
