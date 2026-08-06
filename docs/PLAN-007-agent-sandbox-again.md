@@ -76,9 +76,34 @@ reply `200`, and splice bytes bidirectionally until either side closes; on deny,
 reply `403` and log the refusal. Plain (non-CONNECT) HTTP is refused rather than
 proxied -- everything csb needs is HTTPS, and refusing it removes a parser.
 
-Sizing: ~200-300 lines with `Unix` sockets and a thread per connection.
-**Zero new nix dependencies** -- `threads.posix` ships with the compiler. It
-reads the same allowlist the OCaml config layer already parses (section 5).
+**BUILT AND VERIFIED (2026-08-05).** `ocaml/lib/allowlist.ml` (host matching),
+`ocaml/lib/proxy.ml` (the server), `ocaml/bin/csb_proxy_cli.ml` (CLI). 8/8 tests
+green via `make test-proxy` (`test/proxy/proxy.bats`), driving real curl through
+a real proxy:
+
+    ok 1 allowed exact host tunnels a real TLS request
+    ok 2 allowed wildcard *.github.com matches a subdomain
+    ok 3 an unlisted host is refused
+    ok 4 an IP literal is refused even though it needs no name lookup
+    ok 5 a port other than 443 is refused on an allowed host
+    ok 6 a non-CONNECT (plain http) request is refused
+    ok 7 the wildcard does not match the bare parent domain
+    ok 8 a comment line in the allowlist is not a host
+
+Actual size: ~250 lines across the three files, **zero new nix dependencies**
+(`unix` + `threads.posix` ship with the compiler). Deliberately its own test
+tier, not part of `make test`, which stays dump-only and hermetic -- though only
+tests 1-2 need a network (a refused CONNECT never dials upstream), so the rest
+run offline and the two skip without connectivity.
+
+The port handshake is a FIFO: the proxy prints its bound port on stdout and the
+launcher blocks on `head -1` before emitting the profile. Same shape upstream
+uses, and it needs no polling.
+
+One non-obvious implementation requirement, learned the hard way in every proxy
+ever written: **`SIGPIPE` must be ignored** (`Sys.set_signal Sys.sigpipe
+Signal_ignore`), or the first client that hangs up mid-transfer kills the
+process.
 
 Dropping MITM is what makes it small, and it drops the expensive parts with it:
 no CA generation, no cert minting, no TLS library, no
@@ -319,8 +344,9 @@ and rewriting the precedence tests twice.
 
 ## 8. Effort and sequencing
 
-- **P1 -- proxy (macOS-usable).** OCaml CONNECT proxy + allowlist matching +
-  port handshake + refusal log. Standalone, testable without any sandbox.
+- **P1 -- proxy. DONE (2026-08-05).** OCaml CONNECT proxy + allowlist matching +
+  port handshake + refusal log; 8/8 in `make test-proxy`. Verified with curl, not
+  with claude -- see section 10 item 1.
 - **P2 -- macOS wiring.** Pin line 8 to the proxy port, `allowed_ports` rules,
   proxy env, `--dump-sandbox` updates, snapshot regen.
 - **P3 -- config surface.** Layers 2-3 with union semantics (section 5), which is
@@ -475,10 +501,14 @@ paths with spaces. `yojson` stays for that seam; nix never sees it.
 
 ## 10. Open questions, each with the command that answers it
 
-1. **Proxy under real claude.** Does an interactive claude session round-trip
-   through a CONNECT proxy with DNS denied? Claude is a Node client; this is the
-   one behavior that must work before anything else matters. **Answer this before
-   P1 is more than a spike.**
+1. **Proxy under real claude.** P1 proves the *tunnel* works -- curl completes a
+   real TLS round-trip through it. What is NOT proven: that claude's Node client
+   honors `HTTPS_PROXY` for its API calls and its own fetches, and that it copes
+   with DNS being unavailable. Node does not read `HTTPS_PROXY` natively -- it
+   depends on what the client library does -- so this is the one remaining
+   behavior that could invalidate the approach. Run a real session with the proxy
+   in front and an allow-nothing list, then read the refusal log (which also
+   answers item 2).
 2. **Which hosts does claude actually need?** Capture from the refusal log with
    an allow-nothing list, then build the default from evidence rather than
    guessing.

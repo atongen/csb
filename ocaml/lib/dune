@@ -1,2 +1,3 @@
 (library
- (name csb_config))
+ (name csb_config)
+ (libraries unix threads.posix))

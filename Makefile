@@ -8,6 +8,8 @@
 #   make check                        # shellcheck the shell scripts
 #   make test                         # bats suite (dump-only, fast)
 #   make test-escape                  # Tier 3: real launches, run OUTSIDE csb
+#   make ocaml-build                  # build csb-config + csb-proxy (dune)
+#   make test-proxy                   # egress-proxy tests (real proxy + curl)
 #
 # `check`/`build` prefer a tool already on PATH and fall back to csb's own
 # devShell (nix develop), so they work with only Nix installed.
@@ -20,12 +22,13 @@ DEST    := $(BIN_DIR)/csb
 CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check test test-escape test-update build update refresh \
+.PHONY: help install uninstall check test test-escape test-update test-proxy build update refresh \
         ocaml-build ocaml-test
 
 # The OCaml config-resolution layer (docs/PLAN-007-agent-sandbox-again.md s9).
 OCAML_DIR  := ocaml
 CSB_CONFIG := $(OCAML_DIR)/_build/default/bin/csb_config_cli.exe
+CSB_PROXY  := $(OCAML_DIR)/_build/default/bin/csb_proxy_cli.exe
 
 help: ## Show this help
 	@echo "csb — targets (override BIN_DIR to change the install location):"
@@ -80,13 +83,21 @@ test-update: ## Regenerate the Tier 2 snapshot goldens for THIS platform
 	fi
 	@echo "test-update: regenerated test/snapshots/$$(uname -s | tr 'A-Z' 'a-z')/ - review the diff"
 
-ocaml-build: ## Build csb-config (dune, ocaml/)
+ocaml-build: ## Build csb-config + csb-proxy (dune, ocaml/)
 	@if command -v dune >/dev/null 2>&1; then \
 		dune build --root $(OCAML_DIR); \
 	else \
 		nix develop --command dune build --root $(OCAML_DIR); \
 	fi
 	@echo "ocaml-build: $(CSB_CONFIG)"
+	@echo "ocaml-build: $(CSB_PROXY)"
+
+test-proxy: ocaml-build ## Egress-proxy tests (real proxy + curl; not in `make test`)
+	@if command -v bats >/dev/null 2>&1; then \
+		bats test/proxy/; \
+	else \
+		nix develop --command bats test/proxy/; \
+	fi
 
 ocaml-test: ocaml-build ## Config-layer oracle: the bats config tests against csb-config
 	@echo "ocaml-test: WIP - fails until csb-config parses flags/profiles"
