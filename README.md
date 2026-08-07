@@ -57,7 +57,7 @@ The claude binary comes from *csb's own* flake; the repo never imports csb.
 ## Quickstart
 
 ```sh
-make install                     # copy bin/csb into ~/bin (must be on PATH)
+make install                     # csb -> ~/bin (on PATH); csb-config -> ~/.csb/bin
 export CLAUDE_CODE_OAUTH_TOKEN=...      # from 'claude setup-token'; or use --seed-creds
 cd ~/src/your/repo               # a repo with a flake.nix (see "What a repo needs")
 csb feature/foo                  # worktree for feature/foo + claude in the devShell
@@ -65,6 +65,23 @@ csb feature/foo                  # worktree for feature/foo + claude in the devS
 
 Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
 box); `csb` shells out to `nix`.
+
+csb installs as two programs. `csb` orchestrates -- git, nix, the sandbox
+profile, the launch -- and `csb-config` owns the flag grammar, the profiles,
+their validation, `--help` and `--dump-config`.
+
+They land in different places on purpose. `csb` is a portable shell script and
+goes in your `bin` dir (`BIN_DIR`, default `~/bin`), which is commonly under
+version control. `csb-config` is a native per-platform binary, so it goes in
+csb's own `~/.csb/bin` (`TOOLS_DIR`) instead -- out of a versioned bin dir, and
+outside every sandbox write root, which matters because csb-config decides
+policy and runs unsandboxed.
+
+csb finds it by searching, in order: `CSB_CONFIG_BIN` (a verbatim path), a
+`csb-config` beside the `csb` script, this repo's own `ocaml/_build` when you
+run `./bin/csb` from a checkout, `~/.csb/bin`, then `PATH`. If you override
+`TOOLS_DIR`, put that directory on `PATH` or set `CSB_CONFIG_BIN`; `make
+install` warns when neither holds.
 
 Five environment variables tune csb:
 
@@ -876,8 +893,10 @@ shellcheck), so `csb --here` runs claude on the csb repo like any other.
 
 ```
 bin/csb                    the orchestrator (worktree + deny-list + launch)
+ocaml/                     csb-config (config resolution, --help, --dump-config)
+                           and csb-proxy (the --filter-egress CONNECT proxy)
 LICENSE                    MIT
-flake.nix                  packages {csb, claude, bwrap (linux)} + apps + templates
+flake.nix                  packages {csb, csb-tools, claude, bwrap (linux)} + apps
 templates/repo/            scaffold: a standalone dev-shell flake for a consuming repo
 templates/home/            starter seed-home skeleton (copy to ~/.config/csb/home)
 Makefile                   install, lint, test, and build targets (make help)
@@ -886,6 +905,8 @@ docs/PLAN-002.md           the implemented design (single mode, deny-list, profi
 docs/PLAN-003.md           roadmap: VM second boundary (not implemented)
 docs/PLAN-004.md           the pre-release audit: findings, fixes, scope decisions
 docs/PLAN-005-tests.md     the test-suite plan (dump seams + bats tiers)
+docs/PLAN-007-escape.md    the sandbox-escape investigation and what it closed
+docs/PLAN-008-proxy.md     egress filtering, and the OCaml config layer
 docs/TODO.md               current state and next steps
 ```
 

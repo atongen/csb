@@ -25,12 +25,15 @@
         let
           pkgs = pkgsFor system;
         in
-        {
+        rec {
           # The orchestrator script (worktree + launch). Primary install is via
           # `make install` into ~/bin; this output is for `nix run`/profile use.
+          # csb-tools is a runtime input because csb resolves its whole
+          # configuration through csb-config, on every invocation: it looks
+          # beside itself first, then PATH, which this supplies.
           csb = pkgs.writeShellApplication {
             name = "csb";
-            runtimeInputs = [ pkgs.git pkgs.coreutils ];
+            runtimeInputs = [ pkgs.git pkgs.coreutils csb-tools ];
             text = builtins.readFile ./bin/csb;
           };
 

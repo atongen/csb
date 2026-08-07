@@ -22,10 +22,11 @@ decision itself.
 |---|---|
 | P1 -- `csb-proxy` (CONNECT allowlist proxy, OCaml) | **DONE**, 11/11 in `make test-proxy` |
 | P2 -- macOS wiring (`--filter-egress`) | **DONE**, verified end-to-end on aarch64-darwin; goldens on both platforms |
-| `packages.csb-tools` flake output | **DONE**; an installed csb resolves csb-proxy with no PATH dependency. `nix build .#csb-tools` green on aarch64-darwin 2026-08-06, with cmdliner |
+| `packages.csb-tools` flake output | **DONE**; `nix build .#csb-tools` green on aarch64-darwin 2026-08-06, with cmdliner |
 | `csb-config` milestone 1 (default config parity) | **DONE**, byte-identical to bash |
 | `csb-config` milestone 2 (the parser) | **DONE (2026-08-06)**, 73/73 in `make ocaml-test` |
-| parity tier (`make test-parity`) | **DONE**, 63/63; scaffolding, delete it with the bash resolution path |
+| **adoption -- `bin/csb` delegates resolution to `csb-config`** | **DONE (2026-08-06)**, 99/99 in `make test`; see below. NOT yet exercised by a real launch |
+| parity tier (`make test-parity`) | **DELETED** with the bash resolution path, as planned -- it compared csb-config to itself |
 | P3 -- layered INI config, union-for-lists | designed (section 5), not started; Phase B |
 | P4 -- Linux netns so `--filter-egress` enforces there | not started; the big one |
 
@@ -34,55 +35,161 @@ decision itself.
     make check          # shellcheck clean
     make test           # 99 ok   (Tier 1+2; snapshots SKIP inside csb, by design)
     make test-proxy     # 11 ok   (needs network for 2 of them; rest are offline)
-    make ocaml-test     # 73 ok   (Phase A is complete; this is the whole oracle)
-    make test-parity    # 63 ok   (bin/csb vs csb-config on the same argv)
+    make ocaml-test     # 73 ok   (csb-config alone, without the bash wrapper)
     diff <(./bin/csb --dump-config) <(./ocaml/_build/default/bin/csb_config_cli.exe)
                         # must be empty: 37 keys, byte-identical
 
-If any of those five moves, something regressed -- fix that before starting
+If any of those four moves, something regressed -- fix that before starting
 anything new.
+
+### Adoption, as built
+
+`bin/csb` no longer parses a flag. It runs `csb-config` over its own argv and
+reads the resolution back; git, nix, the sandbox profile and exec stay in bash.
+That deleted about 620 lines from `bin/csb` -- `usage()`, the argparse loop,
+`load_profile` and friends, the six validators, the dump block -- against about
+165 added, and it is the reason the two implementations can no longer drift:
+there is only one.
+
+**The contract, which is the part to understand before changing either side:**
+
+- `bin/csb` sets `CSB_EMIT_TO=<tempfile>` and runs the child under
+  `exec -a "$PROG"`, so argv[0] -- and therefore every diagnostic prefix, the
+  usage line and the version string -- names the program the operator typed.
+- **Exit 0**: the file holds the resolution. **Exit 2**: csb-config answered the
+  operator itself (`--help`, `--version`, `--dump-config`) and resolved nothing,
+  so `bin/csb` exits 0 without launching. **Anything else**: it already said why
+  on stderr, and `bin/csb` propagates the status (cmdliner's parse errors are
+  124, a `die` is 1).
+- The wire format is NUL-terminated `KEY=VALUE` records, a list key repeating
+  once per element. NUL because it is the one byte a path, a claude argument or
+  a `setenv` value cannot contain. **Parsed, never `eval`ed.**
+- The emit file carries `token_cmd` unredacted -- that is the whole reason it is
+  a private file rather than stdout -- and is unlinked as soon as it is read.
+- `--dump-config` stays redacted and byte-identical: it is answered by
+  csb-config, not by the emit path.
+
+**Two guards, because a silent no-op is this repo's recurring failure mode.** An
+unrecognized key is fatal, which catches a rename or an addition on one side
+only. A *missing* scalar key would not be caught by that, and `paranoid` or
+`filter_egress` quietly reverting to its default is a weaker sandbox that looks
+normal -- so `csb_config_scalars` in `bin/csb` lists all 25 and requires each to
+arrive. List keys are absent when empty, so only scalars can be required.
+
+**The emit key set is exactly what `bin/csb` consumes** -- 25 scalars plus 10
+list keys. Note it is not the dump's 37: the three raw `nix_target*` keys are
+gone, because `effective_nix_target` was the only consumer and csb-config now
+computes it as `nix_target_effective`; and `dump` was added, carrying
+`sandbox` for the seam bash still has to serve.
+
+**Verified on the host (2026-08-07).** `make test` (99) and the dump seams cover
+everything up to the launch, and no further -- landmine 8's blind spot, which
+adoption widened, because `claude_args`, `keep`, `setenv` and `token_cmd` now
+cross the emit seam and no dump reaches any of them. So these were driven by
+hand on aarch64-darwin, running the branch checkout directly rather than
+installing it:
+
+- `nix build .#csb` succeeds with the split install and `csb-tools` in
+  `runtimeInputs`.
+- `csb --here -s` launches and gives a working shell.
+- **`token_cmd` round-trips through a real claude launch.** The control matters
+  and is easy to get wrong: `CLAUDE_CODE_OAUTH_TOKEN` is in `keep_vars`, so a
+  host-set token sails through the scrub and authenticates the session whether
+  or not `token_cmd` ever fires. Run with it unset --
+  `( unset CLAUDE_CODE_OAUTH_TOKEN; csb --here -p <profile> )` -- and a session
+  that authenticates can only have got its token across the seam. It did.
+
+Still unconfirmed by a launch: `keep` and `setenv` (the `emittest` profile in
+this section's sibling notes exercises both, including a `setenv` value carrying
+spaces and an interior `=`), and `make install` on a real HOME rather than the
+fake one used in-session.
+
+A note for whoever trials a branch build side by side with an installed csb: the
+working-tree fallback is relative to `$0`'s directory, so a **symlink** shim in a
+bin dir resolves to the wrong place and dies. Use an `exec` wrapper or an
+absolute path. Also, `main` knows none of the P2 profile keys
+(`filter_egress`, `allow_host`, `allow_port`), and both versions read the same
+`~/.config/csb/profiles` -- so one of those keys in a shared profile takes the
+OLD csb down with `unknown key`.
+
+### `--help` is cmdliner's now
+
+`usage()` is gone; the 177 lines of hand-maintained prose live in csb-config as
+option `~doc` strings and a `~man` block, grouped into HOME SELECTION, SANDBOX
+POLICY, EGRESS FILTERING, SEEDING THE LAUNCH HOME, READ-ONLY SEAMS and
+NEGATIONS, plus a PROFILES section for the key list. This is what section 9
+decided; the HOME-choice explainer survived as prose, as promised.
+
+One wrinkle worth knowing, and it is landmine 10's sibling: cmdliner picks its
+help *renderer* from `TERM`, not from whether anyone is watching, so a piped
+`--help` came out overstruck for a pager that was not there. The driver rewrites
+a bare `-h`/`--help` to `--help=plain` when stdout is not a tty.
+
+`CSB_VERSION` moved out of `bin/csb` into `ocaml/lib/version.ml`, so there is one
+copy. `csb --version` still prints `csb 0.3.1`.
+
+### How `csb-config` is found, and why not the way `csb-proxy` is
+
+`CSB_CONFIG_BIN` verbatim, else a `csb-config` beside `$0`, else this repo's own
+`ocaml/_build/.../csb_config_cli.exe`, else `$CSB_TOOLS_DIR` (`~/.csb/bin`),
+else `PATH`, else a die naming `make install`.
+
+The working-tree entry is why `./bin/csb --here --dump-config` still just works
+after `make ocaml-build` -- `CLAUDE.md` names that seam as the in-session
+verification path, so needing an env var for it would have taxed every future
+session. It comes before the installed copies on purpose: running the tree tests
+the tree, even on a host with csb installed.
+
+**`csb-config` does NOT go in the bin dir** (operator, 2026-08-07). The first cut
+installed both there and was wrong for a reason the Makefile had already written
+down: that dir "may itself be under version control, so it must hold real,
+portable content", and a per-platform native binary is portable content's
+opposite. So `make install` splits -- `BIN_DIR` (`~/bin`) takes the script,
+`TOOLS_DIR` (`~/.csb/bin`) takes the binary. Two things fall out of it:
+
+- **`~/.csb/bin` is outside every sandbox write root, and that is a requirement,
+  not a coincidence.** csb-config decides policy and runs *unsandboxed*, so a
+  writable one is a persistence vector of exactly the `.git/hooks` class that
+  section 5 rules on. The write roots are the worktree, the git dir,
+  `/private/tmp`, `/dev` and the launch HOME -- so the launch HOMEs under
+  `~/.csb/claudes/<ns>` are writable and this sibling is not. **Never cache or
+  install it under the temp dir**, which is a write root.
+- An overridden `TOOLS_DIR` that is neither the default nor on `PATH` produces a
+  csb that dies on every invocation, so `make install` warns at install time
+  rather than leaving it to first use.
+
+**Deliberately no `nix build` fallback**, which is how
+`csb-proxy` resolves: that runs only under `--filter-egress`, whereas this runs
+on every invocation, and a nix eval in front of `csb --help` is not a trade
+worth making. It also keeps section 6 item 5 true -- no nix on the policy path.
+
+The cost is that the two must be installed together, which `make install` does
+in one step, and `packages.csb` gained `csb-tools` in `runtimeInputs` so
+`nix run` keeps working. The split install is verified against a fake HOME
+(`make install HOME=$T BIN_DIR=$T/bin TOOLS_DIR=$T/.csb/bin`, then the installed
+csb resolving with an empty PATH and no env). **The flake half is not: nix is
+absent in here.** `nix build .#csb` is an operator check.
 
 ### The immediate next task
 
-Phase A is done. The recommended next step is **adoption**, because until it
-lands Phase A has bought nothing: `csb-config` passes all 73 tests and
-**nothing calls it** -- `bin/csb` still resolves its own config, so the two
-implementations can now drift silently. The strangler-fig step (section 9,
-"Adoption") closes that: `bin/csb` shells out and reads `KEY=VALUE` back with a
-plain `while IFS='=' read -r k v` loop -- **never `eval` the child's output** --
-keeping git/nix/exec in bash.
-
-After that, two independent halves, in either order:
+Two independent halves, in either order:
 
 - **P3 / Phase B (section 5), in OCaml, in-session.** Config layers 2-3 with
-  union-for-lists. `csb-config` owns the whole resolution, so this is additive:
-  one more layer between the built-in defaults and the profile, and the INI
-  section-header parse. No nix, no launch, no operator handoff.
+  union-for-lists. Adoption is what makes this worth doing: `csb-config` owns
+  the whole resolution now, so a new layer between the built-in defaults and the
+  profile reaches the launch for free. No nix, no launch, no operator handoff.
 - **P4 (section 4), on a NixOS host.** `--unshare-net` + pasta + nftables so
   `--filter-egress` enforces on Linux instead of disabling itself. Cannot be
   done from inside a csb sandbox at all.
 
-### The parity tier, and its expiry date
-
-`test/parity/parity.bats` (`make test-parity`, 63 ok) runs one argv through
-both implementations and requires identical stdout+stderr and exit status,
-normalizing only each binary's own `basename $0` prefix. It reuses
-`helpers.bash`'s isolated HOME, so a case is one line.
-
-It earns its place by being a *different kind* of test from the other 73: those
-encode an expected value someone typed, so each costs a decision; this one
-takes bin/csb's answer at run time as the expectation, so a case costs nothing
-and the grammar's corners get swept rather than its centre. That is how the
-`--accent --` divergence surfaced, and the bottom of the file pins it.
-
-**It is scaffolding. Delete it with the bash resolution path** -- once `bin/csb`
-delegates to `csb-config`, it compares csb-config to itself and asserts nothing.
+Before either, the operator checks adoption left open: a real launch, `nix build
+.#csb`, and `make install`.
 
 ### No decisions left open
 
 `-V` was dropped from `bin/csb` (operator, 2026-08-06) rather than restored in
 csb-config: cmdliner owns `--version` and offers no short form, so removal is
-what makes the two agree. `--version` is unchanged.
+what makes the two agree.
 
 ### What cannot be done from inside a csb sandbox
 
@@ -145,6 +252,24 @@ what makes the two agree. `--version` is unchanged.
     `--dump-config` test joins the oracle automatically and a new
     `--dump-sandbox` test breaks it loudly until tagged. Duplicating the file
     would have let the two drift.
+13. **An assignment prefix on `exec` does not reach the exec'd program.**
+    `VAR=x exec -a name cmd` sets `VAR` in the *shell* -- `exec` is a special
+    builtin, so the prefix persists rather than being exported for one command.
+    The adoption seam passes `CSB_EMIT_TO` that way and would have handed
+    csb-config an unset variable, which is the quiet kind of wrong: csb-config
+    would have printed the dump and exited 0, and `bin/csb` would have launched
+    with an empty resolution. Write `( export VAR=x; exec -a name cmd )`.
+14. **cmdliner picks its help RENDERER from `TERM` too**, not only its
+    diagnostic styling (landmine 10), and not from whether stdout is a tty. With
+    a real `TERM` and no pager on `PATH` a piped `--help` arrives overstruck
+    (`N^HNA^HAM^HME^HE`), so `csb --help | grep` misses. Rewriting a bare
+    `-h`/`--help` to `--help=plain` when stdout is not a tty is the fix, and it
+    is the same shape as `Cli.eval`'s unstyling. Expect a third member of this
+    family before trusting any cmdliner output to a pipe.
+15. **shellcheck SC2094 fires on `rm -f "$f"` inside `while ... done <"$f"`** --
+    read and write of one file in the same construct. The fix is also the better
+    code: record the fault, `break`, and unlink once after the loop, so the
+    temp file is removed on every path rather than only on the fatal one.
 
 ### Conventions that are not obvious from the code
 
@@ -661,6 +786,10 @@ as `true`/`false`, lists joined with `|`, `token_cmd` as `present`/`absent`,
 `setenv` as VAR names only. `helpers.bash` confirms it "exits before repo
 lookup".
 
+(That reads as of the spec being frozen. Since adoption there is no dump block
+in `bin/csb` to be the spec: `csb-config` owns `--dump-config`, and `bin/csb`
+passes the flag through. The 37 keys and their order are unchanged.)
+
 Acceptance: `CSB=./csb-config` makes `lists.bats` (10) + `precedence.bats` (36)
 plus the 27 dump-config tests in `validation.bats` pass **unchanged** -- 73
 tests, none needing nix, a launch, or a repo. That tier runs *inside* a csb
@@ -826,14 +955,20 @@ by a test:
 ### Phases
 
 - **A: DONE (2026-08-06).** Reproduce today exactly; 73 tests pass unchanged.
+- **Adoption: DONE (2026-08-06).** `bin/csb` delegates; the bash resolution path
+  and the parity tier are deleted. The contract is in the handoff at the top of
+  this file -- read that, not this paragraph, before touching either side.
 - **B:** add config layers 2-3 with union-for-lists (section 5). Additive.
 - **C:** revisit `-p` after real use.
 
-Adoption is strangler-fig: `bin/csb` shells out to `csb-config` and reads the
-resolved values back, keeping git/nix/exec in bash. Read `KEY=VALUE` with a
-plain `while IFS='=' read -r k v` loop -- **do not `eval` the child's output** --
-and use a NUL-delimited form for list-valued keys, since csb already handles
-paths with spaces. `yojson` stays for that seam; nix never sees it.
+Adoption was strangler-fig and came out close to the sketch: `bin/csb` runs
+`csb-config` over its own argv and reads `KEY=VALUE` back, parsed and never
+`eval`ed, keeping git/nix/exec in bash. Two things the sketch got wrong.
+NUL-termination turned out to be right for *every* key rather than only the
+list-valued ones -- one framing for the whole stream is simpler than two, and it
+costs nothing. And `yojson` was never needed: repeating a list key once per
+element is enough structure for a flat record set, so the dependency went unused
+and the seam has no parser on either side.
 
 ---
 

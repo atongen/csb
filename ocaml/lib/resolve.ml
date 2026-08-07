@@ -173,6 +173,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(profile : Profile.t option) ~tmpdir 
 
   {
     Types.mode = cli.mode;
+    dump = cli.dump;
     no_launch = cli.no_launch;
     target =
       (if here then Types.Here

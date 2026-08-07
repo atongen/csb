@@ -32,6 +32,13 @@ type home =
   | Throwaway of throwaway
   | Real_home
 
+(* The two read-only seams. Config is answered by csb-config itself; sandbox
+   needs the profile generator, which lives in bin/csb, so it travels onward. *)
+type dump =
+  | No_dump
+  | Dump_config
+  | Dump_sandbox
+
 type nix_targets = {
   shared : string option;     (* --nix-target *)
   for_shell : string option;  (* --nix-target-shell *)
@@ -40,6 +47,7 @@ type nix_targets = {
 
 type t = {
   mode : mode;
+  dump : dump;
   no_launch : bool;
   target : target;
   runner : runner;
@@ -88,6 +96,7 @@ let effective_nix_target c =
 let default =
   {
     mode = Launch;
+    dump = No_dump;
     no_launch = false;
     target = List_worktrees;
     runner = Claude;

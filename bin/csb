@@ -19,11 +19,16 @@
 #                 it via nix (keeps --dump-sandbox / tests hermetic).
 #      CSB_PROXY_BIN use this csb-proxy binary verbatim instead of resolving
 #                 "$CSB_SELF#csb-tools" (same purpose, for --filter-egress).
+#      CSB_CONFIG_BIN use this csb-config binary verbatim instead of searching
+#                 beside this script, then ~/.csb/bin, then $PATH.
+#
+# Config resolution -- the flag grammar, the profiles, the validation, --help
+# and --dump-config -- belongs to csb-config, not to this script; see
+# docs/PLAN-008-proxy.md section 9. This script keeps git, nix and exec.
 
 set -euo pipefail
 
 PROG=$(basename "$0")
-CSB_VERSION="0.3.1"
 
 # csb supplies the claude binary from its own flake (so repos stay decoupled).
 # Default: the private remote. For local dev against a working tree,
@@ -38,213 +43,16 @@ case "$CSB_SELF" in
 esac
 
 CSB_NS_ROOT="$HOME/.csb/claudes"
+# Where `make install` puts csb's native helpers. Deliberately NOT the bin dir
+# holding the csb script: that dir is meant to hold portable content and is
+# commonly under version control, which a per-platform binary must not enter.
+# Outside every sandbox write root, which matters -- csb-config decides policy
+# and runs unsandboxed, so a writable one would be a persistence vector of the
+# same class as .git/hooks. The launch HOMEs under claudes/ are write roots;
+# this sibling is not.
+CSB_TOOLS_DIR="$HOME/.csb/bin"
 CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"
 CSB_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/csb"
-
-usage() {
-  cat <<EOF
-$PROG $CSB_VERSION -- claude sandbox
-
-USAGE:
-  $PROG [OPTIONS] BRANCH [-- ARGS...]     worktree for BRANCH + claude in the devShell
-  $PROG [OPTIONS] --here [-- ARGS...]     launch in the current dir (no worktree)
-  $PROG -n BRANCH                         prepare BRANCH's worktree, don't launch
-  $PROG -d BRANCH                         remove BRANCH's worktree (keeps the branch)
-  $PROG --list-ns                         list csb namespace configs
-  $PROG                                   list csb worktrees
-
-Claude (or the -s shell) runs inside the repo's devShell with a scrubbed
-environment, a private HOME (per-repo by default), a read deny-list (~/.ssh,
-~/.aws, the real ~/.claude, etc. — extend with --deny-read / a profile's
-deny_read=), and a write allow-list (worktree, git dir, the launch HOME, tmp —
-extend with --allow-write / a profile's allow_write=). Network egress stays
-open, so local services over TCP stay reachable; host IPC does not — mach/XPC
-and every HOST unix socket on macOS, the session/system bus and the nix daemon
-socket on Linux — so a host service cannot act outside the sandbox on the
-sandbox's behalf. Unix sockets inside the sandbox's own trees (worktree, git
-dir, launch HOME) still work, and a host socket can be named with
---allow-socket / a profile's allow_socket=. See the README's threat model, and
-'Known gaps' for what is still open.
-
-OPTIONS:
-  -y, --yolo         pass --dangerously-skip-permissions to claude (allow-all)
-      --paranoid     tighten reads: instead of allow-minus-deny-list, make the
-                     real HOME read-DENY except the write-allow roots (worktree,
-                     git dir, namespace HOME, tmp). The redirected HOME keeps
-                     tool caches working; re-expose read-only paths with
-                     --paranoid-allow-read, deny extra trees with
-                     --paranoid-deny-read. Also via a profile's paranoid=true.
-      --pasteboard   macOS: re-allow pbcopy/pbpaste inside the sandbox. OFF by
-                     default -- the pasteboard is a read channel around the whole
-                     file deny-list (a secret copied from a password manager
-                     while an agent runs is readable by it). No-op on Linux and
-                     under --no-sandbox. Also via a profile's pasteboard=true.
-      --here         no worktree: run in the current directory (quick ops).
-                     Mutually exclusive with BRANCH.
-
-  HOME choice: -N, -E, and --real-home are three MUTUALLY-EXCLUSIVE answers to
-  one question -- which HOME the sandboxed process gets. Each one (potentially
-  creates and) sets \$HOME inside the sandbox; they differ only in persistence
-  and in whether that HOME is WRITABLE inside the sandbox:
-    default        per-repo HOME ~/.csb/claudes/repo-<key>, persistent,
-                   writable, shared by all the repo's branches/worktrees.
-    -N/--ns NAME   a shared, cross-repo HOME ~/.csb/claudes/@NAME, persistent,
-                   writable. NAME and @NAME mean the same thing.
-    -E/--ephemeral throwaway HOME under tmp, not persisted, writable.
-    --real-home    the operator's REAL HOME: NOT redirected, NOT seeded, and
-                   NOT made writable (reads still obey the deny-list).
-
-  -N, --ns NAME      use a shared, cross-repo HOME at ~/.csb/claudes/@NAME
-                     instead of the per-repo default. NAME and @NAME are
-                     equivalent (the @ is added if you omit it). Persistent and
-                     never auto-removed by -d.
-  -E, --ephemeral[=NAME]
-                     throwaway config/HOME, no namespace (not persisted).
-                     Mutually exclusive with --ns. Bare: a random throwaway
-                     HOME. With =NAME: a deterministic throwaway HOME under tmp
-                     (csb-home-NAME), so a sibling '$PROG -s -E=NAME' in another
-                     pane attaches to the exact same env. Still ephemeral (tmp,
-                     OS-reaped; untracked by --list-ns), not a namespace.
-      --real-home    use the operator's REAL HOME instead of a redirected one:
-                     no namespace, no seeding, and the real HOME is NOT made
-                     writable. Mutually exclusive with --ns and -E. Pair with
-                     --no-sandbox for a shell whose ~/.ssh, ~/.kube, ~/.aws etc.
-                     resolve (e.g. a deployment). Also via a profile's
-                     real_home=true.
-      --nix-target NAME  which nix target to run under: 'devShells.<system>.NAME'
-                     from the repo's own flake, instead of the 'default' one
-                     (e.g. a leaner 'ci' or 'release' closure). If the repo's
-                     flake has no such target the launch FAILS rather than
-                     silently falling back -- the generic fallback devShell only
-                     ever provides 'default'. Profile nix_target=.
-      --nix-target-shell NAME / --nix-target-claude NAME
-                     same, but for ONE launch mode only; each beats --nix-target
-                     when that mode is the one running. Profile
-                     nix_target_shell= / nix_target_claude=. Whichever target
-                     wins also applies to .worktreesetup.sh, which runs in the
-                     same devShell. --no-nix-target clears all three.
-  -s, --shell        drop into an interactive bash — or run ARGS after -- as a
-                     command — instead of claude, in the exact environment
-                     claude would get: same worktree, devShell, env scrub,
-                     HOME redirection, and deny-list.
-      --no-sandbox   drop the filesystem sandbox (the seatbelt/bwrap wrapper)
-                     for the launched process. SHELL ONLY — csb refuses to run
-                     claude unsandboxed. The env scrub, devShell, HOME policy,
-                     and --keep still apply; only the read/write lockdown is
-                     gone, so the shell has full host filesystem access. With
-                     it, --paranoid and the deny/allow lists are inert. Also via
-                     a profile's sandbox=false.
-  -k, --keep VAR     also keep env var VAR across the scrubbed environment.
-                     Repeatable.
-      --deny-read PATH   also read-DENY PATH (both modes). Repeatable. Adds to
-                     the built-in floor; also via a profile's deny_read=.
-      --allow-write PATH also make PATH writable, and thus readable under
-                     --paranoid (both modes). Repeatable; profile allow_write=.
-      --allow-socket PATH  also allow connecting to the unix socket at PATH (a
-                     directory allows the sockets under it). For a dev service
-                     the sandbox must reach over a socket rather than TCP, e.g.
-                     allow_socket=/tmp/.s.PGSQL.5432 for postgres. macOS only --
-                     a no-op on Linux, where such sockets are already reachable.
-                     Refused for the IPC broker paths csb closes and for a whole
-                     shared write root like /tmp. Repeatable; profile
-                     allow_socket=.
-      --filter-egress    route the sandbox's HTTPS egress through csb-proxy and
-                     allow ONLY the hosts named by --allow-host / a profile's
-                     allow_host= / \$XDG_CONFIG_HOME/csb/allowed-hosts. The
-                     sandbox profile is what enforces it: the proxy's loopback
-                     port becomes the only reachable IP endpoint, so a client
-                     that ignores HTTPS_PROXY reaches nothing. macOS only for
-                     now -- a warning and no filtering on Linux, which needs a
-                     network namespace. OFF by default: filtering breaks
-                     WebFetch for any host not on the list. Also via a
-                     profile's filter_egress=true.
-      --allow-host HOST  under --filter-egress, allow egress to HOST. A leading
-                     '*.' matches subdomains only, so list a bare parent domain
-                     separately when you want both. Repeatable; accumulates with
-                     the config file and a profile's allow_host=.
-      --allow-port PORT  under --filter-egress, also allow host-local TCP to
-                     localhost:PORT (a dev server, postgres over TCP) -- traffic
-                     the CONNECT proxy cannot carry. Repeatable; profile
-                     allow_port=.
-      --paranoid-deny-read PATH  under --paranoid only, additionally read-deny
-                     PATH (e.g. a tree outside HOME like /Volumes). Repeatable;
-                     profile paranoid_deny_read=.
-      --paranoid-allow-read PATH under --paranoid only, re-expose PATH read-only
-                     WITHOUT granting write. Rejected if it overlaps a deny.
-                     Repeatable; profile paranoid_allow_read=.
-      --seed-creds   seed the HOST's native claude session credential into the
-                     launch config (macOS keychain / linux ~/.claude), so the
-                     sandbox presents your live subscription session instead
-                     of a long-lived token. Shares the refresh-token family
-                     with native claude. Also via a profile's seed_creds=true.
-      --seed-home DIR
-                     seed the launch HOME (non-overwriting) from template DIR:
-                     user-level files (CLAUDE.md, settings.json, rules/) that
-                     in-sandbox claude should otherwise miss (the real ~/.claude
-                     is denied and HOME is redirected). Default ~/.config/csb/
-                     home; also via a profile's seed_home=.
-      --reseed       when seeding the launch HOME from the template, overwrite
-                     existing files instead of keeping them (default: keep).
-      --accent COLOR tint the statusline repo name so profiles are tellable at
-                     a glance (e.g. personal vs work). COLOR is a name (black,
-                     red, green, yellow, blue, magenta, cyan, white, gray/grey,
-                     or a bright-* variant) or raw ANSI SGR params (38;5;208).
-                     Also via a profile's accent=; --no-accent untints.
-  -p, --profile NAME load launch defaults from ~/.config/csb/profiles/NAME
-                     (ns=, token_cmd=, latest=, verbose=, yolo=,
-                     paranoid=, pasteboard=, sandbox=, real_home=, here=,
-                     ephemeral=, shell=, nix_target=, nix_target_shell=,
-                     nix_target_claude=,
-                     seed_creds=, seed_home=, accent=, args=, keep=, setenv=,
-                     deny_read=, allow_write=, allow_socket=,
-                     filter_egress=, allow_host=, allow_port=,
-                     paranoid_deny_read=, paranoid_allow_read=).
-                     A gitignored NAME.local is layered on top for host-specific
-                     values (its values win). Explicit CLI flags beat both.
-                     Bare '$PROG -p NAME' (no BRANCH) launches --here; plain
-                     '$PROG' still lists worktrees.
-      --no-yolo (--yodo), --no-paranoid, --no-pasteboard, --sandbox,
-      --no-filter-egress,
-      --no-real-home, --no-here, --no-shell, --no-ephemeral, --no-latest,
-      --no-verbose, --no-seed-creds, --no-ns, --no-seed-home, --no-accent,
-      --no-nix-target
-                     negate the corresponding option, overriding a profile
-                     (or, for latest/verbose, the CSB_LATEST/CSB_VERBOSE env)
-                     default for one run
-  -n, --no-launch    prepare/reuse the worktree (incl. .worktreeinclude and
-                     .worktreesetup.sh's sandboxed 'up') and exit; prints the
-                     worktree path
-  -L, --latest       get the very latest claude: re-lock the claude-code flake
-                     input to its upstream HEAD (bypassing the committed
-                     flake.lock). The upstream rev is checked at most once per
-                     CSB_LATEST_TTL seconds (default daily) and cached, then
-                     pinned so the rest of the day is fully cached. Trades
-                     reproducibility for always-newest. Default via CSB_LATEST=1.
-  -d, --delete       delete mode: run .worktreesetup.sh's sandboxed 'down'
-                     teardown (if any), then remove BRANCH's worktree (keeps the
-                     branch). Only worktrees csb created (under .worktrees/) are
-                     ever torn down/removed. The launch HOME is NOT removed: it
-                     is per-repo (or a shared @-namespace), not tied to one
-                     branch. Retire a namespace deliberately with rm -rf.
-      --list-ns      list csb namespace configs under ~/.csb/claudes: the
-                     per-repo default (repo-<key>) and shared @ ones. Flags any
-                     leftover dirs from the pre-0.3 per-branch layout.
-  -v, --verbose      restore csb's routine status narration and nix's own build
-                     output (evaluating/downloading progress). Launches are quiet
-                     by default; warnings and errors always print. Default via
-                     CSB_VERBOSE=1.
-      --dump-config  resolve flags + profile (+ .local) + env and print the final
-                     KEY=VALUE knobs, then exit — no launch, no repo lookup, no
-                     token_cmd. A read-only debug/test seam; never prints a secret
-                     (token_cmd shows present/absent; setenv shows VAR names only).
-      --dump-sandbox resolve far enough to build the sandbox artifact and print it
-                     — the seatbelt profile text (macOS) or the bwrap argv, one
-                     token per line (Linux) — then exit before any launch, seeding,
-                     or token_cmd. Drive it with --here in a git repo.
-  -h, --help         show this help
-      --version      print the version and exit
-EOF
-}
 
 die() { echo "$PROG: $*" >&2; exit 1; }
 
@@ -405,8 +213,7 @@ process_worktreeinclude() {
 # target never falls back: csb's generic fallback only ever provides `default`,
 # so silently substituting it would run the wrong closure. Missing -> die.
 resolve_devshell_ref() {
-  local dir="$1" system target
-  target=$(effective_nix_target)
+  local dir="$1" system target="$nix_target_effective"
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)              system="aarch64-darwin" ;;
     Darwin-x86_64)             system="x86_64-darwin" ;;
@@ -662,74 +469,6 @@ setup_namespace() {
 #           deny_read=/--deny-read); the active namespace is re-allowed.
 #   WRITES: default-deny plus an allow-list (worktree, git common dir minus
 #           hooks/config, namespace HOME, tmp, /dev; + allow_write=/--allow-write).
-
-# Expand a LITERAL leading ~/ and require an absolute or ~/ path; used for every
-# read/write list value captured from a CLI flag or a profile var. Echoes the
-# expanded path; dies (with $2 as the source label) on a relative value.
-normalize_list_path() {
-  local val="$1" where="$2"
-  # shellcheck disable=SC2088  # a LITERAL leading ~/ is the accepted syntax
-  case "$val" in
-    "~/"*) printf '%s\n' "$HOME/${val#\~/}" ;;
-    /*)    printf '%s\n' "$val" ;;
-    *)     die "$where: not an absolute or ~/ path: '$val'" ;;
-  esac
-}
-
-# Echo a validated egress host (--allow-host / profile allow_host=), dying with
-# $2 as the source label. A leading '*.' matches subdomains only. The charset is
-# what a DNS name needs and nothing else: the value reaches the proxy through a
-# file, so no quote or whitespace can smuggle a second entry onto a line.
-validate_host() {
-  local val="$1" where="$2"
-  [[ "$val" =~ ^(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
-    || die "$where: not a hostname or *.suffix pattern: '$val'"
-  printf '%s\n' "$val"
-}
-
-# Echo a validated TCP port (--allow-port / profile allow_port=).
-validate_port() {
-  local val="$1" where="$2"
-  [[ "$val" =~ ^[0-9]+$ && "$val" -ge 1 && "$val" -le 65535 ]] \
-    || die "$where: not a port from 1 to 65535: '$val'"
-  printf '%s\n' "$val"
-}
-
-# Append $CSB_CONFIG_DIR/allowed-hosts (if present) to allow_host_list. Same
-# add-only shape as the deny file: entries accumulate, a parse error aborts the
-# launch rather than silently launching with a shorter allowlist.
-read_allowed_hosts_file() {
-  local f="$CSB_CONFIG_DIR/allowed-hosts" line lineno=0
-  [[ -f "$f" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    lineno=$((lineno + 1))
-    line="${line%%#*}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [[ -n "$line" ]] || continue
-    allow_host_list+=("$(validate_host "$line" "$f:$lineno")")
-  done <"$f"
-}
-
-# Echo a validated nix target (--nix-target* / profile nix_target*=), dying with
-# $2 as the source label. It is interpolated into a flake ref, so the charset is
-# restricted to what a nix attribute name needs -- no '#', quotes, or whitespace
-# can reach the nix command line.
-validate_nix_target() {
-  local val="$1" where="$2"
-  [[ "$val" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
-    || die "$where: invalid nix target '$val' (use letters, digits, . _ -)"
-  printf '%s\n' "$val"
-}
-
-# The nix target in effect for THIS launch: the mode-specific value if set
-# (shell vs claude), else the shared one, else the flake's `default`.
-effective_nix_target() {
-  local mode_specific
-  if [[ "$shell" == "true" ]]; then mode_specific="$nix_target_shell"
-  else                              mode_specific="$nix_target_claude"; fi
-  printf '%s\n' "${mode_specific:-${nix_target:-default}}"
-}
 
 # True when realpath'd absolute paths $1 and $2 are equal or one contains the
 # other. Used to reject a --paranoid-allow-read that overlaps any deny root.
@@ -1495,193 +1234,6 @@ seed_credentials() {
   vecho "$PROG: seeded host session credentials into the launch config"
 }
 
-# Validate a true|false profile value.
-profile_bool() {
-  local key="$1" val="$2" where="$3"
-  [[ "$val" == "true" || "$val" == "false" ]] \
-    || die "profile $where: $key needs true or false: '$val'"
-}
-
-# Dispatch one profile KEY=VALUE line. Writes load_profile's p_* locals via
-# bash dynamic scoping.
-apply_profile_line() {
-  local f="$1" lineno="$2" line="$3" key val
-  key="${line%%=*}"
-  val="${line#*=}"
-  case "$key" in
-    ns)          p_ns="$val" ;;
-    shell)       profile_bool shell "$val" "$f:$lineno"; p_shell="$val" ;;
-    token_cmd)   token_cmd="$val" ;;
-    latest)      profile_bool latest    "$val" "$f:$lineno"; p_latest="$val" ;;
-    verbose)     profile_bool verbose   "$val" "$f:$lineno"; p_verbose="$val" ;;
-    yolo)        profile_bool yolo      "$val" "$f:$lineno"; p_yolo="$val" ;;
-    paranoid)    profile_bool paranoid  "$val" "$f:$lineno"; p_paranoid="$val" ;;
-    pasteboard)  profile_bool pasteboard "$val" "$f:$lineno"; p_pasteboard="$val" ;;
-    nix_target)        p_nix_target="$(validate_nix_target "$val" "profile $f:$lineno: nix_target")" ;;
-    nix_target_shell)  p_nix_target_shell="$(validate_nix_target "$val" "profile $f:$lineno: nix_target_shell")" ;;
-    nix_target_claude) p_nix_target_claude="$(validate_nix_target "$val" "profile $f:$lineno: nix_target_claude")" ;;
-    sandbox)     profile_bool sandbox   "$val" "$f:$lineno"; p_sandbox="$val" ;;
-    real_home)   profile_bool real_home "$val" "$f:$lineno"; p_real_home="$val" ;;
-    here)        profile_bool here      "$val" "$f:$lineno"; p_here="$val" ;;
-    ephemeral)   profile_bool ephemeral "$val" "$f:$lineno"; p_ephemeral="$val" ;;
-    seed_creds)  profile_bool seed_creds "$val" "$f:$lineno"; p_seed_creds="$val" ;;
-    seed_home)
-      # shellcheck disable=SC2088  # a LITERAL leading ~/ is the config syntax
-      case "$val" in "~/"*) val="$HOME/${val#\~/}" ;; esac
-      p_seed_home="$val" ;;
-    accent)      p_accent="$val" ;;
-    args)        p_args="$val" ;;
-    keep)        p_keep+=" $val" ;;
-    deny_read)           deny_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: deny_read")") ;;
-    allow_write)         allow_write_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: allow_write")") ;;
-    allow_socket)        allow_socket_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: allow_socket")") ;;
-    filter_egress)       profile_bool filter_egress "$val" "$f:$lineno"; p_filter_egress="$val" ;;
-    allow_host)          allow_host_list+=("$(validate_host "$val" "profile $f:$lineno: allow_host")") ;;
-    allow_port)          allow_port_list+=("$(validate_port "$val" "profile $f:$lineno: allow_port")") ;;
-    paranoid_deny_read)  paranoid_deny_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: paranoid_deny_read")") ;;
-    paranoid_allow_read) paranoid_allow_read_paths+=("$(normalize_list_path "$val" "profile $f:$lineno: paranoid_allow_read")") ;;
-    setenv)
-      [[ "$val" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] \
-        || die "profile $f:$lineno: setenv needs VAR=value: '$val'"
-      profile_setenv+=("$val")
-      ;;
-    *) die "profile $f:$lineno: unknown key '$key' (ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, accent, args, keep, setenv, deny_read, allow_write, allow_socket, filter_egress, allow_host, allow_port, paranoid_deny_read, paranoid_allow_read)" ;;
-  esac
-}
-
-# Parse ~/.config/csb/profiles/$profile_name and apply it as DEFAULTS -- explicit
-# CLI flags win. Keys are documented in the README (Profiles). Booleans track
-# whether the CLI touched them (*_cli) so --no-* can override a profile's true
-# (and a profile latest= beats the CSB_LATEST default). An optional gitignored
-# <name>.local overlay is read last: its scalar values win, its keep=/setenv=
-# accumulate.
-load_profile() {
-  local base="$CSB_CONFIG_DIR/profiles/$profile_name"
-  local override="$base.local"
-  [[ -f "$base" ]] || die "profile not found: $base"
-  local p_ns="" p_latest="" p_verbose="" p_yolo="" p_paranoid="" p_here="" p_ephemeral="" \
-        p_shell="" p_seed_creds="" p_seed_home="" p_accent="" p_args="" p_keep="" v \
-        p_sandbox="" p_real_home="" p_pasteboard="" p_filter_egress="" \
-        p_nix_target="" p_nix_target_shell="" p_nix_target_claude=""
-  local -a keep_list=()
-
-  # Read the committed base profile, then the optional gitignored <name>.local
-  # overlay. The override is read LAST so its scalar values win and its
-  # keep=/setenv= accumulate on top of the base.
-  local pf line lineno fidx
-  for fidx in 0 1; do
-    [[ "$fidx" == 0 ]] && pf="$base" || pf="$override"
-    [[ -f "$pf" ]] || continue
-    lineno=0
-    # shellcheck disable=SC2094  # $pf is passed for error messages only, never written
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      lineno=$((lineno + 1))
-      [[ -z "$line" || "$line" == \#* ]] && continue
-      [[ "$line" == *=* ]] || die "profile $pf:$lineno: expected KEY=VALUE: '$line'"
-      apply_profile_line "$pf" "$lineno" "$line"
-    done < "$pf"
-  done
-
-  # At most one launch-HOME selector per profile: ns=, ephemeral=true, and
-  # real_home=true all pick where HOME comes from.
-  local home_sel=0
-  [[ -n "$p_ns" ]]                && home_sel=$((home_sel + 1))
-  [[ "$p_ephemeral" == "true" ]]  && home_sel=$((home_sel + 1))
-  [[ "$p_real_home" == "true" ]]  && home_sel=$((home_sel + 1))
-  (( home_sel <= 1 )) \
-    || die "profile $profile_name: ns, ephemeral=true, and real_home=true are mutually exclusive"
-  if [[ -n "$p_shell" && "$shell_cli" != "true" ]]; then
-    shell="$p_shell"
-  fi
-  # real_home first (like ephemeral, it's a HOME-kind selector): an explicit CLI
-  # --ns / -E suppresses it, and it in turn suppresses a profile ns=/ephemeral=.
-  if [[ -n "$p_real_home" && "$real_home_cli" != "true" && -z "$namespace" && "$ephemeral_cli" != "true" ]]; then
-    real_home="$p_real_home"
-  fi
-  # ephemeral before ns: an applied ephemeral=true suppresses nothing (the two
-  # can't coexist in one profile), but an explicit --ns / --real-home must.
-  if [[ -n "$p_ephemeral" && "$ephemeral_cli" != "true" && -z "$namespace" && "$real_home" != "true" ]]; then
-    ephemeral="$p_ephemeral"
-  fi
-  if [[ -n "$p_ns" && -z "$namespace" && "$ephemeral" != "true" && "$real_home" != "true" && "$ns_cli" != "true" ]]; then
-    namespace="$p_ns"
-  fi
-  if [[ -n "$p_latest" && "$latest_cli" != "true" ]]; then
-    latest="$p_latest"
-  fi
-  if [[ -n "$p_verbose" && "$verbose_cli" != "true" ]]; then
-    verbose="$p_verbose"
-  fi
-  if [[ -n "$p_yolo" && "$yolo_cli" != "true" ]]; then
-    yolo="$p_yolo"
-  fi
-  if [[ -n "$p_paranoid" && "$paranoid_cli" != "true" ]]; then
-    paranoid="$p_paranoid"
-  fi
-  if [[ -n "$p_pasteboard" && "$pasteboard_cli" != "true" ]]; then
-    pasteboard="$p_pasteboard"
-  fi
-  if [[ -n "$p_filter_egress" && "$filter_egress_cli" != "true" ]]; then
-    filter_egress="$p_filter_egress"
-  fi
-  # The three nix-target keys share one --no-nix-target reset, so one *_cli flag
-  # gates all of them: an explicit CLI target (of any kind) takes the profile's
-  # whole set out of play rather than merging with it.
-  if [[ "$nix_target_cli" != "true" ]]; then
-    [[ -n "$p_nix_target" ]]        && nix_target="$p_nix_target"
-    [[ -n "$p_nix_target_shell" ]]  && nix_target_shell="$p_nix_target_shell"
-    [[ -n "$p_nix_target_claude" ]] && nix_target_claude="$p_nix_target_claude"
-  fi
-  if [[ -n "$p_sandbox" && "$sandbox_cli" != "true" ]]; then
-    sandbox="$p_sandbox"
-  fi
-  # Exported for the bare `csb -p NAME` implied---here decision: an explicit
-  # profile here=false must suppress the implication.
-  profile_here="$p_here"
-  if [[ -n "$p_here" && "$here_cli" != "true" ]]; then
-    if [[ "$p_here" == "true" && -n "$branch" ]]; then
-      echo "$PROG: warning: profile here=true overridden by BRANCH '$branch' (worktree mode)" >&2
-    else
-      here="$p_here"
-    fi
-  fi
-  if [[ -n "$p_seed_creds" && "$seed_creds_cli" != "true" ]]; then
-    seed_creds="$p_seed_creds"
-  fi
-  # An explicit --seed-home beats the profile value; --no-seed-home resets to
-  # the default template for one run (seed_home_cli covers both).
-  if [[ -n "$p_seed_home" && -z "$seed_home" && "$seed_home_cli" != "true" ]]; then
-    seed_home="$p_seed_home"
-  fi
-  if [[ -n "$p_accent" && "$accent_cli" != "true" ]]; then
-    accent="$p_accent"
-  fi
-  if [[ -n "$p_args" && "$claude_args_cli" != "true" ]]; then
-    local -a args_words=()
-    local w
-    read -ra args_words <<< "$p_args"
-    claude_args=()
-    # shellcheck disable=SC2016,SC2088  # matching the LITERAL strings ${HOME} and ~/
-    for w in "${args_words[@]+"${args_words[@]}"}"; do
-      w="${w//'${HOME}'/$HOME}"
-      if [[ "$w" == "~/"* ]]; then
-        w="$HOME/${w#\~/}"
-      fi
-      claude_args+=("$w")
-    done
-  fi
-  read -ra keep_list <<< "$p_keep"
-  for v in "${keep_list[@]+"${keep_list[@]}"}"; do
-    [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "profile $profile_name: invalid keep var name: '$v'"
-    extra_keep+=("$v")
-  done
-  if [[ -f "$override" ]]; then
-    vecho "$PROG: profile: $profile_name (+ $profile_name.local)"
-  else
-    vecho "$PROG: profile: $profile_name"
-  fi
-}
-
 # Run the profile's token_cmd host-side; stdout becomes CLAUDE_CODE_OAUTH_TOKEN
 # (never echoed). Failure or empty output aborts the launch — before any
 # worktree/namespace side effects.
@@ -1693,231 +1245,171 @@ run_token_cmd() {
   export CLAUDE_CODE_OAUTH_TOKEN="$tok"
 }
 
-# --- argument parsing -----------------------------------------------------------
+# --- config resolution ------------------------------------------------------------
+#
+# csb-config owns the flag grammar, the profiles, their validation, --help and
+# --dump-config. It answers those three itself and otherwise hands back a
+# resolved configuration, so this script never re-derives a knob the two could
+# then disagree about. See docs/PLAN-008-proxy.md section 9.
 
+# The csb-config binary, in order: CSB_CONFIG_BIN verbatim, one sitting beside
+# this script, this repo's own dune build, $CSB_TOOLS_DIR where `make install`
+# puts it, then PATH. There is deliberately no nix fallback the way csb-proxy
+# has one -- this runs on every invocation, and a `nix build` in front of
+# `csb --help` is not a trade worth making.
+csb_config_bin() {
+  local self dir found tree
+  if [[ -n "${CSB_CONFIG_BIN:-}" ]]; then printf '%s' "$CSB_CONFIG_BIN"; return; fi
+  self="$(command -v "$0" 2>/dev/null || printf '%s' "$0")"
+  dir="$(cd "$(dirname "$self")" 2>/dev/null && pwd -P)" || dir=""
+  if [[ -n "$dir" && -x "$dir/csb-config" ]]; then printf '%s' "$dir/csb-config"; return; fi
+  # A working tree: ./bin/csb beside an ocaml/ that `make ocaml-build` has built.
+  # It comes before the installed copies so that running the tree tests the tree,
+  # which is how csb's own verification seams are driven.
+  tree="$dir/../ocaml/_build/default/bin/csb_config_cli.exe"
+  if [[ -n "$dir" && -x "$tree" ]]; then printf '%s' "$tree"; return; fi
+  if [[ -x "$CSB_TOOLS_DIR/csb-config" ]]; then printf '%s' "$CSB_TOOLS_DIR/csb-config"; return; fi
+  found="$(command -v csb-config 2>/dev/null)" || found=""
+  if [[ -n "$found" ]]; then printf '%s' "$found"; return; fi
+  die "csb-config not found in $CSB_TOOLS_DIR, beside $PROG, or on PATH (run 'make install', or set CSB_CONFIG_BIN)"
+}
+
+# Every scalar key csb-config emits, checked off as the records arrive. An
+# unknown key is loud on its own, but a VANISHED one would not be: `paranoid` or
+# `filter_egress` going missing would weaken the sandbox while looking like an
+# ordinary default. Lists are absent when empty, so only scalars can be required.
+csb_config_scalars=(dump mode no_launch here shell paranoid pasteboard
+                    nix_target_effective sandbox real_home yolo latest verbose
+                    namespace branch ephemeral ephemeral_name profile seed_creds
+                    seed_home reseed accent cfg_tmpdir token_cmd filter_egress)
+
+# Run csb-config over this invocation's argv and read the resolution back into
+# the globals below. The wire format is NUL-terminated KEY=VALUE records, a list
+# key repeating once per element: NUL is the one byte a path, a claude argument
+# or a setenv value cannot hold, so no value can split itself into two. The
+# child's output is parsed, never eval'd.
+resolve_config() {
+  local bin emit rc=0 rec k v unknown="" seen=" "
+  bin="$(csb_config_bin)"
+  # The file carries token_cmd, so it is created private and unlinked as soon as
+  # it is read.
+  emit="$(mktemp "${TMPDIR:-/tmp}/csb-resolve.XXXXXX")"
+  # exec -a so csb-config's diagnostics, usage line and version name the program
+  # the operator actually typed.
+  ( export CSB_EMIT_TO="$emit"; exec -a "$PROG" "$bin" "$@" ) || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f "$emit"
+    # 2 means csb-config answered the operator itself (--help, --version,
+    # --dump-config) and resolved nothing. Any other status already said why.
+    if [[ "$rc" -eq 2 ]]; then exit 0; fi
+    exit "$rc"
+  fi
+  [[ -s "$emit" ]] \
+    || { rm -f "$emit"; die "csb-config exited 0 without resolving anything"; }
+  while IFS= read -r -d '' rec; do
+    k="${rec%%=*}"; v="${rec#*=}"
+    seen+="$k "
+    case "$k" in
+      dump)                 dump="$v" ;;
+      mode)                 mode="$v" ;;
+      no_launch)            no_launch="$v" ;;
+      here)                 here="$v" ;;
+      shell)                shell="$v" ;;
+      paranoid)             paranoid="$v" ;;
+      pasteboard)           pasteboard="$v" ;;
+      nix_target_effective) nix_target_effective="$v" ;;
+      sandbox)              sandbox="$v" ;;
+      real_home)            real_home="$v" ;;
+      yolo)                 yolo="$v" ;;
+      latest)               latest="$v" ;;
+      verbose)              verbose="$v" ;;
+      namespace)            namespace="$v" ;;
+      branch)               branch="$v" ;;
+      ephemeral)            ephemeral="$v" ;;
+      ephemeral_name)       ephemeral_name="$v" ;;
+      profile)              profile_name="$v" ;;
+      seed_creds)           seed_creds="$v" ;;
+      seed_home)            seed_home="$v" ;;
+      reseed)               reseed="$v" ;;
+      accent)               accent="$v" ;;
+      cfg_tmpdir)           cfg_tmpdir="$v" ;;
+      token_cmd)            token_cmd="$v" ;;
+      filter_egress)        filter_egress="$v" ;;
+      claude_args)          claude_args+=("$v") ;;
+      keep)                 extra_keep+=("$v") ;;
+      setenv)               profile_setenv+=("$v") ;;
+      deny_read)            deny_read_paths+=("$v") ;;
+      allow_write)          allow_write_paths+=("$v") ;;
+      allow_socket)         allow_socket_paths+=("$v") ;;
+      allow_host)           allow_host_list+=("$v") ;;
+      allow_port)           allow_port_list+=("$v") ;;
+      paranoid_deny_read)   paranoid_deny_read_paths+=("$v") ;;
+      paranoid_allow_read)  paranoid_allow_read_paths+=("$v") ;;
+      *) unknown="$k"; break ;;
+    esac
+  done <"$emit"
+  rm -f "$emit"
+  [[ -z "$unknown" ]] || die "csb-config emitted an unknown key: '$unknown'"
+  for k in "${csb_config_scalars[@]}"; do
+    [[ "$seen" == *" $k "* ]] || die "csb-config emitted no '$k' (mismatched versions?)"
+  done
+}
+
+# Every knob csb-config resolves. The scalars carry csb-config's own defaults so
+# that a reader under `set -u` is never surprised; the arrays must exist before
+# resolve_config appends to them.
+dump=""             # "" | sandbox: the read-only seam that still needs this script
 mode="launch"
 no_launch="false"
-dump=""             # --dump-config|--dump-sandbox: read-only dry-run seam, no launch
-namespace="";       ns_cli="false"
-profile_name=""
-profile_here=""     # set by load_profile: the profile's raw here= value
-token_cmd=""
-seatbelt_profile="" # macOS: generated profile path, reaped by trap on abnormal exit
-# Booleans a profile can default: each tracks whether the CLI set it (*_cli),
-# in either direction (-X / --no-X) — CLI beats profile beats env default.
-yolo="false";       yolo_cli="false"
-paranoid="false";   paranoid_cli="false"
-pasteboard="false"; pasteboard_cli="false"  # macOS: re-allow pbcopy/pbpaste (PLAN-007 F2)
-sandbox="true";     sandbox_cli="false"  # --no-sandbox drops the fs lockdown (shell only)
-real_home="false";  real_home_cli="false"  # --real-home: use the real HOME, no redirect
-shell="false";      shell_cli="false"
-# --nix-target* / profile nix_target*=: which devShells.<system>.NAME to run
-# under. Empty -> the flake's `default`. The per-mode values win over the shared
-# one; one _cli flag covers all three (they share --no-nix-target).
-nix_target=""; nix_target_shell=""; nix_target_claude=""; nix_target_cli="false"
-here="false";       here_cli="false"
-ephemeral="false";  ephemeral_cli="false"
-ephemeral_name=""   # -E=NAME/--ephemeral=NAME: a reusable throwaway HOME under
-                    # tmp (deterministic path), so a sibling -s shell can attach
-seed_creds="false"; seed_creds_cli="false"
-latest="false";     latest_cli="false"
-[[ -n "${CSB_LATEST:-}" ]] && latest="true"
-verbose="false";   verbose_cli="false"
-[[ -n "${CSB_VERBOSE:-}" ]] && verbose="true"
-claude_args_cli="false"
-reseed="false"      # --reseed: overwrite existing files when seeding the HOME
-cfg_tmpdir="${CSB_TMPDIR:-}"  # host scratch/temp dir (was config tmpdir=)
-deny_read_paths=()           # --deny-read / profile deny_read=: extra read denies (both modes)
-allow_write_paths=()         # --allow-write / profile allow_write=: extra write roots (both modes)
-allow_socket_paths=()        # --allow-socket / profile allow_socket=: reachable unix sockets (macOS; no-op on Linux)
-# Egress filtering (docs/PLAN-008-proxy.md P2). OFF by default:
-# turning it on amputates WebFetch for unlisted hosts, so it is opted into.
-filter_egress="false"; filter_egress_cli="false"
-allow_host_list=()           # --allow-host / profile allow_host= (+ $CSB_CONFIG_DIR/allowed-hosts)
-allow_port_list=()           # --allow-port / profile allow_port=: host-local TCP ports
-proxy_port=""                # resolved at launch; a placeholder under --dump-sandbox
-proxy_pid=""                 # reaped by the launch trap
-proxy_allow_file=""          # temp file csb-proxy reads the allowlist from
-proxy_log=""                 # decision log, inside the launch HOME so the agent can read it
-paranoid_deny_read_paths=()  # --paranoid-deny-read / profile paranoid_deny_read=: extra denies (paranoid)
-paranoid_allow_read_paths=() # --paranoid-allow-read / profile paranoid_allow_read=: read re-allows (paranoid)
-seed_home=""        # --seed-home / profile seed_home=; empty -> ~/.config/csb/home
-seed_home_cli="false"
-accent="";          accent_cli="false"  # --accent / profile accent=; statusline tint
+here="false"
+shell="false"
+paranoid="false"
+pasteboard="false"
+nix_target_effective="default"  # devShells.<system>.NAME for THIS launch mode
+sandbox="true"
+real_home="false"
+yolo="false"
+latest="false"
+verbose="false"
+namespace=""
 branch=""
+ephemeral="false"
+ephemeral_name=""
+profile_name=""
+seed_creds="false"
+seed_home=""
+reseed="false"
+accent=""
+cfg_tmpdir=""
+token_cmd=""
+filter_egress="false"
 claude_args=()
 extra_keep=()
 profile_setenv=()
+deny_read_paths=()
+allow_write_paths=()
+allow_socket_paths=()
+allow_host_list=()
+allow_port_list=()
+paranoid_deny_read_paths=()
+paranoid_allow_read_paths=()
+
+# Launch state, not configuration: filled in as the launch proceeds.
+seatbelt_profile=""  # macOS: generated profile path, reaped by trap on abnormal exit
+proxy_port=""        # resolved at launch; a placeholder under --dump-sandbox
+proxy_pid=""         # reaped by the launch trap
+proxy_allow_file=""  # temp file csb-proxy reads the allowlist from
+proxy_log=""         # decision log, inside the launch HOME so the agent can read it
 ns_dir=""
 claude_home=""       # set once the namespace/ephemeral HOME is resolved; empty
-                      # default lets run_worktreesetup call build_deny_wrapper
-                      # earlier (under set -u) with no namespace HOME involved
+                     # default lets run_worktreesetup call build_deny_wrapper
+                     # earlier (under set -u) with no namespace HOME involved
 csb_ns=""            # resolved namespace name (empty for ephemeral)
 csb_ephemeral="false"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --version) echo "$PROG $CSB_VERSION"; exit 0 ;;
-    -d|--delete) mode="delete"; shift ;;
-    --list-ns) mode="list_ns"; shift ;;
-    -y|--yolo) yolo="true"; yolo_cli="true"; shift ;;
-    --no-yolo|--yodo) yolo="false"; yolo_cli="true"; shift ;;
-    --paranoid) paranoid="true"; paranoid_cli="true"; shift ;;
-    --no-paranoid) paranoid="false"; paranoid_cli="true"; shift ;;
-    --pasteboard) pasteboard="true"; pasteboard_cli="true"; shift ;;
-    --no-pasteboard) pasteboard="false"; pasteboard_cli="true"; shift ;;
-    --nix-target) [[ $# -ge 2 && -n "$2" ]] || die "--nix-target requires a NAME"
-      nix_target="$(validate_nix_target "$2" "--nix-target")"; nix_target_cli="true"; shift 2 ;;
-    --nix-target-shell) [[ $# -ge 2 && -n "$2" ]] || die "--nix-target-shell requires a NAME"
-      nix_target_shell="$(validate_nix_target "$2" "--nix-target-shell")"; nix_target_cli="true"; shift 2 ;;
-    --nix-target-claude) [[ $# -ge 2 && -n "$2" ]] || die "--nix-target-claude requires a NAME"
-      nix_target_claude="$(validate_nix_target "$2" "--nix-target-claude")"; nix_target_cli="true"; shift 2 ;;
-    --no-nix-target) nix_target=""; nix_target_shell=""; nix_target_claude=""
-      nix_target_cli="true"; shift ;;
-    --sandbox) sandbox="true"; sandbox_cli="true"; shift ;;
-    --no-sandbox) sandbox="false"; sandbox_cli="true"; shift ;;
-    --real-home) real_home="true"; real_home_cli="true"; shift ;;
-    --no-real-home) real_home="false"; real_home_cli="true"; shift ;;
-    -n|--no-launch) no_launch="true"; shift ;;
-    --dump-config) dump="config"; shift ;;
-    --dump-sandbox) dump="sandbox"; shift ;;
-    --here) here="true"; here_cli="true"; shift ;;
-    --no-here) here="false"; here_cli="true"; shift ;;
-    -s|--shell) shell="true"; shell_cli="true"; shift ;;
-    --no-shell) shell="false"; shell_cli="true"; shift ;;
-    -N|--ns) [[ $# -ge 2 && -n "$2" ]] || die "--ns requires a non-empty NAME (--no-ns resets to the branch default)"
-             namespace="$2"; ns_cli="true"; shift 2 ;;
-    --no-ns) namespace=""; ns_cli="true"; shift ;;
-    -E|--ephemeral) ephemeral="true"; ephemeral_cli="true"; shift ;;
-    -E=*|--ephemeral=*)
-      ephemeral="true"; ephemeral_cli="true"
-      ephemeral_name="${1#*=}"
-      [[ -n "$ephemeral_name" ]] || die "-E=/--ephemeral= requires a NAME (use bare -E for a random throwaway)"
-      shift ;;
-    --no-ephemeral) ephemeral="false"; ephemeral_cli="true"; ephemeral_name=""; shift ;;
-    -L|--latest) latest="true"; latest_cli="true"; shift ;;
-    --no-latest) latest="false"; latest_cli="true"; shift ;;
-    -v|--verbose) verbose="true"; verbose_cli="true"; shift ;;
-    --no-verbose) verbose="false"; verbose_cli="true"; shift ;;
-    --seed-creds) seed_creds="true"; seed_creds_cli="true"; shift ;;
-    --no-seed-creds) seed_creds="false"; seed_creds_cli="true"; shift ;;
-    --seed-home) [[ $# -ge 2 && -n "$2" ]] || die "--seed-home requires a non-empty DIR (--no-seed-home resets to the default template)"
-                 seed_home="$2"; seed_home_cli="true"; shift 2 ;;
-    --no-seed-home) seed_home=""; seed_home_cli="true"; shift ;;
-    --accent) [[ $# -ge 2 && -n "$2" ]] || die "--accent requires a COLOR (--no-accent untints)"
-              accent="$2"; accent_cli="true"; shift 2 ;;
-    --no-accent) accent=""; accent_cli="true"; shift ;;
-    --reseed) reseed="true"; shift ;;
-    -k|--keep)
-      [[ $# -ge 2 ]] || die "--keep requires a VAR name"
-      [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid env var name for --keep: '$2'"
-      extra_keep+=("$2"); shift 2 ;;
-    --deny-read) [[ $# -ge 2 && -n "$2" ]] || die "--deny-read requires a PATH"
-      deny_read_paths+=("$(normalize_list_path "$2" "--deny-read")"); shift 2 ;;
-    --allow-write) [[ $# -ge 2 && -n "$2" ]] || die "--allow-write requires a PATH"
-      allow_write_paths+=("$(normalize_list_path "$2" "--allow-write")"); shift 2 ;;
-    --allow-socket) [[ $# -ge 2 && -n "$2" ]] || die "--allow-socket requires a PATH"
-      allow_socket_paths+=("$(normalize_list_path "$2" "--allow-socket")"); shift 2 ;;
-    --filter-egress) filter_egress="true"; filter_egress_cli="true"; shift ;;
-    --no-filter-egress) filter_egress="false"; filter_egress_cli="true"; shift ;;
-    --allow-host) [[ $# -ge 2 && -n "$2" ]] || die "--allow-host requires a HOST"
-      allow_host_list+=("$(validate_host "$2" "--allow-host")"); shift 2 ;;
-    --allow-port) [[ $# -ge 2 && -n "$2" ]] || die "--allow-port requires a PORT"
-      allow_port_list+=("$(validate_port "$2" "--allow-port")"); shift 2 ;;
-    --paranoid-deny-read) [[ $# -ge 2 && -n "$2" ]] || die "--paranoid-deny-read requires a PATH"
-      paranoid_deny_read_paths+=("$(normalize_list_path "$2" "--paranoid-deny-read")"); shift 2 ;;
-    --paranoid-allow-read) [[ $# -ge 2 && -n "$2" ]] || die "--paranoid-allow-read requires a PATH"
-      paranoid_allow_read_paths+=("$(normalize_list_path "$2" "--paranoid-allow-read")"); shift 2 ;;
-    -p|--profile) [[ $# -ge 2 && -n "$2" ]] || die "--profile requires a non-empty NAME"; profile_name="$2"; shift 2 ;;
-    --) shift; claude_args+=("$@"); claude_args_cli="true"; break ;;
-    -*) usage >&2; die "unknown option: $1" ;;
-    *)
-      if [[ -z "$branch" ]]; then
-        branch="$1"; shift
-      else
-        die "unexpected argument: $1"
-      fi
-      ;;
-  esac
-done
+resolve_config "$@"
 
-# --here means "no worktree": a BRANCH argument would be ignored, so reject it.
-if [[ "$here" == "true" && -n "$branch" ]]; then
-  die "--here and BRANCH are mutually exclusive (either provision a worktree for BRANCH, or run --here)"
-fi
-
-# --ns and -E are mutually exclusive: one names a namespace, the other opts out.
-if [[ -n "$namespace" && "$ephemeral" == "true" ]]; then
-  die "--ns and -E/--ephemeral are mutually exclusive"
-fi
-
-# --real-home selects a THIRD kind of launch HOME (the operator's real one), so
-# it is mutually exclusive with the two that select a redirected HOME. Checked
-# at the CLI level here (both explicit); a profile-side conflict is caught in
-# load_profile, and a CLI value beats a profile default without erroring.
-if [[ "$real_home" == "true" && -n "$namespace" ]]; then
-  die "--real-home and --ns are mutually exclusive (each selects the launch HOME)"
-fi
-if [[ "$real_home" == "true" && "$ephemeral" == "true" ]]; then
-  die "--real-home and -E/--ephemeral are mutually exclusive (each selects the launch HOME)"
-fi
-
-# CSB_TMPDIR (host scratch/temp dir; replaces the old config tmpdir= key): the
-# launched process's TMPDIR, its ephemeral HOME base, and a write-allow root.
-if [[ -n "$cfg_tmpdir" ]]; then
-  # shellcheck disable=SC2088  # a LITERAL leading ~/ is accepted here too
-  case "$cfg_tmpdir" in "~/"*) cfg_tmpdir="$HOME/${cfg_tmpdir#\~/}" ;; esac
-  [[ -d "$cfg_tmpdir" ]] || die "CSB_TMPDIR does not exist or is not a directory: '$cfg_tmpdir'"
-  cfg_tmpdir=$(realpath "$cfg_tmpdir")
-fi
-
-# Profile values are defaults; explicit CLI flags (checked above) beat them.
-if [[ -n "$profile_name" ]]; then
-  load_profile
-fi
-
-# The user-global host allowlist is add-only, like the deny file: it accumulates
-# with --allow-host and a profile's allow_host=, and never removes an entry.
-read_allowed_hosts_file
-
-# Bare `csb -p NAME` (no BRANCH) launches --here rather than falling into list
-# mode: a profile is a launch config, and plain `csb` still lists. Suppressed
-# when the CLI or the profile said otherwise (--no-here / here=false).
-if [[ -n "$profile_name" && "$mode" == "launch" && -z "$branch" \
-      && "$here" != "true" && "$here_cli" != "true" && "$profile_here" != "false" ]]; then
-  here="true"
-fi
-
-# --no-sandbox drops the filesystem lockdown (the seatbelt/bwrap wrapper) for
-# the launched process. Only ever allowed for a shell -- a deploy/escape-hatch
-# shell you drive yourself. Running claude with no sandbox defeats the whole
-# tool, so fail hard and fast. The condition mirrors the "will actually launch
-# claude" guard used for token_cmd below (mode launch, not prepare-only, not a
-# shell, with a worktree or --here).
-if [[ "$sandbox" != "true" && "$shell" != "true" && "$mode" == "launch" \
-      && "$no_launch" != "true" && ( -n "$branch" || "$here" == "true" ) ]]; then
-  die "--no-sandbox is only allowed with -s/--shell -- claude never runs unsandboxed.
-  add -s for an unsandboxed shell, or drop --no-sandbox."
-fi
-
-# With no sandbox there is no read/write policy to shape, so the deny/allow knobs
-# are inert. They commonly ride in from a profile, so note rather than error.
-if [[ "$sandbox" != "true" ]]; then
-  if [[ "$paranoid" == "true" || ${#deny_read_paths[@]} -gt 0 || ${#allow_write_paths[@]} -gt 0 \
-        || ${#allow_socket_paths[@]} -gt 0 \
-        || ${#paranoid_deny_read_paths[@]} -gt 0 || ${#paranoid_allow_read_paths[@]} -gt 0 ]]; then
-    echo "$PROG: warning: --no-sandbox drops the filesystem sandbox; --paranoid and the" >&2
-    echo "  deny-read / allow-write / allow-socket lists have no effect in this mode" >&2
-  fi
-  if [[ "$filter_egress" == "true" ]]; then
-    echo "$PROG: warning: --filter-egress needs the sandbox to enforce it (the profile is what" >&2
-    echo "  leaves the proxy as the only reachable endpoint); egress is NOT filtered here" >&2
-  fi
-fi
-
-# Quiet nix's own progress/eval output unless verbose. Computed AFTER the profile
-# load so a profile verbose= (or -v/CSB_VERBOSE) governs it. Expanded into every
+# Quiet nix's own progress/eval output unless verbose. Expanded into every
 # host-side nix build/develop below via the safe empty-array pattern.
 nix_quiet=(); [[ "$verbose" == "true" ]] || nix_quiet=(--quiet)
 
@@ -1937,94 +1429,6 @@ keep_vars=(HOME USER TERM LANG LC_ALL CLAUDE_CODE_OAUTH_TOKEN
 keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
 keep_args=()
 for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
-
-# Validate the namespace name: a named namespace becomes a directory
-# ~/.csb/claudes/@NAME, shared across repos. The leading @ is optional here (it
-# is added at resolve time); NAME and @NAME are equivalent.
-if [[ -n "$namespace" ]]; then
-  [[ "$namespace" =~ ^@?[A-Za-z0-9._-]+$ && "$namespace" != "." && "$namespace" != ".." ]] \
-    || die "invalid namespace '$namespace' (use letters, digits, . _ -; optional leading @)"
-fi
-
-# Named ephemeral: NAME becomes one filesystem path component (csb-home-<NAME>),
-# so hold it to the same safe set as a namespace (no @ — there is no cross-repo
-# sharing concept for a throwaway tmp HOME).
-if [[ -n "$ephemeral_name" ]]; then
-  [[ "$ephemeral_name" =~ ^[A-Za-z0-9._-]+$ && "$ephemeral_name" != "." && "$ephemeral_name" != ".." ]] \
-    || die "invalid ephemeral name '$ephemeral_name' (use letters, digits, . _ -)"
-fi
-
-# Accent: a statusline tint, passed through as CSB_ACCENT. Accept a known color
-# name or a raw ANSI SGR parameter string (38;5;208), nothing else -- so no
-# arbitrary bytes reach the escape sequence the statusline builds, and an unknown
-# name fails here instead of silently not tinting. The name set mirrors the map
-# in templates/home/.claude/statusline.sh.
-if [[ -n "$accent" ]]; then
-  case "$accent" in
-    black|red|green|yellow|blue|magenta|cyan|white|gray|grey|\
-    bright-red|bright-green|bright-yellow|bright-blue|bright-magenta|bright-cyan|bright-white) ;;
-    *) [[ "$accent" =~ ^[0-9]+(;[0-9]+)*$ ]] \
-         || die "invalid --accent '$accent' (a color name like magenta, or ANSI SGR params like 38;5;208)" ;;
-  esac
-fi
-
-if [[ "$yolo" == "true" ]]; then
-  if [[ "$shell" == "true" ]]; then
-    echo "$PROG: warning: -y/--yolo has no effect with --shell (ignored)" >&2
-  else
-    claude_args=("--dangerously-skip-permissions" "${claude_args[@]+"${claude_args[@]}"}")
-  fi
-fi
-
-# --dump-config: read-only Tier-1 seam. Print the resolved flag/profile/env
-# knobs as stable KEY=VALUE lines and exit -- before locating the repo, running
-# token_cmd, or any launch/seeding side effect. Git-free: a branch-derived
-# namespace shows as an empty namespace= plus a branch= field. Never prints a
-# secret: token_cmd is reported present/absent (never run), setenv reports VAR
-# names only (never their values), seeded credentials are never touched.
-if [[ "$dump" == "config" ]]; then
-  join_bar() { local IFS='|'; printf '%s' "$*"; }
-  dump_setenv_names=()
-  for v in "${profile_setenv[@]+"${profile_setenv[@]}"}"; do dump_setenv_names+=("${v%%=*}"); done
-  printf 'mode=%s\n'                "$mode"
-  printf 'no_launch=%s\n'           "$no_launch"
-  printf 'here=%s\n'                "$here"
-  printf 'shell=%s\n'               "$shell"
-  printf 'paranoid=%s\n'            "$paranoid"
-  printf 'pasteboard=%s\n'          "$pasteboard"
-  printf 'nix_target=%s\n'          "$nix_target"
-  printf 'nix_target_shell=%s\n'    "$nix_target_shell"
-  printf 'nix_target_claude=%s\n'   "$nix_target_claude"
-  printf 'nix_target_effective=%s\n' "$(effective_nix_target)"
-  printf 'sandbox=%s\n'             "$sandbox"
-  printf 'real_home=%s\n'           "$real_home"
-  printf 'yolo=%s\n'                "$yolo"
-  printf 'latest=%s\n'              "$latest"
-  printf 'verbose=%s\n'             "$verbose"
-  printf 'namespace=%s\n'           "$namespace"
-  printf 'branch=%s\n'              "$branch"
-  printf 'ephemeral=%s\n'           "$ephemeral"
-  printf 'ephemeral_name=%s\n'      "$ephemeral_name"
-  printf 'profile=%s\n'             "$profile_name"
-  printf 'seed_creds=%s\n'          "$seed_creds"
-  printf 'seed_home=%s\n'           "$seed_home"
-  printf 'reseed=%s\n'              "$reseed"
-  printf 'accent=%s\n'              "$accent"
-  printf 'cfg_tmpdir=%s\n'          "$cfg_tmpdir"
-  if [[ -n "$token_cmd" ]]; then printf 'token_cmd=present\n'; else printf 'token_cmd=absent\n'; fi
-  printf 'claude_args=%s\n'         "$(join_bar "${claude_args[@]+"${claude_args[@]}"}")"
-  printf 'keep=%s\n'                "$(join_bar "${extra_keep[@]+"${extra_keep[@]}"}")"
-  printf 'setenv=%s\n'              "$(join_bar "${dump_setenv_names[@]+"${dump_setenv_names[@]}"}")"
-  printf 'deny_read=%s\n'           "$(join_bar "${deny_read_paths[@]+"${deny_read_paths[@]}"}")"
-  printf 'allow_write=%s\n'         "$(join_bar "${allow_write_paths[@]+"${allow_write_paths[@]}"}")"
-  printf 'allow_socket=%s\n'        "$(join_bar "${allow_socket_paths[@]+"${allow_socket_paths[@]}"}")"
-  printf 'filter_egress=%s\n'      "$filter_egress"
-  printf 'allow_host=%s\n'         "$(join_bar "${allow_host_list[@]+"${allow_host_list[@]}"}")"
-  printf 'allow_port=%s\n'         "$(join_bar "${allow_port_list[@]+"${allow_port_list[@]}"}")"
-  printf 'paranoid_deny_read=%s\n'  "$(join_bar "${paranoid_deny_read_paths[@]+"${paranoid_deny_read_paths[@]}"}")"
-  printf 'paranoid_allow_read=%s\n' "$(join_bar "${paranoid_allow_read_paths[@]+"${paranoid_allow_read_paths[@]}"}")"
-  exit 0
-fi
 
 # Host-side credential work, before any worktree/namespace side effects (a
 # token_cmd failure must abort a clean launch, not a half-prepared one).

@@ -10,6 +10,10 @@
 bats_require_minimum_version 1.5.0
 
 CSB="${CSB:-$BATS_TEST_DIRNAME/../bin/csb}"
+# bin/csb resolves its configuration through csb-config. Pin it to the working
+# tree's build so the suite never depends on an installed one; harmless when
+# $CSB is csb-config itself.
+export CSB_CONFIG_BIN="${CSB_CONFIG_BIN:-$BATS_TEST_DIRNAME/../ocaml/_build/default/bin/csb_config_cli.exe}"
 
 setup() {
   bats_load_library bats-support

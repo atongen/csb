@@ -1,31 +1,40 @@
-# csb — development & install
+# csb - development and install
 #
 # Copies (not symlinks) bin/csb into a bin dir on your PATH: the target may
 # itself be under version control, so it must hold real, portable content.
 #
-#   make install                      # copy bin/csb into ~/bin
+# The native csb-config binary is portable content's opposite, so it goes to
+# TOOLS_DIR (~/.csb/bin) instead, which csb searches. That keeps a per-platform
+# binary out of a version-controlled bin dir, and keeps it outside every sandbox
+# write root -- csb-config decides policy and runs unsandboxed.
+#
+#   make install                      # bin/csb -> ~/bin, csb-config -> ~/.csb/bin
 #   make install BIN_DIR=~/.local/bin # ...or elsewhere
 #   make check                        # shellcheck the shell scripts
 #   make test                         # bats suite (dump-only, fast)
 #   make test-escape                  # Tier 3: real launches, run OUTSIDE csb
 #   make ocaml-build                  # build csb-config + csb-proxy (dune)
 #   make ocaml-test                   # the bats config tests against csb-config
-#   make test-parity                  # bin/csb vs csb-config on the same argv
 #   make test-proxy                   # egress-proxy tests (real proxy + curl)
 #   make proxy-run                    # run csb-proxy in the foreground
 #
 # `check`/`build` prefer a tool already on PATH and fall back to csb's own
 # devShell (nix develop), so they work with only Nix installed.
 
-BIN_DIR ?= $(HOME)/bin
-DEST    := $(BIN_DIR)/csb
+BIN_DIR   ?= $(HOME)/bin
+DEST      := $(BIN_DIR)/csb
+# csb's own dir for native helpers; csb looks here (see CSB_TOOLS_DIR in bin/csb).
+# Override it and the copy must be on PATH, or named by CSB_CONFIG_BIN, for csb
+# to find it -- install warns when neither holds.
+TOOLS_DIR ?= $(HOME)/.csb/bin
+TOOLS_DEST := $(TOOLS_DIR)/csb-config
 
 # Flake ref csb pulls the claude binary from; mirrors bin/csb's CSB_SELF default.
 # Override to refresh a different remote: make refresh CSB_SELF=path:/path/to/csb
 CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check test test-escape test-update test-proxy test-parity \
+.PHONY: help install uninstall check test test-escape test-update test-proxy \
         build update refresh ocaml-build ocaml-test proxy-run
 
 # The OCaml config-resolution layer (docs/PLAN-008-proxy.md s9).
@@ -42,24 +51,37 @@ PROXY_ALLOW ?= templates/allowed-hosts
 PROXY_LOG ?= $(patsubst %/,%,$(or $(TMPDIR),/tmp))/csb-proxy.log
 
 help: ## Show this help
-	@echo "csb — targets (override BIN_DIR to change the install location):"
+	@echo "csb - targets (BIN_DIR holds the script, TOOLS_DIR the csb-config binary):"
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-install: ## Copy bin/csb into BIN_DIR (default ~/bin)
-	@mkdir -p "$(BIN_DIR)"
-	@rm -f "$(DEST)"        # clear any pre-existing symlink
+install: ocaml-build ## Copy bin/csb into BIN_DIR and csb-config into TOOLS_DIR
+	@mkdir -p "$(BIN_DIR)" "$(TOOLS_DIR)"
+	@rm -f "$(DEST)" "$(TOOLS_DEST)"    # clear any pre-existing symlinks
 	@cp bin/csb "$(DEST)"
 	@chmod +x "$(DEST)"
 	@echo "install: copied -> $(DEST)"
+	@cp "$(CSB_CONFIG)" "$(TOOLS_DEST)"
+	@chmod +x "$(TOOLS_DEST)"
+	@echo "install: copied -> $(TOOLS_DEST)"
 	@case ":$$PATH:" in \
 		*":$(BIN_DIR):"*) ;; \
-		*) echo "install: note — $(BIN_DIR) is not on your PATH" >&2 ;; \
+		*) echo "install: note - $(BIN_DIR) is not on your PATH" >&2 ;; \
 	esac
+	@# A TOOLS_DIR csb does not search, and that is not on PATH, yields a csb that
+	@# dies on every invocation. Say so at install time, not at first use.
+	@if [ "$(TOOLS_DIR)" != "$(HOME)/.csb/bin" ]; then \
+		case ":$$PATH:" in \
+			*":$(TOOLS_DIR):"*) ;; \
+			*) echo "install: warning - $(TOOLS_DIR) is neither csb's default nor on your" >&2; \
+			   echo "  PATH, so csb will not find csb-config there;" >&2; \
+			   echo "  export CSB_CONFIG_BIN=$(TOOLS_DEST)" >&2 ;; \
+		esac; \
+	fi
 
-uninstall: ## Remove csb from BIN_DIR
-	@rm -f "$(DEST)"
-	@echo "uninstall: removed $(DEST)"
+uninstall: ## Remove csb from BIN_DIR and csb-config from TOOLS_DIR
+	@rm -f "$(DEST)" "$(TOOLS_DEST)"
+	@echo "uninstall: removed $(DEST) and $(TOOLS_DEST)"
 
 SHELLSCRIPTS := bin/csb templates/home/.claude/statusline.sh
 
@@ -71,7 +93,7 @@ check: ## Lint the shell scripts with shellcheck
 	fi
 	@echo "check: shellcheck clean"
 
-test: ## Run the bats test suite (test/)
+test: ocaml-build ## Run the bats test suite (test/)
 	@if command -v bats >/dev/null 2>&1; then \
 		bats test/; \
 	else \
@@ -128,13 +150,6 @@ ocaml-test: ocaml-build ## Config-layer oracle: the bats config tests against cs
 		CSB=$(CSB_CONFIG) bats $(OCAML_ORACLE); \
 	else \
 		nix develop --command env CSB=$(CSB_CONFIG) bats $(OCAML_ORACLE); \
-	fi
-
-test-parity: ocaml-build ## Differential oracle: bin/csb vs csb-config on the same argv
-	@if command -v bats >/dev/null 2>&1; then \
-		bats test/parity/; \
-	else \
-		nix develop --command bats test/parity/; \
 	fi
 
 build: ## Build the csb package from the flake (nix build .#csb)
