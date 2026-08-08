@@ -32,6 +32,19 @@ type home =
   | Throwaway of throwaway
   | Real_home
 
+(* What a layer may SELECT, which is the same set minus the default: Per_repo is
+   what remains when no layer selected anything, so a layer that "chose Per_repo"
+   is not a state worth being able to write down. *)
+type home_sel =
+  | Sel_shared of string
+  | Sel_throwaway of throwaway
+  | Sel_real_home
+
+let home_of_sel = function
+  | Sel_shared n -> Shared n
+  | Sel_throwaway t -> Throwaway t
+  | Sel_real_home -> Real_home
+
 (* The two read-only seams. Config is answered by csb-config itself; sandbox
    needs the profile generator, which lives in bin/csb, so it travels onward. *)
 type dump =

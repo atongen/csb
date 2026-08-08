@@ -38,29 +38,17 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
 
   let shell = bool_layer ~cli:cli.shell ~profile:(pf (fun p -> p.shell)) ~default:false in
 
-  (* The launch HOME: three selectors on one axis, each profile value suppressed
-     by an explicit CLI choice anywhere on that axis. *)
-  let ns_cli, ns_val =
-    match cli.ns with Set n -> (true, n) | Cleared -> (true, "") | Untouched -> (false, "")
+  (* The launch HOME: one axis, one field, every layer answering the same way.
+     Per_repo is what Cleared and Unset both resolve to -- the difference between
+     them is only whether a lower layer still gets to speak. *)
+  let home =
+    Option.fold ~none:Types.Per_repo ~some:Types.home_of_sel
+      (Layer.value (Layer.over cli.home (pf (fun p -> p.home))))
   in
-  let eph_cli = cli.ephemeral <> None in
-  let rh_cli = cli.real_home <> None in
-  let real_home =
-    match pf (fun p -> p.real_home) with
-    | Some v when (not rh_cli) && ns_val = "" && not eph_cli -> v
-    | _ -> cli.real_home = Some true
+  let namespace = match home with Types.Shared n -> n | _ -> "" in
+  let ephemeral_name =
+    match home with Types.Throwaway (Types.Named n) -> Some n | _ -> None
   in
-  let ephemeral =
-    match pf (fun p -> p.ephemeral) with
-    | Some v when (not eph_cli) && ns_val = "" && not real_home -> v
-    | _ -> cli.ephemeral = Some true
-  in
-  let namespace =
-    match pf (fun p -> p.ns) with
-    | Some n when ns_val = "" && (not ephemeral) && (not real_home) && not ns_cli -> n
-    | _ -> ns_val
-  in
-  let ephemeral_name = if ephemeral then cli.ephemeral_name else None in
 
   let latest = bool_layer ~cli:cli.latest ~profile:(pf (fun p -> p.latest)) ~default:env.latest in
   let verbose =
@@ -81,17 +69,12 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     bool_layer ~cli:cli.filter_egress ~profile:(pf (fun p -> p.filter_egress)) ~default:false
   in
 
-  (* One CLI target of any kind takes the profile's whole set out of play. *)
+  (* One CLI target of any kind takes the layers' whole set out of play, which is
+     now just the axis being one field. *)
   let nix_targets =
-    match cli.nix_targets with
-    | Cli.Nt_cleared -> Types.no_nix_targets
-    | Cli.Nt_set t -> t
-    | Cli.Nt_untouched ->
-        {
-          Types.shared = pf (fun p -> p.nix_target);
-          for_shell = pf (fun p -> p.nix_target_shell);
-          for_claude = pf (fun p -> p.nix_target_claude);
-        }
+    Option.value
+      (Layer.value (Layer.over cli.nix (pf (fun p -> p.nix))))
+      ~default:Types.no_nix_targets
   in
 
   let here_cli = cli.here <> None in
@@ -114,18 +97,17 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
         && (not here_cli) && p_here <> Some false)
   in
 
-  let seed_home =
-    match cli.seed_home with
-    | Cli.Set v -> Some v
-    | Cli.Cleared -> None
-    | Cli.Untouched -> pf (fun p -> p.seed_home)
+  let seed_home = Layer.value (Layer.over cli.seed_home (pf (fun p -> p.seed_home))) in
+  let token_cmd = Layer.value (Layer.over cli.token_cmd (pf (fun p -> p.token_cmd))) in
+  (* CSB_TMPDIR is the floor, as it is for latest and verbose: a layer that names
+     tmpdir answers instead of it, and --no-tmpdir hands the question back. *)
+  let cfg_tmpdir =
+    match Layer.over cli.tmpdir (pf (fun p -> p.tmpdir)) with
+    | Layer.Set v -> Some (Env.checked_tmpdir env ~where:"tmpdir" v)
+    | Layer.Cleared -> None
+    | Layer.Unset -> tmpdir
   in
-  let accent =
-    match cli.accent with
-    | Cli.Set v -> Some v
-    | Cli.Cleared -> None
-    | Cli.Untouched -> pf (fun p -> p.accent)
-  in
+  let accent = Layer.value (Layer.over cli.accent (pf (fun p -> p.accent))) in
 
   let deny_read = cli.deny_read @ plist (fun p -> p.deny_read) in
   let allow_write = cli.allow_write @ plist (fun p -> p.allow_write) in
@@ -162,7 +144,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     match cli.claude_args with
     | Some args -> args
     | None -> (
-        match pf (fun p -> p.args) with
+        match Layer.value (pf (fun p -> p.args)) with
         | None -> []
         | Some s -> List.map (expand_word env) (Profile.split_ws s))
   in
@@ -182,13 +164,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
       (if here then Types.Here
        else match cli.branch with Some b -> Types.Branch b | None -> Types.List_worktrees);
     runner = (if shell then Types.Shell else Types.Claude);
-    home =
-      (if real_home then Types.Real_home
-       else if ephemeral then
-         Types.Throwaway
-           (match ephemeral_name with Some n -> Types.Named n | None -> Types.Anon)
-       else if namespace <> "" then Types.Shared namespace
-       else Types.Per_repo);
+    home;
     paranoid;
     pasteboard;
     sandbox;
@@ -199,13 +175,13 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     seed_creds;
     nix_targets;
     profile = cli.profile;
-    token_cmd = pf (fun p -> p.token_cmd);
+    token_cmd;
     seed_home;
     accent;
-    cfg_tmpdir = tmpdir;
+    cfg_tmpdir;
     claude_args;
     keep = cli.keep @ plist (fun p -> p.keep);
-    setenv = plist (fun p -> p.setenv);
+    setenv = Profile.dedupe_setenv (plist (fun p -> p.setenv) @ cli.setenv);
     deny_read;
     allow_write;
     allow_socket;

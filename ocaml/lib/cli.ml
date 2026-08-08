@@ -12,13 +12,6 @@
 
 open Cmdliner
 
-(* A valued option that --no-<opt> also resets. *)
-type 'a setting = Untouched | Cleared | Set of 'a
-
-(* The three nix-target keys share one --no-nix-target, so they resolve against
-   a profile as a set rather than individually. *)
-type nix_targets = Nt_untouched | Nt_cleared | Nt_set of Types.nix_targets
-
 type t = {
   mode : Types.mode;
   dump : Types.dump;
@@ -32,18 +25,18 @@ type t = {
   paranoid : bool option;
   pasteboard : bool option;
   sandbox : bool option;
-  real_home : bool option;
   here : bool option;
-  ephemeral : bool option;
-  ephemeral_name : string option;
   seed_creds : bool option;
   latest : bool option;
   verbose : bool option;
   filter_egress : bool option;
-  nix_targets : nix_targets;
-  ns : string setting;
-  seed_home : string setting;
-  accent : string setting;
+  nix : Types.nix_targets Layer.t;
+  home : Types.home_sel Layer.t;
+  seed_home : string Layer.t;
+  accent : string Layer.t;
+  token_cmd : string Layer.t;
+  tmpdir : string Layer.t;
+  setenv : (string * string) list;
   keep : string list;
   deny_read : string list;
   allow_write : string list;
@@ -67,7 +60,8 @@ type t = {
 
 let value_taking =
   [ "-N"; "--ns"; "--nix-target"; "--nix-target-shell"; "--nix-target-claude";
-    "--seed-home"; "--accent"; "-p"; "--profile"; "-k"; "--keep"; "--deny-read";
+    "--seed-home"; "--accent"; "--token-cmd"; "--tmpdir"; "--setenv";
+    "-p"; "--profile"; "-k"; "--keep"; "--deny-read";
     "--allow-write"; "--allow-socket"; "--allow-host"; "--allow-port";
     "--paranoid-deny-read"; "--paranoid-allow-read" ]
 
@@ -135,9 +129,9 @@ let pair ~pos ~neg pos_given neg_given =
 
 let setting ~pos ~neg ~cleared value =
   match (value, cleared) with
-  | Some v, false -> Set v
-  | None, true -> Cleared
-  | None, false -> Untouched
+  | Some v, false -> Layer.Set v
+  | None, true -> Layer.Cleared
+  | None, false -> Layer.Unset
   | Some _, true -> Err.die "%s and %s are mutually exclusive" pos neg
 
 let mode ~delete ~list_ns =
@@ -159,13 +153,42 @@ let branch_of = function
   | [ b ] -> Some b
   | _ :: extra :: _ -> Err.die "unexpected argument: %s" extra
 
+(* The launch HOME is ONE axis with four answers, so the command line gives one
+   field: three positive selectors, and --per-repo retracting whatever a lower
+   layer chose. Two positives in one invocation is unresolvable rather than
+   ranked -- the same rule Profile.seal applies to a file layer, stated once
+   here instead of a second time in check_exclusive. *)
+let home_of ~ns ~ephemeral ~eph_name ~real_home ~per_repo =
+  if ns <> None && ephemeral then Err.die "--ns and -E/--ephemeral are mutually exclusive";
+  if real_home && ns <> None then
+    Err.die "--real-home and --ns are mutually exclusive (each selects the launch HOME)";
+  if real_home && ephemeral then
+    Err.die
+      "--real-home and -E/--ephemeral are mutually exclusive (each selects the launch HOME)";
+  let positive =
+    match (ns, ephemeral, real_home) with
+    | Some n, _, _ -> Some (Types.Sel_shared n)
+    | _, true, _ ->
+        Some
+          (Types.Sel_throwaway
+             (match eph_name with Some n -> Types.Named n | None -> Types.Anon))
+    | _, _, true -> Some Types.Sel_real_home
+    | _ -> None
+  in
+  match (positive, per_repo) with
+  | Some _, true ->
+      Err.die "--per-repo and an explicit HOME selector are mutually exclusive"
+  | Some sel, false -> Layer.Set sel
+  | None, true -> Layer.Cleared
+  | None, false -> Layer.Unset
+
 let nix_targets_of ~shared ~for_shell ~for_claude ~cleared =
   let any = shared <> None || for_shell <> None || for_claude <> None in
   if any && cleared then
     Err.die "--nix-target and --no-nix-target are mutually exclusive";
-  if cleared then Nt_cleared
-  else if any then Nt_set { Types.shared; for_shell; for_claude }
-  else Nt_untouched
+  if cleared then Layer.Cleared
+  else if any then Layer.Set { Types.shared; for_shell; for_claude }
+  else Layer.Unset
 
 (* --- the term ---------------------------------------------------------------
 
@@ -268,8 +291,12 @@ let term env pre =
          no seeding, and the real HOME is NOT made writable. Pair it with \
          --no-sandbox for a shell whose ~/.ssh, ~/.kube and ~/.aws resolve, for \
          example a deployment."
-  and+ no_real_home =
-    flag [ "no-real-home" ] ~docs:s_negate ~doc:"Cancel a profile real_home=true."
+  and+ per_repo =
+    flag [ "per-repo" ] ~docs:s_home
+      ~doc:
+        "Select the default per-repo HOME ~/.csb/claudes/repo-<key>, retracting \
+         an ns=, ephemeral= or real_home= chosen by any lower layer. The one \
+         negation for the whole HOME axis, since the axis has one answer."
   and+ here =
     flag [ "here" ]
       ~doc:
@@ -295,8 +322,6 @@ let term env pre =
          sibling 'csb -s -E=NAME' in another pane attaches to the exact same \
          environment. Still ephemeral -- temp, OS-reaped, untracked by \
          --list-ns -- and not a namespace."
-  and+ no_ephemeral =
-    flag [ "no-ephemeral" ] ~docs:s_negate ~doc:"Cancel a profile ephemeral=true."
   and+ latest =
     flag [ "L"; "latest" ]
       ~doc:
@@ -337,8 +362,12 @@ let term env pre =
     flag [ "no-filter-egress" ] ~docs:s_negate ~doc:"Cancel a profile filter_egress=true."
   and+ no_nix_target =
     flag [ "no-nix-target" ] ~docs:s_negate ~doc:"Cancel all three profile nix_target keys."
-  and+ no_ns =
-    flag [ "no-ns" ] ~docs:s_negate ~doc:"Cancel a profile ns= and use the branch default."
+  and+ no_token_cmd =
+    flag [ "no-token-cmd" ] ~docs:s_negate
+      ~doc:"Cancel a configured token_cmd= and authenticate some other way."
+  and+ no_tmpdir =
+    flag [ "no-tmpdir" ] ~docs:s_negate
+      ~doc:"Cancel a configured tmpdir= and fall back to CSB_TMPDIR."
   and+ no_seed_home =
     flag [ "no-seed-home" ] ~docs:s_negate
       ~doc:"Cancel a profile seed_home= and use the default template."
@@ -373,6 +402,18 @@ let term env pre =
          user-level files -- CLAUDE.md, settings.json, rules/ -- that \
          in-sandbox claude should otherwise miss, since the real ~/.claude is \
          denied and HOME is redirected. Defaults to ~/.config/csb/home."
+  and+ token_cmd =
+    opt_str [ "token-cmd" ] ~docv:"CMD"
+      ~doc:
+        "Run CMD on the host, outside the sandbox, and pass its first line into          the launch as CLAUDE_CODE_OAUTH_TOKEN -- a secrets-manager read such as          'op read op://vault/claude/token'. The command is the configuration,          never the token, so it is safe in a config file; note that a value          given here reaches ps(1) and the shell history, which a config or          profile key does not."
+  and+ tmpdir =
+    opt_str [ "tmpdir" ] ~docv:"DIR"
+      ~doc:
+        "Use DIR as the launch's TMPDIR, the base for an -E throwaway HOME, and a          write root. Must already exist. Overrides CSB_TMPDIR."
+  and+ setenv =
+    opt_str_all [ "setenv" ] ~docv:"VAR=VALUE" ~docs:s_seed
+      ~doc:
+        "Export VAR=VALUE in the launched environment, after the scrub, so it          survives regardless of --keep. Repeatable; the last layer to name a VAR          wins, and this is the highest layer."
   and+ accent =
     opt_str [ "accent" ] ~docv:"COLOR"
       ~doc:
@@ -434,11 +475,6 @@ let term env pre =
         "Under --paranoid only, re-expose PATH read-only WITHOUT granting write. \
          Rejected if it overlaps a deny. Repeatable."
   and+ positional = Arg.(value & pos_all string [] & info [] ~docv:"BRANCH") in
-  let ephemeral =
-    pair ~pos:"-E/--ephemeral" ~neg:"--no-ephemeral"
-      (given ephemeral || pre.eph_name <> None)
-      (given no_ephemeral)
-  in
   {
     mode = mode ~delete:(given delete) ~list_ns:(given list_ns);
     dump = dump ~config:(given dump_config) ~sandbox:(given dump_sandbox);
@@ -455,11 +491,7 @@ let term env pre =
       pair ~pos:"--pasteboard" ~neg:"--no-pasteboard" (given pasteboard)
         (given no_pasteboard);
     sandbox = pair ~pos:"--sandbox" ~neg:"--no-sandbox" (given sandbox) (given no_sandbox);
-    real_home =
-      pair ~pos:"--real-home" ~neg:"--no-real-home" (given real_home) (given no_real_home);
     here = pair ~pos:"--here" ~neg:"--no-here" (given here) (given no_here);
-    ephemeral;
-    ephemeral_name = (if ephemeral = Some true then pre.eph_name else None);
     seed_creds =
       pair ~pos:"--seed-creds" ~neg:"--no-seed-creds" (given seed_creds)
         (given no_seed_creds);
@@ -468,7 +500,7 @@ let term env pre =
     filter_egress =
       pair ~pos:"--filter-egress" ~neg:"--no-filter-egress" (given filter_egress)
         (given no_filter_egress);
-    nix_targets =
+    nix =
       nix_targets_of
         ~shared:
           (Option.map (Validate.nix_target ~where:"--nix-target")
@@ -480,11 +512,13 @@ let term env pre =
           (Option.map (Validate.nix_target ~where:"--nix-target-claude")
              (need ~msg:"--nix-target-claude requires a NAME" nix_target_claude))
         ~cleared:(given no_nix_target);
-    ns =
-      setting ~pos:"-N/--ns" ~neg:"--no-ns" ~cleared:(given no_ns)
-        (need
-           ~msg:"--ns requires a non-empty NAME (--no-ns resets to the branch default)"
-           ns);
+    home =
+      home_of
+        ~ns:
+          (need ~msg:"--ns requires a non-empty NAME (--per-repo resets to the default)" ns)
+        ~ephemeral:(given ephemeral || pre.eph_name <> None) ~eph_name:pre.eph_name
+        ~real_home:(given real_home)
+        ~per_repo:(given per_repo);
     seed_home =
       setting ~pos:"--seed-home" ~neg:"--no-seed-home" ~cleared:(given no_seed_home)
         (need
@@ -495,6 +529,18 @@ let term env pre =
     accent =
       setting ~pos:"--accent" ~neg:"--no-accent" ~cleared:(given no_accent)
         (need ~msg:"--accent requires a COLOR (--no-accent untints)" accent);
+    token_cmd =
+      setting ~pos:"--token-cmd" ~neg:"--no-token-cmd" ~cleared:(given no_token_cmd)
+        (need
+           ~msg:"--token-cmd requires a CMD (--no-token-cmd cancels a configured one)"
+           token_cmd);
+    tmpdir =
+      setting ~pos:"--tmpdir" ~neg:"--no-tmpdir" ~cleared:(given no_tmpdir)
+        (need ~msg:"--tmpdir requires a DIR (--no-tmpdir falls back to CSB_TMPDIR)"
+           tmpdir);
+    setenv =
+      List.map (Validate.setenv ~where:"--setenv")
+        (need_all ~msg:"--setenv requires VAR=VALUE" setenv);
     keep =
       List.map
         (Validate.keep_var ~msg:"invalid env var name for --keep")
@@ -554,10 +600,4 @@ let check_exclusive c =
     Err.die
       "--here and BRANCH are mutually exclusive (either provision a worktree for \
        BRANCH, or run --here)";
-  let ns_set = match c.ns with Set _ -> true | Untouched | Cleared -> false in
-  if ns_set && c.ephemeral = Some true then
-    Err.die "--ns and -E/--ephemeral are mutually exclusive";
-  if c.real_home = Some true && ns_set then
-    Err.die "--real-home and --ns are mutually exclusive (each selects the launch HOME)";
-  if c.real_home = Some true && c.ephemeral = Some true then
-    Err.die "--real-home and -E/--ephemeral are mutually exclusive (each selects the launch HOME)"
+  ()

@@ -171,6 +171,11 @@ choices for that HOME; the default is a per-repo redirected HOME. They differ in
 | **`-E`** | a throwaway dir under tmp | no | yes | yes |
 | **`--real-home`** | your real `$HOME` | n/a | **no** (reads obey the deny-list) | no |
 
+`--per-repo` names the default explicitly, which is how one run declines an
+`ns=`, `ephemeral=` or `real_home=` set by a config section or a profile. Since
+the four are one axis it retracts whichever of the three a lower layer chose;
+there is no per-key negation, and naming two selectors at once is an error.
+
 **By default the namespace is the repo, not the branch.** One persistent HOME is
 shared by every branch and worktree of the repo, living flat at
 `~/.csb/claudes/repo-<key>`, where `<key>` is the basename of the physical
@@ -295,7 +300,8 @@ config_sections=config[*]|config[*work*]|config.local[*]
 
 Two keys on the same **axis** move together: a layer that names any of `ns=`,
 `ephemeral=`, `real_home=` (which HOME) replaces all three below it, and the
-same holds for the three `nix_target*` keys. Per-repo config lives here and not
+same holds for the three `nix_target*` keys. On the command line that axis is
+one flag's worth of surface too: three positive selectors plus `--per-repo`. Per-repo config lives here and not
 in the repo itself, deliberately: the repo is writable inside the sandbox, so an
 in-repo `.csb/config` would let a launch edit the policy of the next one.
 
@@ -313,7 +319,7 @@ negating `--no-*` flags. Launch with `-p/--profile NAME`. Recognized keys
 
 ```
 ns=@work                                  # as --ns
-token_cmd=pass work/claude/token          # run host-side via bash -c;
+token_cmd=pass work/claude/token          # as --token-cmd; run host-side via bash -c;
                                           # stdout -> CLAUDE_CODE_OAUTH_TOKEN (never echoed)
 latest=true                               # as -L/--latest; beats CSB_LATEST, loses to explicit -L
 verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, loses to explicit -v
@@ -330,12 +336,14 @@ ephemeral=true                            # as -E; excludes ns= in the same prof
 shell=true                                # as -s/--shell
 seed_creds=true                           # as --seed-creds (skipped in -s shell mode, with a warning)
 seed_home=~/.config/csb/home              # as --seed-home; template copied into the launch HOME
+tmpdir=/fast/tmp                          # as --tmpdir; the launch TMPDIR, -E HOME base and a
+                                          # write root. Must exist. Overrides CSB_TMPDIR.
 accent=magenta                            # as --accent; statusline tint (csb --help lists the colors)
 args=bash --rcfile ~/.config/my.bashrc    # the ARGS after --: command in -s mode, extra claude
                                           # args otherwise. Whitespace-split, no quoting; a leading
                                           # ~/ or ${HOME} expands to the HOST home.
 keep=COLORTERM DIRENV_LOG_FORMAT          # space-separated, appended to --keep
-setenv=CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1 # repeatable; injected post-scrub
+setenv=CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1 # as --setenv; repeatable; injected post-scrub
 deny_read=~/notes                         # as --deny-read: extra read deny (both modes); repeatable
 allow_write=~/scratch                     # as --allow-write: extra write root (both modes); repeatable
 allow_socket=/tmp/.s.PGSQL.5432           # as --allow-socket: reachable unix socket (macOS); repeatable
@@ -362,6 +370,13 @@ Commit portable profiles
 to a dotfiles repo; keep host-specific values (a `token_cmd=` path, a
 `seed_home=`) in the uncommitted `.local`. Precedence: base -> `.local`
 -> explicit CLI flags.
+
+**An empty value retracts a key** for every layer below it, which is how a
+profile declines a repo default rather than replacing it: given
+`token_cmd=op read ...` in a `~/.config/csb/config` section, a profile with
+`token_cmd=` authenticates some other way, while a profile that never mentions
+the key leaves it standing. Booleans are retracted by `false`, not by an empty
+value; lists have no retraction and only ever union.
 
 ```
 # ~/.config/csb/profiles/work.local   (gitignored, per-host)

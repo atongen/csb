@@ -28,14 +28,19 @@ decision itself.
 | **adoption -- `bin/csb` delegates resolution to `csb-config`** | **DONE (2026-08-06)**, 99/99 in `make test`; see below. NOT yet exercised by a real launch |
 | parity tier (`make test-parity`) | **DELETED** with the bash resolution path, as planned -- it compared csb-config to itself |
 | P3 -- layered INI config, union-for-lists | **DONE (2026-08-07)**, 122/122 in `make test`; see below. NOT yet exercised by a real launch |
+| P3b -- one layer type, clearing across layers, flag parity | **DONE (2026-08-08)**, 143/143 `make test` and 115/115 `make ocaml-test`; section 5. NOT yet exercised by a real launch, and `ocaml/lib/layer.ml` needs `git add` before `nix build` |
 | P4 -- Linux netns so `--filter-egress` enforces there | not started; the big one |
 
 ### The expected numbers -- run these first to detect drift
 
     make check          # shellcheck clean
-    make test           # 122 ok  (Tier 1+2; snapshots SKIP inside csb, by design)
+    make test           # 143 ok  (Tier 1+2. bats reports a skip as `ok N # skip`,
+                        #          so 143 is the total on every platform and what
+                        #          varies is how many are skips: 14 inside csb --
+                        #          12 Tier-2 goldens plus 2 Linux-only cases --
+                        #          and fewer on a host, where the goldens run.)
     make test-proxy     # 11 ok   (needs network for 2 of them; rest are offline)
-    make ocaml-test     # 94 ok   (csb-config alone, without the bash wrapper)
+    make ocaml-test     # 115 ok  (csb-config alone, without the bash wrapper)
     ( export CSB_MAIN_ROOT="$(pwd -P)"
       diff <(./bin/csb --dump-config) <(./ocaml/_build/default/bin/csb_config_cli.exe) )
                         # must be empty: 38 keys, byte-identical
@@ -256,11 +261,24 @@ and `config_sections` makes the selection visible, but landmine 8 still holds --
   `--filter-egress` enforces on Linux instead of disabling itself. Cannot be
   done from inside a csb sandbox at all.
 
-Before it, the operator checks what adoption and P3 left open: a real launch,
-`nix build .#csb`, and `make install`. For P3 specifically, the launch worth
-running is one with a real `~/.config/csb/config` -- `csb --here --dump-config`
-first, to see `config_sections=` name the sections it should, then a launch and
-`env | grep DISABLE_AUTOUPDATER` inside it.
+Before P4, the operator checks what adoption, P3 and P3b left open: a real
+launch, `nix build .#csb`, and `make install`. For P3 specifically, the launch
+worth running is one with a real `~/.config/csb/config` -- `csb --here
+--dump-config` first, to see `config_sections=` name the sections it should,
+then a launch and `env | grep DISABLE_AUTOUPDATER` inside it.
+
+**P3b adds three to that list, and the first is a hard prerequisite:**
+
+- **`git add ocaml/lib/layer.ml`.** It is a new file, so landmine 11 applies and
+  `nix build` cannot see it until it is staged -- the failure is the confusing
+  one, "Unbound module Layer" for a file sitting right there on disk.
+- **The Tier-2 goldens have not been re-run since P3b.** They skip inside csb, so
+  the 143 above does not cover them. P3b touched resolution and not the profile
+  generator, so no golden should move; a host `make test` on each platform is
+  what confirms it. If one does move, that is a finding, not churn.
+- **A launch with `--per-repo`** against a config section or profile that sets
+  `ns=`, since HOME selection is what decides the directory the launch actually
+  runs in, and that path lives in `bin/csb` past both dump seams.
 
 Also open, and not P3's to fix: the README documented no egress surface at all
 until this pass (its profile key list had been missing `filter_egress`,
@@ -757,6 +775,297 @@ So profiles shrink to "optional named overlay". Ship layers 2-3, then look at
 what is left in `~/.config/csb/profiles/` after a month. Bundling the removal in
 turns one reversible change into two irreversible ones.
 
+### P3b -- one flag surface, and clearing across layers -- DONE (2026-08-08)
+
+P3 shipped the layering but left the three surfaces saying different things. Two
+gaps, and they turn out to be one root: **a layer can add but cannot retract.**
+
+#### The requirement (operator, 2026-08-08)
+
+Config carries the repo's default -- `seed_creds=true`, or `token_cmd=CMD` --
+and a named profile reverses it, so that `-p work` takes effect over the repo
+default. Booleans already do this; `token_cmd` cannot, and it is the sharp case.
+
+Measured 2026-08-08, with `[*] token_cmd = op read op://global/...` in config:
+
+    profile work: token_cmd=op read op://work/...  ->  op read op://work/...
+    profile clear: token_cmd=                      ->  op read op://global/...
+
+The second is the bug. `token_cmd` has **no CLI flag at all** (`ocaml/lib/cli.ml`
+names it only in `--doc` strings), so a profile is the only place that could
+retract it, and a profile cannot. A repo that defaults to a work credential has
+no expression for "this variant authenticates some other way".
+
+#### The rule: an empty value clears every layer below
+
+`Profile.overlay` reads `None` as "this layer did not say", so an empty value is
+inert across layers -- it resets the key within its own file and nothing more.
+It becomes an explicit **cleared** state that beats the layers below.
+
+**The blast radius is five keys.** Empty is already a hard error for every
+validated key, measured across the whole grammar:
+
+    paranoid=     rc=1  paranoid needs true or false: ''
+    allow_host=   rc=1  allow_host: not a hostname or *.suffix pattern: ''
+    allow_write=  rc=1  allow_write: not an absolute or ~/ path: ''
+    setenv=       rc=1  setenv needs VAR=value: ''
+    allow_port=   rc=1  allow_port: not a port from 1 to 65535: ''
+    nix_target=   rc=1  nix_target: invalid nix target ''
+    ns=           rc=0  accepted, inert
+    accent=       rc=0  accepted, inert
+    keep=         rc=0  accepted, inert (split_ws "" = [])
+
+So only `ns`, `token_cmd`, `seed_home`, `accent` and `args` change meaning, and
+each changes it from a silent no-op into something `--dump-config` reports.
+Within one layer the observable result is unchanged, so no existing file shifts
+under its author.
+
+**This is not a new semantic -- it is an existing one reaching one more
+boundary.** `resolve.ml:120-121` is already exactly this rule at the CLI edge:
+
+    | Cli.Cleared -> None
+    | Cli.Untouched -> pf (fun p -> p.seed_home)
+
+`--no-seed-home` already retracts the layer below. `Cli.t` already carries the
+tri-state that requires (`type 'a setting = Untouched | Cleared | Set of 'a`),
+and `Profile.t` carries a plain `'a option`. Two spellings of one idea, which is
+why the rule reaches one boundary and not the other.
+
+#### The type, which is where the work actually is
+
+One type serves every layer, and the merge is its monoid:
+
+    type 'a layer = Unset | Cleared | Set of 'a
+    let over hi lo = match hi with Unset -> lo | Cleared | Set _ -> hi
+
+`over` is associative with `Unset` as its identity, so the four-layer stack stops
+being nested `overlay` calls and becomes a fold, and resolution is one final
+`Set v -> v | Unset | Cleared -> default`. `Cli.t` and `Profile.t` become the
+same type rather than two shapes with a translation between them, which is what
+deletes the `Cli.Cleared`/`Cli.Untouched` special-cases in `resolve.ml` (44,
+120-127): they are the general rule, written out per key.
+
+**Booleans keep `bool option`, deliberately.** `bool layer` has four states and
+`Cleared` is indistinguishable from `Set false` -- an invalid state made
+representable, which is the one thing the house rule forbids. For a bool,
+clearing *is* `Some false`. `Cli.t` already splits exactly this way (`pair ~pos
+~neg` for bools, `'a setting` for strings), and it is why `seed_creds=false` in a
+profile already beats `seed_creds=true` in config; verified 2026-08-08. The
+operator's first scenario is satisfied today and this subsection does not touch
+it.
+
+**The multi-key axes collapse into single fields, and this is the prize.**
+`Profile.t` carries `ns`, `ephemeral` and `real_home` as three independent fields
+and then reconstructs the invariant by hand:
+
+    let home_over = over.ns <> None || over.ephemeral <> None || over.real_home <> None
+    let axis on hi lo = if on then hi else lo
+
+That is P3's decision 5 implemented as derived state -- the invalid case, two
+layers both answering "which HOME", is representable and prevented by code. Make
+it one field over a sum type (`home : home_sel layer`, with
+`home_sel = Ns of string | Ephemeral of throwaway | Real_home`) and `home_over`
+and `axis` both disappear: the axis rule becomes ordinary `over`. `Cli.t` already
+found this shape for the nix targets (`nix_targets = Nt_untouched | Nt_cleared |
+Nt_set of Types.nix_targets`, one field), and `Types.t` already has the resolved
+`home` sum type. `Profile.t` is the layer that never caught up.
+
+**What the collapse must preserve, measured 2026-08-08 rather than assumed.** The
+three keys are independent *within* a layer and an axis only *between* layers,
+and two rules already distinguish the cases:
+
+    profile: ns=foo + ephemeral=false      -> namespace=foo   (coexist)
+    profile: ns=foo + ephemeral=true       -> dies, "mutually exclusive"
+    config ns=bar / profile ephemeral=false -> namespace=      (axis reset)
+    config ns=bar / profile real_home=false -> namespace=
+
+So `ephemeral = Some true` is what makes a layer's selector *positive*
+(`profile.ml:150-157`, the exclusivity check), while `ephemeral <> None` is what
+makes the layer *claim the axis* (`overlay`'s `home_over`). A plain
+last-line-wins single field would break both: it would silently accept the second
+line and drop `ns=foo` on the first.
+
+The fold is therefore per layer, not per line. The three keys parse into a
+scratch triple, the existing exclusivity check runs on it unchanged, and the
+layer's single field is derived once:
+
+    ns = Some n            -> Set (Ns n)
+    ephemeral = Some true  -> Set (Ephemeral ...)
+    real_home = Some true  -> Set Real_home
+    any of the three named -> Cleared      (this is `ephemeral=false` today)
+    otherwise              -> Unset
+
+All four measured rows fall out of that with no special case, and the last line
+is the point: **`ephemeral=false` is already a working cross-layer retraction**,
+undocumented and un-named. The `Cleared` constructor is not new behavior here --
+it is the name for behavior that already shipped.
+
+**This is why clearing cannot be sequenced before the refactor.** A cleared `ns=`
+has to decide whether it triggers `home_over` -- a rule that has to be specified,
+tested, and got right, and that exists only because the axis is three fields.
+Do the refactor first and there is no rule to write.
+
+**Lists are deliberately excluded.** An empty `deny_read=` would have to mean
+"discard what the layers below accumulated", which is a different operation from
+the scalar case and a policy-weakening primitive: today list union is monotonic,
+so no layer can drop a restriction another layer added. That invariant is worth
+keeping on purpose rather than losing as a side effect of a syntax. If a list
+ever needs retraction it should arrive as an explicit `clear_deny_read` key,
+where it is visible, and not before something needs it.
+
+**The emit seam does not change.** `Dump.opt` encodes an absent scalar as an
+empty value, and `token_cmd=` on the wire already means absent -- confirmed
+against a live emit. `token_cmd` and `seed_creds` are both in `bin/csb`'s
+required-scalar list and stay there; clearing produces the encoding that list
+already expects. So nothing on the bash side of the seam moves.
+
+**The objection, recorded because it is this repo's failure mode.** An empty
+value is the least visible possible spelling of a verb, and a truncated line
+becomes a policy action. Two things answer it: today that same truncated line is
+silently ignored, which is strictly worse, and after the change `--dump-config`
+shows the outcome next to `config_sections`, which makes it the debuggable kind
+of wrong.
+
+#### Three steps, one effort -- and step 1 changes no behavior
+
+The type work is not a follow-on to the clearing rule; it is its prerequisite, so
+this is one effort rather than two. But it stages into three steps, and the order
+matters for one specific reason: **only step 1 is behavior-preserving, and that
+is a verification gate worth buying.**
+
+1. **Unify the layer types.** `'a layer` for scalars, `bool option` for booleans,
+   the two axes collapsed to single sum-typed fields, `overlay` and the CLI
+   special-cases replaced by a fold over `over`. **No behavior change.** The gate
+   is that `make test` (122) and `make ocaml-test` (94) stay green with *no test
+   edited and no golden regenerated*, which is the strongest evidence available
+   in here that the refactor was faithful. Every test drives the real binary
+   through `--dump-config`/`--dump-sandbox` (`test/helpers.bash:4-5`), so nothing
+   asserts internals and the whole suite survives the reshaping intact.
+2. **Make `Cleared` reachable from a file.** An empty value parses to `Cleared`
+   for the five plain-string scalars instead of `None`. This is where behavior
+   changes and where new tests are written.
+3. **Close the flag gaps.** `--token-cmd`, `--setenv`, and the `tmpdir`
+   key/flag. Independent of 1 and 2; it could equally be its own piece.
+
+Sequencing steps 1 and 2 the other way would mean writing the `home_over`
+interaction rule, testing it, and then deleting it -- so the merged effort is
+also the smaller one.
+
+#### The flag surface: what is accidental and what is not
+
+Measured by diffing `ocaml/lib/cli.ml` against `Profile.known_keys` against
+`Types.t`:
+
+| gap | keys | verdict |
+|---|---|---|
+| CLI-only: modes and seams | `--dump-config`, `--dump-sandbox`, `--no-launch`, `-d`, `--list-ns`, BRANCH, `-E=NAME` | **Stays CLI-only.** These answer "what am I doing right now", not "how is this configured". A file saying `dump=config` makes every launch print and exit. |
+| CLI-only: the selector | `-p/--profile` | **Stays CLI-only.** A profile naming a profile recurses. |
+| CLI-only: per-run action | `--reseed` | **Stays CLI-only.** Overwriting on seed is a one-shot repair; sticky in a file it silently overwrites a launch HOME on every run. |
+| CLI-only: negation | the 18 `--no-*` flags | **Closed by the clearing rule above** for scalars; booleans need no negation, lists keep none by decision. |
+| config/profile-only | `token_cmd`, `setenv` | **Accidental. Add `--token-cmd CMD` and `--setenv VAR=value`.** |
+| config/profile-only, naming only | `args` | **Not a gap.** The CLI spells it `-- ...`. Leave both spellings. |
+| env-only | `CSB_TMPDIR` (`cfg_tmpdir`) | **Accidental. Add a `tmpdir` key and `--tmpdir DIR`,** so the one env-only setting stops being a special case. |
+
+One caveat on `--token-cmd`: a CLI flag puts the command in shell history and in
+`ps` argv. It is the command and not the secret, and the emit seam already
+carries it unredacted through a private file, so this is a note for the man page
+rather than a reason to withhold the flag.
+
+**Explicitly not in scope: a `profile=` key in config.** `[*/work/*] profile=work`
+is coherent and probably useful, but it is a layer-2 value selecting layer 3 --
+an ordering inversion, and a new feature rather than a symmetry fix. It wants its
+own decision.
+
+#### As built -- DONE (2026-08-08)
+
+All three steps landed in one pass. `make check` clean, **143/143 `make test`**
+(was 122), **115/115 `make ocaml-test`** (was 94), and the emit-seam drift guard
+still byte-identical.
+
+**Step 1 met its gate**: `lib/layer.ml` plus the reshaping of `Profile.t`,
+`Cli.t` and `Resolve` ran green at 122/94 with **no test edited and no golden
+regenerated**. The 15 axis probes above were re-run afterwards and match the
+pre-refactor recordings row for row, which matters because the suite does not
+cover every one of those combinations.
+
+Three things the implementation forced, none of them foreseen:
+
+1. **The CLI retracted per KEY where the file layers retract per AXIS** --
+   `--no-ns` cancelled a profile's `ns=` but left its `real_home=true` standing,
+   while `ephemeral=false` in a file layer wiped the whole axis. The first cut
+   preserved that. **Step 4 removed it instead (operator, 2026-08-08):** no test
+   pinned the cross-selector case -- both existing tests were same-key -- so the
+   granularity was an accident of three interdependent boolean expressions, not
+   a decision. See "Step 4" below.
+2. **A layer's HOME answer is derived per LAYER, not per line**, exactly as the
+   corrected section above specifies -- `Profile.draft` collects the six raw keys
+   and `Profile.seal` folds them once, so the existing exclusivity error survives
+   unchanged rather than degrading into last-line-wins.
+3. **`Env.resolve_tmpdir` had to become `Env.checked_tmpdir ~where`**, since
+   CSB_TMPDIR, a `tmpdir=` key and `--tmpdir` now all reach the same validator
+   and only the label differs.
+
+**Step 2 was the one-line change the refactor was for**: `Profile.scalar`
+returning `Layer.Cleared` instead of `Layer.Unset` for an empty value. Ten tests
+cover it, including the operator's scenario end to end and the three controls
+(a boolean is retracted by `false`, an empty boolean is still a bad value, an
+empty list value does not clear the list).
+
+**Step 3** added `--token-cmd`/`--no-token-cmd`, `--setenv`, and `--tmpdir`/
+`--no-tmpdir` with a matching `tmpdir` key. `--setenv` sits at the top of the
+setenv stack and dedupes by name like every other layer. Seven tests. The emit
+seam and `bin/csb` are untouched: every new surface resolves into a key that
+already existed, so the 25 required scalars and 10 list keys are unchanged.
+
+`--help`'s CONFIGURATION section and the README's key list both gained `tmpdir`
+and a paragraph on retraction.
+
+Not verified: a real launch, and `nix build` -- **`ocaml/lib/layer.ml` is a new
+file, so landmine 11 applies and it must be `git add`ed before the flake can see
+it.**
+
+#### Step 4: the CLI collapses onto the same axis -- DONE (2026-08-08)
+
+`--no-ns`, `--no-ephemeral` and `--no-real-home` are **gone**, replaced by one
+`--per-repo`, and `Cli.t`'s four HOME fields (`ns`, `ephemeral`,
+`ephemeral_name`, `real_home`) are one `home : Types.home_sel Layer.t`. Every
+layer now answers the HOME question the same way, which is what step 1 was for
+and did not finish.
+
+What it cost, in full: a negation naming a different selector than the layer
+below used no longer leaves that selection standing. Nothing became
+inexpressible -- the layers below hold at most one selector, so every outcome is
+still reachable by naming a positive selector or none -- and no test covered it.
+What it removed was three flags that were synonyms in every case except the one
+where the difference was a surprise.
+
+What it bought:
+
+- `Resolve`'s HOME block: **35 lines to 7**. `cli_home`, `cancels` and the
+  `-E=NAME` re-naming special case are all gone; it is now `Layer.over` and a
+  fold to `Per_repo`.
+- `Cli.check_exclusive`: **4 dies to 1**. The three HOME exclusivity checks moved
+  into `Cli.home_of`, which states the same "two positives is unresolvable" rule
+  `Profile.seal` applies to a file layer -- one rule, not two copies.
+- `--per-repo` maps to `Layer.Cleared`, so the CLI spells retraction exactly as a
+  file layer's empty value does.
+
+Backward compatibility was explicitly waived (operator): csb has one user.
+**Anything with `--no-ns`, `--no-ephemeral` or `--no-real-home` in it now fails
+with a usage error** -- worth grepping shell aliases for. Positive selectors are
+untouched, so an alias like
+`csb -p drip --shell --here --no-sandbox --real-home -- script/release` behaves
+exactly as before; verified.
+
+Totals after step 4: **143/143 `make test`, 115/115 `make ocaml-test`.**
+
+#### Why before P4
+
+It is pure OCaml plus tests, needs no nix and no launch, and is doable entirely
+inside a csb sandbox -- the same properties that let P3 land in one pass. P4
+needs a NixOS host and the operator. Doing the cheap one first also means the
+config surface is settled before the Linux work starts adding keys to it.
+
 ### When it landed -- DONE (2026-08-07)
 
 **Phase B of the csb-config work (section 9), not bash.** Phase A had to
@@ -939,12 +1248,24 @@ at the top of this file.
   resolves nothing (the placeholder keeps that seam nix-free).
 - **P3 -- config surface. DONE (2026-08-07).** Layers 2-3 with union semantics
   (section 5), which is Phase B of section 9; see the handoff for what it cost.
+- **P3b -- one flag surface, and clearing across layers. DONE (2026-08-08).**
+  Four steps:
+  unify `Cli.t` and `Profile.t` on one `'a layer` type with the two multi-key
+  axes collapsed to single sum-typed fields (behavior-preserving); then an empty
+  value clears the layers below (five scalars; booleans and lists unaffected);
+  then `--token-cmd`, `--setenv`, and a `tmpdir` key/flag; then the CLI's HOME
+  axis collapses onto the same one field, trading three `--no-*` flags for one
+  `--per-repo`. Section 5 has the
+  decision and the measurements. OCaml and tests only -- no nix, no launch, no
+  host.
 - **P4 -- Linux netns.** `--unshare-net` + pasta + nftables, plus NixOS
   verification and an F4/abstract-socket re-measurement.
 
 P1+P2 are the cheap, high-value half and are independently shippable. P4 is the
 bulk and deserves its own verification pass. P3 can land before or after P2 --
-it is orthogonal.
+it is orthogonal. P3b landed before P4 because it was sandbox-doable and P4 is
+not, and because settling the config surface before the Linux work adds keys to
+it was cheaper than the reverse.
 
 ---
 

@@ -109,7 +109,12 @@ let man =
     `P
       "Naming none of them gives the fourth answer, and the default: the \
        per-repo HOME ~/.csb/claudes/repo-<key>, persistent and writable, shared \
-       by all the repo's branches and worktrees.";
+       by all the repo's branches and worktrees. --per-repo names that fourth \
+       answer explicitly, which is how a run declines an ns=, ephemeral= or \
+       real_home= set by a config section or a profile. Because the four are one \
+       axis, --per-repo retracts whichever of the three a lower layer chose; \
+       there is no per-key negation, and naming two selectors at once is an \
+       error rather than a ranking.";
     `S Cli.s_policy;
     `S Cli.s_egress;
     `S Cli.s_seed;
@@ -119,7 +124,9 @@ let man =
       "Each negation overrides a profile default -- or, for latest and verbose, \
        the CSB_LATEST and CSB_VERBOSE environment defaults -- for one run. A \
        flag and its --no- partner in the same invocation is an error rather than \
-       last-wins.";
+       last-wins. The HOME axis is the exception to the one-negation-per-flag \
+       shape: it has four answers and one field, so --per-repo is its whole \
+       negation and lives in HOME SELECTION.";
     `S "CONFIGURATION";
     `P
       "Four layers, lowest first: built-in defaults, the matching sections of \
@@ -140,13 +147,19 @@ let man =
        Every layer takes the same keys: ns, token_cmd, latest, verbose, yolo, \
        paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, \
        nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, \
-       accent, args, keep, setenv, deny_read, allow_write, allow_socket, \
-       filter_egress, allow_host, allow_port, paranoid_deny_read, \
-       paranoid_allow_read.";
+       tmpdir, accent, args, keep, setenv, deny_read, allow_write, \
+       allow_socket, filter_egress, allow_host, allow_port, \
+       paranoid_deny_read, paranoid_allow_read.";
     `P
       "The three HOME selectors -- ns, ephemeral, real_home -- are one axis, as \
        are the three nix_target keys: a layer naming any key on an axis replaces \
        the whole axis below it.";
+    `P
+      "An EMPTY value retracts a key, so no lower layer answers it either: \
+       token_cmd= in a profile cancels a token_cmd= set by a config section, \
+       where naming no key at all would have left it standing. Booleans are \
+       retracted by false rather than by an empty value, and lists are not \
+       retractable -- they only ever union.";
     `S Manpage.s_environment;
     `I
       ( "CSB_SELF",

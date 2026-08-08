@@ -8,12 +8,18 @@
    all of them. --dump-config reports which sections matched, because a selector
    that matches nothing is otherwise indistinguishable from one that matches. *)
 
-type t = {
-  layer : Profile.t;
-  matched : string list; (* file[selector], in application order *)
+(* Accumulating across both files, then the one sealed layer they amount to. *)
+type acc = {
+  draft : Profile.draft;
+  seen : string list; (* file[selector], in application order *)
 }
 
-let empty = { layer = Profile.empty; matched = [] }
+type t = {
+  layer : Profile.t;
+  matched : string list;
+}
+
+let empty = { draft = Profile.blank; seen = [] }
 
 (* '*' matches any run of characters, INCLUDING '/', and is the only
    metacharacter. That one rule covers all three shapes: [*] is everything,
@@ -56,7 +62,7 @@ let read env ~path acc =
               | None -> false
             in
             let acc =
-              if hit then { acc with matched = acc.matched @ [ label ^ "[" ^ sel ^ "]" ] }
+              if hit then { acc with seen = acc.seen @ [ label ^ "[" ^ sel ^ "]" ] }
               else acc
             in
             (acc, (if hit then Applied else Skipped), lineno)
@@ -65,10 +71,10 @@ let read env ~path acc =
             | Preamble ->
                 Err.die "%s: KEY=VALUE outside a [SELECTOR] section: '%s'" where line
             | Skipped ->
-                ignore (Profile.apply_line env ~where Profile.empty line);
+                ignore (Profile.apply_line env ~where Profile.blank line);
                 (acc, region, lineno)
             | Applied ->
-                ({ acc with layer = Profile.apply_line env ~where acc.layer line },
+                ({ acc with draft = Profile.apply_line env ~where acc.draft line },
                  region, lineno))
     in
     let acc, _, _ = List.fold_left step (acc, Preamble, 0) (Lines.of_file path) in
@@ -80,4 +86,4 @@ let load env =
     Err.warn "warning: no git repository here, so no config section in %s applies"
       env.Env.config_dir;
   let acc = List.fold_left (fun acc path -> read env ~path acc) empty paths in
-  { acc with layer = Profile.checked ~label:"config" acc.layer }
+  { layer = Profile.seal ~label:"config" acc.draft; matched = acc.seen }

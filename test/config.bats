@@ -142,6 +142,153 @@ setup_root() { export CSB_MAIN_ROOT="$REPO"; }
   assert_line "ephemeral=true"
 }
 
+# --- retraction: an empty value clears the layers below -----------------------
+
+@test "an empty profile value clears a config token_cmd" {
+  setup_root
+  write_config config "[*]" "token_cmd=op read op://global/token"
+  write_profile p "token_cmd="
+  dump_config -p p
+  assert_line "token_cmd=absent"
+}
+
+@test "a profile naming token_cmd replaces the config's, rather than clearing it" {
+  setup_root
+  write_config config "[*]" "token_cmd=op read op://global/token"
+  write_profile p "token_cmd=op read op://work/token"
+  dump_config -p p
+  assert_line "token_cmd=present"
+}
+
+@test "a profile silent on token_cmd leaves the config's standing" {
+  setup_root
+  write_config config "[*]" "token_cmd=op read op://global/token"
+  write_profile p "paranoid=true"
+  dump_config -p p
+  assert_line "token_cmd=present"
+}
+
+@test "config.local clears a scalar set by config" {
+  setup_root
+  write_config config "[*]" "accent=blue"
+  write_config config.local "[*]" "accent="
+  dump_config
+  assert_line "accent="
+}
+
+@test "an empty value clears seed_home and args too" {
+  setup_root
+  write_config config "[*]" "seed_home=/tmp/tpl" "args=--foo"
+  write_profile p "seed_home=" "args="
+  dump_config -p p
+  assert_line "seed_home="
+  assert_line "claude_args="
+}
+
+@test "an empty ns= retracts the whole HOME axis, like ephemeral=false" {
+  setup_root
+  write_config config "[*]" "real_home=true"
+  write_profile p "ns="
+  dump_config -p p
+  assert_line "real_home=false"
+  assert_line "namespace="
+}
+
+@test "a boolean is cleared by false, not by an empty value" {
+  setup_root
+  write_config config "[*]" "seed_creds=true"
+  write_profile p "seed_creds=false"
+  dump_config -p p
+  assert_line "seed_creds=false"
+}
+
+@test "an empty boolean is still a bad value" {
+  setup_root
+  write_config config "[*]" "paranoid="
+  dump_config
+  assert_failure
+  assert_output --partial "paranoid needs true or false"
+}
+
+@test "an empty list value does not clear the list" {
+  setup_root
+  write_config config "[*]" "keep=FROM_CONFIG"
+  write_profile p "keep="
+  dump_config -p p
+  assert_line "keep=FROM_CONFIG"
+}
+
+@test "a CLI negation still beats a layer that set the scalar" {
+  setup_root
+  write_config config "[*]" "accent=blue"
+  dump_config --no-accent
+  assert_line "accent="
+}
+
+# --- flag parity: the CLI reaches every configurable key ----------------------
+
+@test "--token-cmd beats a config token_cmd" {
+  setup_root
+  write_config config "[*]" "token_cmd=op read op://global/token"
+  dump_config --token-cmd "pass show other"
+  assert_line "token_cmd=present"
+}
+
+@test "--no-token-cmd cancels a config token_cmd" {
+  setup_root
+  write_config config "[*]" "token_cmd=op read op://global/token"
+  dump_config --no-token-cmd
+  assert_line "token_cmd=absent"
+}
+
+@test "--token-cmd and --no-token-cmd are mutually exclusive" {
+  setup_root
+  dump_config --token-cmd x --no-token-cmd
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+@test "--setenv adds to the layered setenv, and the CLI wins a name" {
+  setup_root
+  write_config config "[*]" "setenv=FROM=config"
+  dump_config --setenv FROM=cli --setenv EXTRA=1
+  assert_line "setenv=DISABLE_AUTOUPDATER|CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC|FROM|EXTRA"
+}
+
+@test "--setenv requires VAR=VALUE" {
+  setup_root
+  dump_config --setenv nope
+  assert_failure
+  assert_output --partial "setenv needs VAR=value"
+}
+
+@test "a tmpdir= key resolves like CSB_TMPDIR" {
+  setup_root
+  mkdir -p "$TEST_TMP/td"
+  write_config config "[*]" "tmpdir=$TEST_TMP/td"
+  dump_config
+  assert_success
+  refute_line "cfg_tmpdir="
+}
+
+@test "--tmpdir beats a config tmpdir=, and --no-tmpdir cancels it" {
+  setup_root
+  mkdir -p "$TEST_TMP/td" "$TEST_TMP/td2"
+  write_config config "[*]" "tmpdir=$TEST_TMP/td"
+  dump_config --tmpdir "$TEST_TMP/td2"
+  assert_success
+  dump_config --no-tmpdir
+  assert_line "cfg_tmpdir="
+}
+
+@test "a tmpdir that does not exist is fatal" {
+  setup_root
+  write_config config "[*]" "tmpdir=$TEST_TMP/missing"
+  dump_config
+  assert_failure
+  assert_output --partial "does not exist or is not a directory"
+}
+
 # --- failure modes -----------------------------------------------------------
 
 @test "a KEY=VALUE before any section header is an error" {

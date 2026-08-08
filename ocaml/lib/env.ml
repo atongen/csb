@@ -46,13 +46,14 @@ let expand_tilde env v =
     Filename.concat env.home (String.sub v 2 (n - 2))
   else v
 
-(* CSB_TMPDIR becomes the launched process's TMPDIR, its ephemeral HOME base and
-   a write root, so it must exist and is stored resolved. *)
+(* The launched process's TMPDIR, its ephemeral HOME base and a write root, so it
+   must exist and is stored resolved. `where` names whichever surface supplied
+   it, since CSB_TMPDIR, a tmpdir= key and --tmpdir all land here. *)
+let checked_tmpdir env ~where raw =
+  let v = expand_tilde env raw in
+  if not (Sys.file_exists v && Sys.is_directory v) then
+    Err.die "%s does not exist or is not a directory: '%s'" where v;
+  Unix.realpath v
+
 let resolve_tmpdir env =
-  match env.tmpdir with
-  | None -> None
-  | Some raw ->
-      let v = expand_tilde env raw in
-      if not (Sys.file_exists v && Sys.is_directory v) then
-        Err.die "CSB_TMPDIR does not exist or is not a directory: '%s'" v;
-      Some (Unix.realpath v)
+  Option.map (checked_tmpdir env ~where:"CSB_TMPDIR") env.tmpdir

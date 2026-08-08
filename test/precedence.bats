@@ -145,9 +145,9 @@ load helpers
   assert_line "real_home=true"
 }
 
-@test "CLI --no-real-home beats profile real_home=true" {
+@test "CLI --per-repo beats profile real_home=true" {
   write_profile p "real_home=true"
-  dump_config -p p --no-real-home
+  dump_config -p p --per-repo
   assert_line "real_home=false"
 }
 
@@ -206,10 +206,31 @@ load helpers
   assert_line "namespace=fromcli"
 }
 
-@test "--no-ns clears a profile ns=" {
+@test "--per-repo clears a profile ns=" {
   write_profile p "ns=fromprofile"
-  dump_config -p p --no-ns
+  dump_config -p p --per-repo
   assert_line "namespace="
+}
+
+@test "--per-repo retracts whichever selector the layer below used" {
+  write_profile p "ephemeral=true"
+  dump_config -p p --per-repo
+  assert_line "ephemeral=false"
+  assert_line "namespace="
+  assert_line "real_home=false"
+}
+
+@test "--per-repo and an explicit HOME selector are mutually exclusive" {
+  dump_config --per-repo --real-home
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+@test "a positive CLI selector still takes the whole axis from a profile" {
+  write_profile p "real_home=true"
+  dump_config -p p --ns fromcli
+  assert_line "namespace=fromcli"
+  assert_line "real_home=false"
 }
 
 # --- .local overlay ----------------------------------------------------------
