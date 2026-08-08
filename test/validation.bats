@@ -345,11 +345,37 @@ load helpers
 }
 
 # bats test_tags=dump-sandbox
-@test "--filter-egress on Linux warns and filters nothing" {
+@test "--filter-egress on Linux wraps bwrap in a pasta netns with an nft ruleset" {
   [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS enforces via the seatbelt profile)"
   local repo; repo="$(fake_repo)"
   dump_sandbox "$repo" --filter-egress --allow-host api.anthropic.com
   assert_success
-  assert_output --partial "--filter-egress is macOS-only for now"
-  refute_output --partial "network-outbound"
+  refute_output --partial "macOS-only"
+  assert_line "$CSB_PASTA_BIN"
+  assert_line "$CSB_NFT_BIN"
+  assert_line "<NFT_RULES:<PROXY_PORT>>"
+  # bwrap itself never unshares net -- that namespace is pasta's.
+  refute_line "--unshare-net"
+}
+
+# bats test_tags=dump-sandbox
+@test "without --filter-egress on Linux, bwrap argv has no pasta/nft at all" {
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo"
+  assert_success
+  refute_line "$CSB_PASTA_BIN"
+  refute_line "$CSB_NFT_BIN"
+}
+
+# bats test_tags=dump-sandbox
+@test "--allow-port reaches the Linux nft ruleset only under --filter-egress" {
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-port 5432
+  assert_success
+  assert_line "<NFT_RULES:<PROXY_PORT>, 5432>"
+  dump_sandbox "$repo" --allow-port 5432
+  assert_success
+  refute_line "$CSB_NFT_BIN"
 }

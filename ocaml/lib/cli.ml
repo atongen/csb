@@ -353,11 +353,12 @@ let term env pre =
       ~doc:
         "Route the sandbox's HTTPS egress through csb-proxy and allow ONLY the \
          hosts named by --allow-host, a profile's allow_host=, or the \
-         allowed-hosts config file. The sandbox profile is what enforces it: the \
-         proxy's loopback port becomes the only reachable IP endpoint, so a \
-         client that ignores HTTPS_PROXY reaches nothing. macOS only for now -- \
-         a warning and no filtering on Linux, which needs a network namespace. \
-         OFF by default: filtering breaks WebFetch for any host not on the list."
+         allowed-hosts config file. On macOS the sandbox profile enforces it: \
+         the proxy's loopback port becomes the only reachable IP endpoint. On \
+         Linux a pasta network namespace plus an nftables default-drop ruleset \
+         does the same job, since bwrap itself has no socket filter. Either \
+         way, a client that ignores HTTPS_PROXY reaches nothing. OFF by \
+         default: filtering breaks WebFetch for any host not on the list."
   and+ no_filter_egress =
     flag [ "no-filter-egress" ] ~docs:s_negate ~doc:"Cancel a profile filter_egress=true."
   and+ no_nix_target =

@@ -30,10 +30,14 @@ setup() {
   # network-reaching --latest, and no inherited main checkout root (config.bats
   # sets that per test; unset, csb derives it from the working directory).
   unset CSB_LATEST CSB_VERBOSE CLAUDE_CODE_OAUTH_TOKEN CSB_MAIN_ROOT
-  # Pin bwrap to a placeholder so --dump-sandbox on Linux prints a stable path
-  # instead of running `nix build .#bwrap` (nix is not on PATH in the devShell,
-  # and the dump never execs it). A no-op on macOS (seatbelt ignores it).
+  # Pin bwrap (and, under --filter-egress, pasta/nft) to placeholders so
+  # --dump-sandbox on Linux prints a stable path instead of running
+  # `nix build .#bwrap`/`.#pasta`/`.#nft` (nix is not on PATH in the devShell,
+  # and the dump never execs any of them). A no-op on macOS (seatbelt ignores
+  # them).
   export CSB_BWRAP_BIN="/csb-test/placeholder/bin/bwrap"
+  export CSB_PASTA_BIN="/csb-test/placeholder/bin/pasta"
+  export CSB_NFT_BIN="/csb-test/placeholder/sbin/nft"
   # A deterministic scratch/temp dir under the isolated TEST_TMP: it becomes a
   # write root and the base for the -E ephemeral HOME, so the Tier-2 snapshots
   # stay stable (the normalizer maps it to <TMP>).
@@ -162,8 +166,11 @@ normalize_sandbox() {
     fi
   fi
 
-  # Linux: the bwrap binary (pinned to the CSB_BWRAP_BIN placeholder).
+  # Linux: the bwrap binary (pinned to the CSB_BWRAP_BIN placeholder), and,
+  # under --filter-egress, pasta/nft (CSB_PASTA_BIN/CSB_NFT_BIN).
   prog+="s#$(_sed_escape "$CSB_BWRAP_BIN")#<BWRAP>#g;"
+  prog+="s#$(_sed_escape "$CSB_PASTA_BIN")#<PASTA>#g;"
+  prog+="s#$(_sed_escape "$CSB_NFT_BIN")#<NFT>#g;"
 
   printf '%s\n' "$output" | sed "$prog" | collapse_ipc_tmpfs
 }

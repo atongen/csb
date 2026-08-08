@@ -17,10 +17,12 @@ load helpers
 
 # --filter-egress replaces the blanket IP-egress allow with the proxy port and the
 # named local ports. The port is emitted as the stable <PROXY_PORT> placeholder in
-# dump mode, so no proxy starts and the golden is reproducible. On Linux this
-# golden is byte-identical to `baseline` -- the flag declines rather than emitting
-# a rule bwrap cannot enforce, and that identity IS the assertion (same shape as
-# linux/pasteboard and linux/allow-socket).
+# dump mode, so no proxy starts and the golden is reproducible. On macOS that is a
+# seatbelt rule change; on Linux (docs/PLAN-008-proxy.md section 4) bwrap gets
+# wrapped in a pasta netns plus an nft ruleset, so linux/filter-egress is no longer
+# byte-identical to `baseline` the way linux/pasteboard and linux/allow-socket
+# still are -- it needs regenerating (`make test-update`, host-side) now that the
+# flag enforces there instead of declining.
 @test "snapshot: --filter-egress (proxy port + allowed local port)" {
   local repo; repo="$(fake_repo feature/x)"
   dump_sandbox_snapshot "$repo" --filter-egress \

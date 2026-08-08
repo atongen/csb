@@ -68,6 +68,15 @@
           # launch so the sandbox doesn't depend on bubblewrap being installed
           # on the host. (macOS uses /usr/bin/sandbox-exec — nothing to build.)
           bwrap = pkgs.bubblewrap;
+
+          # --filter-egress on Linux (docs/PLAN-008-proxy.md section 4): bwrap
+          # has no socket filter, so enforcing the proxy allowlist needs a real
+          # network namespace. pasta (same binary as passt, `pkgs.passt`)
+          # creates and services it; nftables drops everything in that
+          # namespace except loopback to the allowed ports. Resolved the same
+          # way as #bwrap, so neither needs to be on the host's PATH.
+          pasta = pkgs.passt;
+          nft = pkgs.nftables;
         });
 
       # csb dogfoods itself: `csb <branch>` (or --here) runs claude in this
