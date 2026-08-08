@@ -1,3 +1,14 @@
+<PASTA>
+-f
+--
+bash
+-c
+nft_bin="$1"; rules="$2"; shift 2
+                               "$nft_bin" -f "$rules" || exit 1
+                               exec "$@"
+csb-netns-shim
+<NFT>
+<NFT_RULES:<PROXY_PORT>, 5432>
 <BWRAP>
 --ro-bind
 /

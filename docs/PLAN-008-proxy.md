@@ -29,7 +29,7 @@ decision itself.
 | parity tier (`make test-parity`) | **DELETED** with the bash resolution path, as planned -- it compared csb-config to itself |
 | P3 -- layered INI config, union-for-lists | **DONE (2026-08-07)**, 122/122 in `make test`; see below. NOT yet exercised by a real launch |
 | P3b -- one layer type, clearing across layers, flag parity | **DONE (2026-08-08)**, 143/143 `make test` and 115/115 `make ocaml-test`; section 5. NOT yet exercised by a real launch, and `ocaml/lib/layer.ml` needs `git add` before `nix build` |
-| P4 -- Linux netns so `--filter-egress` enforces there | **CODE WRITTEN in-session (2026-08-08)**, 145/145 `make test`, `make check` clean; section 8 and below. **Nothing about pasta/nftables is verified** -- neither binary exists in this sandbox (confirmed: no nix, no `pasta`, no `nft`, not even in `/nix/store`), and a real launch needs the operator regardless. Next task for whoever has a NixOS host. |
+| P4 -- Linux netns so `--filter-egress` enforces there | **DONE and VERIFIED END-TO-END on x86_64-linux (2026-08-08)**, on the NixOS host outside any sandbox. 145/145 `make test`, `make check` clean, goldens regenerated. One real bug found and fixed in the process (the nft ruleset dropped loopback replies -- see below). Section 8 has the measurements. |
 
 ### The expected numbers -- run these first to detect drift
 
@@ -257,48 +257,119 @@ Not verified: a real launch. The dump seams cover resolution and the profile,
 and `config_sections` makes the selection visible, but landmine 8 still holds --
 `setenv` reaching the launch environment is only observable by launching.
 
-### The immediate next task
+### P4 verification -- DONE (2026-08-08, x86_64-linux, on the host)
 
-**P4's code is written (section 8 has the full writeup); none of it is
-verified.** This session ran entirely inside a csb sandbox (launched by the
-main-branch `bin/csb`, per the operator) on an underlying NixOS host, with
-`nix`, `pasta` and `nft` all absent from inside that sandbox -- confirmed by
-`command -v`, and by `find /nix/store` turning up neither binary. So the
-actual next task is the operator, on that NixOS host,
-**outside any csb sandbox** (nesting is exactly what P4 adds a namespace
-underneath, and this session's own sandbox already proved that nested
-namespace/nix tooling isn't reachable from in here):
+Everything section 8 listed as unverified for Linux is now measured. The run
+happened on the NixOS host outside any csb sandbox, with `CSB_PASTA_BIN` /
+`CSB_NFT_BIN` pinned to `nix build .#pasta .#nft` outputs and
+`CSB_SELF=path:$(pwd -P)`.
 
-1. **Smoke-test pasta and nft in isolation, before touching csb at all** --
-   section 8's P4 writeup has the exact commands. This isolates "pasta/nft
-   don't do what the man pages say" from "the bash wiring is wrong", which
-   matters because several details below were researched, not measured.
-2. **Then `csb --here --filter-egress --shell` for real** and work through the
-   verification list in section 8.
-3. **Then regenerate `test/snapshots/linux/filter-egress`** (`make
-   test-update`, host-side) -- it is currently byte-identical to
-   `linux/baseline` (the old disabled-on-Linux behavior) and is now stale by
-   design; `test/snapshots.bats`'s comment on that test says so.
+**One real bug, and it would have shipped a silently isolated sandbox.** The
+generated ruleset was
 
-Before any of that, the operator still separately owes what adoption, P3 and
-P3b already left open -- unrelated to P4 and not made more urgent by it: a
-real launch, `nix build .#csb`, and `make install`. For P3 specifically, the
-launch worth running is one with a real `~/.config/csb/config` -- `csb --here
---dump-config` first, to see `config_sections=` name the sections it should,
-then a launch and `env | grep DISABLE_AUTOUPDATER` inside it.
+    type filter hook output priority 0; policy drop;
+    oif "lo" tcp dport { <ports> } accept
 
-**P3b adds three to that list, and the first is a hard prerequisite:**
+On loopback the server's replies traverse the *same* output hook, with dport set
+to the client's ephemeral port -- so the SYN was accepted and the SYN-ACK
+dropped. Measured as curl rc=28 against the proxy port itself: `--filter-egress`
+on Linux reached nothing at all, including its own proxy. The fix is one line,
+`ct state established,related accept`, ahead of the dport rule. This is exactly
+the failure class P2's writeup names -- a no-op that reads as working code --
+and it is worth noting **no test seam could have caught it**: `--dump-sandbox`
+emits the placeholder `<NFT_RULES:<ports>>`, so the ruleset's actual text is
+invisible to Tier 1 and Tier 2 alike. Only a real launch reaches it.
 
-- **`git add ocaml/lib/layer.ml`.** It is a new file, so landmine 11 applies and
-  `nix build` cannot see it until it is staged -- the failure is the confusing
-  one, "Unbound module Layer" for a file sitting right there on disk.
-- **The Tier-2 goldens have not been re-run since P3b.** They skip inside csb, so
-  the 145 above does not cover them. P3b touched resolution and not the profile
-  generator, so no golden should move; a host `make test` on each platform is
-  what confirms it. If one does move, that is a finding, not churn.
+**A correction to the design rationale, which was researched rather than
+measured.** Section 8 said nftables was needed because pasta's default
+networking gives the namespace "a real, routable address". It does not:
+pasta configures an address and a default route only under `--config-net`,
+which csb does not pass. Measured both ways --
+
+    pasta -f -- curl http://1.1.1.1/                 -> rc=7, no address, no route
+    pasta -f --config-net -- curl http://1.1.1.1/    -> 301, address + default route
+
+So off-host egress is fail-closed by construction. What nftables is actually
+for is narrower and was not stated: **pasta forwards every port bound on the
+host's loopback into the namespace, not just the proxy's.** Control, no nft
+loaded, two host listeners: ports 18080 and 18081 both answered 200 from
+inside. Without the ruleset a sandbox under `--filter-egress` would reach every
+local dev server, database and agent socket on the host. The port allowlist is
+load-bearing; the routable-egress rule is belt-and-braces. `bin/csb`'s comment
+now says this.
+
+**The four enforcement claims, same shape as the macOS verification**
+(`csb --here -s --filter-egress --allow-host api.anthropic.com`):
+
+    HTTPS_PROXY=http://127.0.0.1:33229     (+ lowercase, HTTP_PROXY, NO_PROXY)
+    curl https://api.anthropic.com/        -> 404      (allowed, via proxy)
+    curl https://example.com/              -> rc=7     (unlisted, refused)
+    curl --noproxy '*' https://api.anthropic.com/ -> rc=7   (DIRECT dial to an
+                                                             ALLOWED host also fails)
+    cat "$CSB_PROXY_LOG"   ->  ALLOW api.anthropic.com:443
+                               DENY host not allowed: example.com
+
+The third line is the one that matters, for the same reason it did on macOS:
+the sandbox has no independent egress capability, so this is enforced rather
+than advisory. The env vars are byte-identical to macOS -- pasta's loopback
+forwarding is what makes `127.0.0.1` resolve to the host's proxy, and no
+Linux-specific branch was needed.
+
+**`--allow-port` (section 8 item 3, the inferred mechanism) holds.** With host
+listeners on 5432 and 5433 and `--allow-port 5432`, from inside:
+`5432 CONNECTED`, `5433 BLOCKED`. Measured with bash `/dev/tcp` rather than
+curl, so the signal is TCP connect and not an HTTP artifact.
+
+**The abstract-socket residual closes (section 8 item 6).** Section 4 predicted
+this and called it plausible, not proven. A/B against a host
+`socat ABSTRACT-LISTEN:csbprobe`, same launch both ways:
+
+    without --filter-egress   -> REACHED
+    with    --filter-egress   -> connect(AF=1 "\0csbprobe"): Connection refused
+
+Abstract sockets are network-namespace scoped, so the netns cuts them as a
+class. Caveat: this host is headless, so the probe is a synthetic abstract
+socket, not the literal `@/tmp/.X11-unix/X0` keystroke-injection case. The
+mechanism is the same one; the X11 instance is inferred from it.
+
+**Also discharged in the same pass:**
+
+- `nix build` is green for all four outputs: `.#csb`, `.#csb-tools` (both
+  `csb-config` and `csb-proxy` present in `bin/`), `.#pasta`, `.#nft`.
+  `ocaml/lib/layer.ml` was already tracked, so landmine 11 never fired.
+- **The Tier-2 goldens ran on a host for the first time since P3b, and only
+  `linux/filter-egress` moved** (`+11 / -0`, the pasta/nft prefix). Every other
+  golden byte-identical, which is P3b's open question answered and the same
+  load-bearing result P2's commit had: the flag adds nothing to any profile
+  when unused. `make test` is 145 ok / 0 failures.
+- `make test-escape` (Tier 3, real launches) is 12/12 -- F3 and F4 still closed,
+  positive control green.
+- **`.worktreesetup.sh` under `filter_egress=true` on Linux (item 8)**: the
+  setup script runs and the launch proceeds, confirming the Linux branch's
+  skip-the-wrap-when-`proxy_port`-is-empty guard behaves as pre-P4.
+
+### What is still open
+
+Nothing Linux-side. The remainder is macOS or a real HOME:
+
+- **The Darwin half of item 8.** `run_worktreesetup` gets no `proxy_port`, and
+  the Darwin branch still emits a port-less `localhost:` rule. Unfixed, and
+  which of profile-load failure / silently open network / correctly-empty it
+  produces is still only answerable by launching on macOS.
+- **A host `make test` on macOS**, for the same P3b golden reason -- the Linux
+  half is now done and found nothing, so this is expected to be quiet.
+- **`make install` on a real HOME** rather than the fake one used in-session.
 - **A launch with `--per-repo`** against a config section or profile that sets
-  `ns=`, since HOME selection is what decides the directory the launch actually
-  runs in, and that path lives in `bin/csb` past both dump seams.
+  `ns=`, since HOME selection decides the directory the launch runs in and that
+  path lives past both dump seams.
+- **A `~/.config/csb/config` launch for P3**: `csb --here --dump-config` first,
+  to see `config_sections=` name the sections it should, then a launch and
+  `env | grep DISABLE_AUTOUPDATER` inside it.
+- **Consider whether the nft ruleset deserves a seam.** The bug above was
+  invisible to every tier by construction. Once is not evidence enough to add
+  one -- the same judgement P2 made about a third dump seam for the launch
+  environment -- but this is now the second no-op-that-reads-as-working in the
+  egress path, and the next one argues for it.
 
 Also open, and not P3's to fix: the README documented no egress surface at all
 until this pass (its profile key list had been missing `filter_egress`,
@@ -1328,8 +1399,8 @@ at the top of this file.
   `--per-repo`. Section 5 has the
   decision and the measurements. OCaml and tests only -- no nix, no launch, no
   host.
-- **P4 -- Linux netns. CODE WRITTEN (2026-08-08), NOT VERIFIED -- no NixOS host
-  in this session.** bwrap has no socket filter (section 4), so
+- **P4 -- Linux netns. DONE (2026-08-08), VERIFIED end-to-end on x86_64-linux.**
+  bwrap has no socket filter (section 4), so
   `--filter-egress` used to warn and disable itself on Linux
   (`start_egress_proxy` had a `uname -s != Darwin` gate). That gate is gone:
   `start_egress_proxy` now runs identically on both platforms, and
@@ -1377,19 +1448,30 @@ at the top of this file.
   -- see the verification list below.
 
   **What nftables is actually for, then.** Not reaching the proxy -- pasta's
-  loopback forwarding does that regardless of any firewall. It is that pasta's
-  default namespace networking is otherwise a REAL, routable connection to the
-  outside (it clones an address/route from the host's default interface), so
-  something has to close everything that isn't the loopback-forwarded proxy
-  path. The ruleset, generated per-launch in bash (this repo's whole model,
-  section 0 -- no static, eval-time firewall the way upstream's is):
+  loopback forwarding does that regardless of any firewall. It is that the
+  forwarding is INDISCRIMINATE: every port bound on the host's loopback is
+  reachable from inside the namespace, not just the proxy's, so without a
+  ruleset `--filter-egress` would expose every local dev server and database
+  on the host. (Measured 2026-08-08; the original claim here -- that pasta
+  also gives the namespace a real routable address that had to be closed --
+  was wrong. That happens only under `--config-net`, which csb does not pass,
+  so off-host egress is fail-closed by construction and the ruleset covers it
+  as belt-and-braces. See the P4 verification section in the handoff.) The
+  ruleset, generated per-launch in bash (this repo's whole model, section 0 --
+  no static, eval-time firewall the way upstream's is):
 
       table inet csb_filter_egress {
         chain output {
           type filter hook output priority 0; policy drop;
+          ct state established,related accept
           oif "lo" tcp dport { <proxy_port>[, <allow_port>...] } accept
         }
       }
+
+  The `ct state` line is not optional and cost a real bug: loopback replies
+  traverse this same output hook with dport set to the client's EPHEMERAL
+  port, so without it the SYN is accepted and the SYN-ACK dropped, and the
+  sandbox cannot reach even its own proxy.
 
   loaded into the namespace by a `bash -c` shim that IS pasta's COMMAND: it
   runs `nft -f <rules>` first, then `exec`s the real bwrap invocation, so
@@ -1404,10 +1486,10 @@ at the top of this file.
   (`pkgs.passt`, confirmed via nixpkgs source: `pkgs/by-name/pa/passt/package.nix`,
   installs both `passt` and `pasta` from one build) and `nft` (`pkgs.nftables`,
   `pkgs/os-specific/linux/nftables/default.nix`, standard autotools --
-  `$out/sbin/nft`, NOT `bin/`). `CSB_PASTA_BIN`/`CSB_NFT_BIN` override for
+  the real layout is `$out/bin/nft` with `sbin` a symlink to `bin`, so csb's
+  `sbin/nft` resolves either way). `CSB_PASTA_BIN`/`CSB_NFT_BIN` override for
   hermetic tests, same role as `CSB_BWRAP_BIN`; `test/helpers.bash` pins both
-  to placeholders the same way. **`nix build .#pasta .#nft` is unverified** --
-  no `nix` in this sandbox, same limit as every other flake output here.
+  to placeholders the same way. `nix build .#pasta .#nft` verified 2026-08-08.
 
   **What IS verified, in-session, without nix or a real launch:**
   - `make check` (shellcheck) and `make test` (145/145, up from 143 -- two new
@@ -1426,71 +1508,43 @@ at the top of this file.
     the proxy binary was already fully portable -- the only thing that was
     macOS-only was `bin/csb`'s gate in front of it.
 
-  **What is NOT verified, and cannot be from here (no nix, no `pasta`, no
-  `nft`, and nested namespaces/nftables under an outer sandbox is exactly the
-  kind of thing P4 itself is about -- confirmed absent by `command -v` and
-  `find /nix/store`, not assumed):**
-  1. **That `pasta [OPTION]... COMMAND ARG...` (with a literal `--` before
-     COMMAND) actually works as documented.** Smoke-test in isolation before
-     anything csb-shaped:
-         nix build .#pasta .#nft --no-link --print-out-paths
-         PASTA=<pasta-out>/bin/pasta; NFT=<nft-out>/sbin/nft
-         "$PASTA" -f -- bash -c 'id; ip addr 2>/dev/null; echo ok'
-     Confirms: `--` is honored as an option terminator, `-f` keeps pasta
-     attached (no early return to the shell), the command's exit status
-     propagates, and Ctrl-C reaches the sandboxed process correctly.
-  2. **The loopback-forwarding claim itself.** With a real csb-proxy listening
-     on the host (`start_egress_proxy`'s job), confirm a process inside the
-     pasta COMMAND can reach `127.0.0.1:<that port>` and nothing else:
-         "$PASTA" -f -- bash -c 'curl -sv http://127.0.0.1:<PORT>/ || true; curl -sv http://93.184.216.34/ || true'
-     The first should reach the proxy (an HTTP response, even a CONNECT-only
-     403); the second should fail closed once nftables is layered on in the
-     real launch.
-  3. **`--allow-port` under Linux `--filter-egress`**, end to end: bind
-     something on host loopback (`nc -l 127.0.0.1 5432`), then
-     `csb --here --filter-egress --allow-host x --allow-port 5432 --shell`
-     and confirm `curl 127.0.0.1:5432` (or the nc connection) succeeds inside
-     while an unlisted port does not. This is the one piece whose mechanism
-     (auto-forward reaching a port that ISN'T the proxy) was inferred from the
-     man page's general description, not from a proxy-specific detail.
-  4. **A real `csb --here --filter-egress --shell` launch**, per section 7
-     item 4's macOS verification shape: `env | grep -i proxy`, an allowed host
-     tunnels, a non-allowed host fails closed, `cat "$CSB_PROXY_LOG"` from
-     inside shows ALLOW/DENY lines, and a DIRECT dial (bypassing HTTPS_PROXY)
-     to an allowed host ALSO fails -- the enforcement claim, same as the
-     macOS verification's third bullet.
-  5. **`test/snapshots/linux/filter-egress` regeneration** (`make test-update`,
-     host-side, per landmine 3's "goldens made in here are wrong AND compare
-     equal" and `assert_snapshot`'s own refusal to run inside csb). It is
-     currently byte-identical to `linux/baseline` -- the OLD disabled-on-Linux
-     shape -- and needs to become the new pasta/nft argv. Not churn: an
-     intentional, expected change now that the flag does something on Linux.
-  6. **Section 10 item 4, the reason to bother**: `bats test/escape/escape.bats`
-     with the netns active, to see whether the abstract-unix-socket residual
-     (X11 keystroke injection via `@/tmp/.X11-unix/X0`) actually closes the way
-     section 4 predicts. `--unshare-net` is necessary but not obviously
-     sufficient for that -- abstract sockets are namespace-scoped by NETWORK
-     namespace, which this now has, so the prediction is plausible, not proven.
-  7. **`nix build .#csb`, `make install`, and a real launch** are already owed
-     from adoption/P3/P3b (this section's own note above); P4 adds nothing new
-     there beyond needing them before item 4 above is even reachable.
-  8. **A repo with both `.worktreesetup.sh` and `filter_egress=true`, on each
-     platform** -- landmine 19. `run_worktreesetup` never calls
-     `start_egress_proxy`, so `build_deny_wrapper` sees an empty `proxy_port`
-     there; the Linux branch now skips the pasta/nft wrap in that case
-     (matching pre-P4 behavior: open network for the setup script), but the
-     Darwin branch still emits a port-less `localhost:` rule, unfixed here.
-     Confirm `.worktreesetup.sh up` still runs (Linux) and check what it
-     actually gets on macOS (a profile-load failure, silently open network, or
-     network correctly restricted to nothing -- any of these is possible from
-     reading the code alone; only a real launch says which).
+  **VERIFIED on x86_64-linux (2026-08-08)**, on the NixOS host outside any csb
+  sandbox. Each item below was open when the code was written; each is now
+  measured. The handoff's "P4 verification" section has the commands and the
+  raw results, including the one real bug this found (loopback replies were
+  dropped, because `ct state established,related accept` was missing) and the
+  correction to the nftables rationale (pasta gives the namespace no routable
+  address without `--config-net`; what the ruleset actually narrows is pasta's
+  indiscriminate forwarding of every host loopback port).
 
-  If 1 or 2 fail, the mechanism this design leans on (pasta's default loopback
-  forwarding) does not hold and section 4's original sketch (explicit
-  `--config-net`/gateway address, nftables matching that address instead of
-  `oif lo`) is the fallback -- more moving parts, but not a rewrite: only the
-  ruleset's match clause and the env-var-injection block would change, not the
-  pasta/bwrap process structure.
+  1. **`pasta [OPTION]... -- COMMAND ARG...` works as documented.** The `--`
+     terminator is honored, `-f` keeps pasta attached, and the command's exit
+     status propagates (`exit 42` -> 42).
+  2. **The loopback-forwarding claim holds.** A process inside the namespace
+     reaches a host-bound `127.0.0.1:PORT`, which is why the injected proxy env
+     stays byte-identical to macOS.
+  3. **`--allow-port` works end to end.** Host listeners on 5432 and 5433 with
+     `--allow-port 5432`: `5432 CONNECTED`, `5433 BLOCKED`, measured over bash
+     `/dev/tcp` so the signal is TCP connect rather than an HTTP artifact.
+  4. **A real `csb --here -s --filter-egress` launch discharges all four
+     enforcement claims**, including the decisive one -- a DIRECT dial
+     (`--noproxy '*'`) to an ALLOWED host also fails, so this is enforced and
+     not advisory.
+  5. **`test/snapshots/linux/filter-egress` regenerated** (`make test-update`,
+     host-side): `+11 / -0`, the pasta/nft prefix. No other golden moved, on
+     either the P4 change or P3b's.
+  6. **The abstract-socket residual closes.** A/B against a host
+     `socat ABSTRACT-LISTEN:csbprobe`: REACHED without `--filter-egress`,
+     `Connection refused` with it. Section 4 predicted this and called it
+     plausible; it is now measured. The host is headless, so the probe is a
+     synthetic abstract socket rather than the literal `@/tmp/.X11-unix/X0`
+     case -- same mechanism, inferred instance.
+  7. **`nix build` green for `.#csb`, `.#csb-tools`, `.#pasta`, `.#nft`.**
+     `make install` on a real HOME is still owed.
+  8. **`.worktreesetup.sh` with `filter_egress=true` runs on Linux**: the setup
+     script executes and the launch proceeds, confirming the skip-the-wrap
+     guard. **The Darwin half is still open** -- that branch emits a port-less
+     `localhost:` rule and only a macOS launch says what it produces.
 
 P1+P2 are the cheap, high-value half and are independently shippable. P4 is the
 bulk and deserves its own verification pass. P3 can land before or after P2 --

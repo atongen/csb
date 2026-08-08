@@ -1232,11 +1232,15 @@ build_deny_wrapper() {
       #     this, so csb-proxy is already listening -- which is why the env
       #     vars below stay 127.0.0.1, unchanged from macOS: pasta is what
       #     makes that address resolve to the host's proxy from inside.
-      #   - nftables then closes the gap that forwarding alone leaves open:
-      #     pasta's default networking also gives the namespace a real,
-      #     routable address, so an nft ruleset loaded into the namespace
-      #     BEFORE bwrap's target runs drops everything on the way out except
+      #   - that forwarding is indiscriminate: EVERY port bound on the host's
+      #     loopback is reachable from inside, not just the proxy's. nftables
+      #     is what narrows it -- a ruleset loaded into the namespace BEFORE
+      #     bwrap's target runs drops everything on the way out except
       #     loopback to the proxy port and any --allow-port ports.
+      #     Routable egress needs no rule: pasta configures an address and a
+      #     default route only under --config-net, which is not passed here,
+      #     so the namespace has neither and off-host traffic has nowhere to
+      #     go. The ruleset covers it anyway rather than resting on that.
       #
       # Guarded on proxy_port too, not just filter_egress: run_worktreesetup
       # calls build_deny_wrapper directly, before start_egress_proxy ever runs
@@ -1275,6 +1279,11 @@ build_deny_wrapper() {
             echo "table inet csb_filter_egress {"
             echo "  chain output {"
             echo "    type filter hook output priority 0; policy drop;"
+            # Loopback replies traverse this same hook with dport set to the
+            # client's ephemeral port, so without this the accept below passes
+            # the SYN and drops the SYN-ACK -- a sandbox that cannot reach even
+            # its own proxy.
+            echo "    ct state established,related accept"
             printf '    oif "lo" tcp dport { %s } accept\n' "$ports"
             echo "  }"
             echo "}"
