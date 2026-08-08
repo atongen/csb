@@ -1045,7 +1045,14 @@ build_deny_wrapper() {
         # Enforcement is structural, not cooperative: HTTP_PROXY tells a client
         # where to go, but this rule is what leaves it nowhere else.
         if [[ "$filter_egress" == "true" ]]; then
-          printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$proxy_port"
+          # One rule per port that EXISTS. run_worktreesetup calls
+          # build_deny_wrapper before start_egress_proxy has run, so there is no
+          # proxy port at that call site and .worktreesetup.sh gets only the
+          # --allow-port rules: filtering stays applied wherever it was asked
+          # for, rather than falling back to open egress at one call site.
+          if [[ -n "$proxy_port" ]]; then
+            printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$proxy_port"
+          fi
           # --allow-port: host-local TCP services (a dev server, postgres over
           # TCP) the proxy cannot carry, since it speaks CONNECT to public names.
           for p in "${allow_port_list[@]+"${allow_port_list[@]}"}"; do
@@ -1242,16 +1249,14 @@ build_deny_wrapper() {
       #     so the namespace has neither and off-host traffic has nowhere to
       #     go. The ruleset covers it anyway rather than resting on that.
       #
-      # Guarded on proxy_port too, not just filter_egress: run_worktreesetup
-      # calls build_deny_wrapper directly, before start_egress_proxy ever runs
-      # (docs/PLAN-008-proxy.md section 8's P4 writeup has the Darwin sibling
-      # of this gap -- this call site never gets a proxy_port at all, so
-      # wrapping it here would build pasta/nft, generate a ruleset with an
-      # empty port, and load a probably-invalid nft table into a namespace
-      # that then has no way out. Without a proxy this can only fail closed
-      # (or fail to load at all), never open -- .worktreesetup.sh keeps the
-      # pre-P4 Linux behavior (open network) until it has a real port to wrap.
-      if [[ "$filter_egress" == "true" && -n "$proxy_port" ]]; then
+      # Wrapped whenever filtering is on, with no second condition:
+      # run_worktreesetup calls build_deny_wrapper before start_egress_proxy has
+      # run, so there is no proxy port at that call site, and the namespace it
+      # gets carries only the --allow-port ports -- or no accept rule at all,
+      # and therefore no egress. Skipping the wrap there instead would hand
+      # .worktreesetup.sh the host's own network namespace, which is open
+      # egress in the one configuration that asked for the opposite.
+      if [[ "$filter_egress" == "true" ]]; then
         local pasta_bin nft_bin ports
         if [[ -n "${CSB_PASTA_BIN:-}" ]]; then
           pasta_bin="$CSB_PASTA_BIN"
@@ -1263,9 +1268,15 @@ build_deny_wrapper() {
         else
           nft_bin="$(nix build "$CSB_SELF#nft" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/sbin/nft"
         fi
-        ports="$proxy_port"
-        for p in "${allow_port_list[@]+"${allow_port_list[@]}"}"; do
-          ports+=", $p"
+        # Only ports that exist reach the set; an absent proxy port contributes
+        # nothing rather than an empty element.
+        ports=""
+        for p in "$proxy_port" "${allow_port_list[@]+"${allow_port_list[@]}"}"; do
+          [[ -n "$p" ]] || continue
+          if [[ -n "$ports" ]]; then
+            ports+=", "
+          fi
+          ports+="$p"
         done
         # Under --dump-sandbox no file is written, matching proxy_port's own
         # placeholder above -- but the port list itself is real (nothing here
@@ -1284,7 +1295,11 @@ build_deny_wrapper() {
             # the SYN and drops the SYN-ACK -- a sandbox that cannot reach even
             # its own proxy.
             echo "    ct state established,related accept"
-            printf '    oif "lo" tcp dport { %s } accept\n' "$ports"
+            # `tcp dport { }` is a parse error, so an empty set emits no rule
+            # and the chain's drop policy stands alone.
+            if [[ -n "$ports" ]]; then
+              printf '    oif "lo" tcp dport { %s } accept\n' "$ports"
+            fi
             echo "  }"
             echo "}"
           } >"$nft_rules_file"

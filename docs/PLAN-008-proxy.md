@@ -30,6 +30,8 @@ decision itself.
 | P3 -- layered INI config, union-for-lists | **DONE (2026-08-07)**, 122/122 in `make test`; see below. NOT yet exercised by a real launch |
 | P3b -- one layer type, clearing across layers, flag parity | **DONE (2026-08-08)**, 143/143 `make test` and 115/115 `make ocaml-test`; section 5. NOT yet exercised by a real launch, and `ocaml/lib/layer.ml` needs `git add` before `nix build` |
 | P4 -- Linux netns so `--filter-egress` enforces there | **DONE and VERIFIED END-TO-END on x86_64-linux (2026-08-08)**, on the NixOS host outside any sandbox. 145/145 `make test`, `make check` clean, goldens regenerated. One real bug found and fixed in the process (the nft ruleset dropped loopback replies -- see below). Section 8 has the measurements. |
+| macOS host adoption (`make install`, `make test`, P3/P3b smoke launches) | **DONE (2026-08-08)**, on the aarch64-darwin host. `make install` on a real HOME, a host `make test` (so the Tier-2 goldens ran), a `~/.config/csb/config` launch confirming `config_sections` and a config-file `setenv=` reaching the launch environment, and a `--per-repo` launch against a section setting `ns=`. Every "not yet exercised by a real launch" above is now discharged on both platforms. |
+| P5 -- the worktreesetup call site fails closed | **DONE (2026-08-08)**, both halves of landmine 19. 145/145 `make test`, `make check` clean, Darwin dump byte-identical to P4. **Tier-3 VERIFIED on aarch64-darwin (2026-08-08)** via `csb -n <branch>`, which stops after `run_worktreesetup` and before `start_egress_proxy`; it also found that pre-P5 macOS did not fail open there but crashed the launch outright. **Linux Tier-3 still open.** |
 
 ### The expected numbers -- run these first to detect drift
 
@@ -348,28 +350,112 @@ mechanism is the same one; the X11 instance is inferred from it.
   setup script runs and the launch proceeds, confirming the Linux branch's
   skip-the-wrap-when-`proxy_port`-is-empty guard behaves as pre-P4.
 
+### P5 -- the worktreesetup call site fails closed (2026-08-08)
+
+`run_worktreesetup` calls `build_deny_wrapper` at `bin/csb:275`;
+`start_egress_proxy` does not run until `bin/csb:1847`, and
+`run_worktreesetup up` is at `bin/csb:1674`. So `proxy_port` is empty at that
+call site on every launch, by construction, on both platforms. Landmine 19
+recorded the two halves; this closes both, and the rule it settles on is the
+same one on each platform: **a rule is emitted per port that EXISTS, and no
+path yields open egress under `filter_egress=true`.**
+
+The decision that shaped it, which landmine 19 did not have: **failing open
+there is not equivalent to the unfiltered default.** `.worktreesetup.sh` runs
+on every non-`--here` launch (`bin/csb:1674` is unconditional after
+`ensure_worktree`, so it is not a create-time hook), it deliberately need not
+be git-tracked to run (`bin/csb:191`), and it sits in write root 22. A
+sandboxed agent can therefore write it and have it execute on the next
+`csb <branch>`. Handing that an unfiltered network in the one configuration
+that asked for filtering is the `.git/hooks` persistence shape section 5 rules
+on, one call site over. It is not an escape -- the filesystem sandbox and the
+devShell are intact -- but it is exactly the capability `--filter-egress` is
+bought to remove.
+
+- **Darwin**: the `proxy_port` rule is guarded individually rather than the
+  whole arm, so the `--allow-port` rules still emit. `.worktreesetup.sh` under
+  filtering gets the ports the operator named and nothing else.
+- **Linux**: the `-n "$proxy_port"` condition is gone from the wrap, so the
+  netns is always built under filtering; instead the `oif "lo" tcp dport {...}`
+  line is omitted when the port set is empty, since `tcp dport { }` is a parse
+  error. What remains is `policy drop` plus `ct state established,related
+  accept` -- a valid ruleset with no egress.
+
+Verified in-session: `make check` clean, **145/145 `make test`**, and the
+Darwin `--dump-sandbox` output is **byte-identical to the previous commit**
+across unfiltered / `--filter-egress` / `+--allow-port` / `+--paranoid`, so no
+golden moves on macOS.
+
+**No read-only seam reaches `run_worktreesetup`'s wrapper.** `--dump-sandbox`
+dumps the main launch's profile, where `proxy_port` is never empty under
+filtering, so the arm this fixes is unreachable from Tier 1 and Tier 2 alike. It
+takes a Tier-3 launch on each platform, against a repo with a real
+`.worktreesetup.sh` and `filter_egress=true`.
+
+### P5 Tier-3 -- DONE on aarch64-darwin (2026-08-08), Linux still open
+
+`csb -n <branch>` is the seam, and it is exact rather than approximate: `-n`
+runs `run_worktreesetup up` (`bin/csb:1689`) and exits at `bin/csb:1693`,
+*before* `start_egress_proxy`, so the launch stops with `proxy_port` empty at
+precisely the call site P5 is about. A scratch repo carried a tracked,
+executable `.worktreesetup.sh` whose `up` connects with bash `/dev/tcp` -- the
+signal is TCP connect, not an HTTP artifact -- against `1.1.1.1:443` and two
+host listeners on 18080 and 18081.
+
+| run | 1.1.1.1:443 | 127.0.0.1:18080 | 127.0.0.1:18081 |
+|---|---|---|---|
+| control, no flag | CONNECTED | CONNECTED | CONNECTED |
+| `--filter-egress --allow-port 18080` | BLOCKED (EPERM) | CONNECTED | BLOCKED |
+| `--filter-egress`, no ports | BLOCKED | BLOCKED | BLOCKED |
+
+Row 2 is both Darwin claims at once: the call site fails closed, and the
+`--allow-port` rules still emit there. Row 3 is the empty port set producing a
+profile that is valid and has no egress, rather than a broken one.
+
+**A correction to what this section assumed, measured against `HEAD`'s own
+script.** Pre-P5 on Darwin the configuration did not fail open -- it hard-failed:
+
+    sandbox-exec: invalid port in network address
+    Backtrace: /private/tmp/csb-deny.Hg9M9q:8:26:  (remote ip "localhost:")
+    csb: .worktreesetup.sh up failed (exit 65); not launching claude.
+
+An empty `proxy_port` interpolates to `(remote ip "localhost:")`, which the
+seatbelt parser rejects outright, so `--filter-egress` was **unusable on macOS
+in any repo carrying a `.worktreesetup.sh`** -- not a weakened sandbox, no
+sandbox at all, because nothing launched. The Darwin bullet above frames its
+half as a scoping refinement; that understates it. Two things follow. The
+open-egress hazard landmine 19 names was the **Linux** half specifically, since
+only that one skipped the mechanism. And nobody had ever run `--filter-egress`
+against a repo with a `.worktreesetup.sh` on macOS -- a first-use crash sat
+there from P2 until this pass, which is the same "the flag was never exercised
+on this path" shape P4's loopback bug had.
+
+The Darwin `--dump-sandbox` byte-identity was re-checked here directly against
+`git show HEAD:bin/csb` rather than carried forward from the claim above (a
+copy at a path named `csb`, with `CSB_CONFIG_BIN` pinned to the built
+`csb_config_cli.exe`): identical on all four variants. `make check` clean,
+`make test` exit 0 numbering through 145 with the three Linux-only egress cases
+skipping, and the `--dump-config` guard empty.
+
+**Linux is untouched by this.** Its Tier-3 launch, and a host `make test` for
+the ruleset change, still need the NixOS host -- both Linux `--dump-sandbox`
+tests skip on macOS.
+
 ### What is still open
 
-Nothing Linux-side. The remainder is macOS or a real HOME:
-
-- **The Darwin half of item 8.** `run_worktreesetup` gets no `proxy_port`, and
-  the Darwin branch still emits a port-less `localhost:` rule. Unfixed, and
-  which of profile-load failure / silently open network / correctly-empty it
-  produces is still only answerable by launching on macOS.
-- **A host `make test` on macOS**, for the same P3b golden reason -- the Linux
-  half is now done and found nothing, so this is expected to be quiet.
-- **`make install` on a real HOME** rather than the fake one used in-session.
-- **A launch with `--per-repo`** against a config section or profile that sets
-  `ns=`, since HOME selection decides the directory the launch runs in and that
-  path lives past both dump seams.
-- **A `~/.config/csb/config` launch for P3**: `csb --here --dump-config` first,
-  to see `config_sections=` name the sections it should, then a launch and
-  `env | grep DISABLE_AUTOUPDATER` inside it.
-- **Consider whether the nft ruleset deserves a seam.** The bug above was
-  invisible to every tier by construction. Once is not evidence enough to add
-  one -- the same judgement P2 made about a third dump seam for the launch
-  environment -- but this is now the second no-op-that-reads-as-working in the
-  egress path, and the next one argues for it.
+- **Tier-3 verification of P5 on Linux**, plus a host `make test` on NixOS for
+  the Linux ruleset change. Darwin is done -- `csb -n <branch>` against a repo
+  with a `.worktreesetup.sh` is the seam, and it works unchanged on Linux.
+- **The nft ruleset deserves a seam.** `--dump-sandbox` emits the placeholder
+  `<NFT_RULES:<ports>>`, so the rule bodies are invisible to every tier -- which
+  is how a ruleset that dropped every loopback reply passed 145/145. Two things
+  on the egress path are still invisible to Tier 1 and Tier 2 (the ruleset text
+  and the launch environment); P5's wrapper was the third until `csb -n` turned
+  out to reach it. P2 and P4 each judged "once is not enough evidence"; P5 makes
+  three, and its Darwin crash is what a seam here would have caught at Tier 1.
+- The README has no `--filter-egress` workflow section, and its Known-gaps row
+  for Linux abstract unix sockets still reads "open, unfixable without closing
+  network egress" -- P4 measured it closed under `--filter-egress`.
 
 Also open, and not P3's to fix: the README documented no egress surface at all
 until this pass (its profile key list had been missing `filter_egress`,
@@ -501,22 +587,20 @@ what makes the two agree.
     one-line paraphrase elsewhere in this same file would have shipped the
     wrong mental model with high confidence.
 19. **`run_worktreesetup` calls `build_deny_wrapper` directly, without ever
-    calling `start_egress_proxy` first** -- `proxy_port` is still `""` at that
-    call site, on BOTH platforms, for every launch, not just under P4. Found
-    while wiring P4 (a Linux `filter_egress=true` there would have built pasta
-    and nft, then loaded an nft ruleset with an empty port -- likely an nft
-    parse error, hard-failing every `.worktreesetup.sh up` in a repo that also
-    sets `filter_egress=true`). Fixed on Linux by also requiring
-    `-n "$proxy_port"` before wrapping (`build_deny_wrapper`'s Linux branch);
-    **the Darwin sibling is UNFIXED, in scope for P2 not P4, and is a live bug,
-    not a hypothetical**: the seatbelt branch has always emitted
-    `(allow network-outbound (remote ip "localhost:"))` -- port omitted -- for
-    this exact call site, which is either a profile-load error or a rule that
-    matches nothing, in either case silently breaking (or misreporting) network
-    access from inside `.worktreesetup.sh` for any repo combining it with
-    `--filter-egress`. Neither the Linux fix nor the Darwin bug is verified
-    end-to-end (needs a real launch with such a repo, on each platform); see
-    the P4 verification list in section 8.
+    calling `start_egress_proxy` first** -- `proxy_port` is `""` at that call
+    site, on BOTH platforms, for every launch. Closed by P5 above; the lasting
+    lesson is the one that decided it. **"Skip the policy when its input is
+    missing" is not a safe default when the policy is the capability.** The
+    first fix guarded the whole wrap on `-n "$proxy_port"`, which reads as
+    conservative and is the opposite: it hands the one call site an unfiltered
+    network in the one configuration that asked for filtering, via a file a
+    sandboxed agent can write. Guard the individual rule, not the mechanism, so
+    the failure mode is "no ports allowed" rather than "no filtering applied".
+    A second trap sits under it: the setup script gets no proxy env either
+    (`run_worktreesetup` runs `nix develop --ignore-environment`, and
+    `env_overrides` applies only to the final launch), so there is no version of
+    this where its egress "works" through the proxy without moving the proxy
+    start AND injecting the env.
 
 ### Conventions that are not obvious from the code
 
@@ -1540,11 +1624,16 @@ at the top of this file.
      synthetic abstract socket rather than the literal `@/tmp/.X11-unix/X0`
      case -- same mechanism, inferred instance.
   7. **`nix build` green for `.#csb`, `.#csb-tools`, `.#pasta`, `.#nft`.**
-     `make install` on a real HOME is still owed.
   8. **`.worktreesetup.sh` with `filter_egress=true` runs on Linux**: the setup
-     script executes and the launch proceeds, confirming the skip-the-wrap
-     guard. **The Darwin half is still open** -- that branch emits a port-less
-     `localhost:` rule and only a macOS launch says what it produces.
+     script executes and the launch proceeds. Note this measured the
+     skip-the-wrap guard, which P5 then replaced -- under P5 that call site gets
+     a netns with no egress instead of the host's network, so this item wants
+     re-running on both platforms.
+
+- **P5 -- the worktreesetup call site fails closed. DONE (2026-08-08).** Both
+  halves of landmine 19, on one rule: a rule per port that exists, and no path
+  to open egress under `filter_egress=true`. The handoff's P5 section has the
+  reasoning and what stays unverified.
 
 P1+P2 are the cheap, high-value half and are independently shippable. P4 is the
 bulk and deserves its own verification pass. P3 can land before or after P2 --
