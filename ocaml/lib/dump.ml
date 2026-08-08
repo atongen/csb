@@ -71,6 +71,7 @@ let to_lines c =
     ("allow_port", joined (List.map string_of_int c.allow_ports));
     ("paranoid_deny_read", joined c.paranoid_deny_read);
     ("paranoid_allow_read", joined c.paranoid_allow_read);
+    ("config_sections", joined c.config_sections);
   ]
 
 let print c =

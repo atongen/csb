@@ -25,15 +25,28 @@ open Cmdliner
    signal, so answering the operator is an ordinary success. *)
 let exit_answered = 2
 
-(* bin/csb's own order: the CLI exclusions, then CSB_TMPDIR, then the profile,
-   then the allowed-hosts file. Each step can die, and which message the
-   operator sees depends on getting here first. *)
+(* bin/csb's own order: the CLI exclusions, then CSB_TMPDIR, then the config
+   layers bottom-up, then the allowed-hosts file. Each step can die, and which
+   message the operator sees depends on getting here first. *)
 let run env cli emit ~answered =
   Cli.check_exclusive cli;
   let tmpdir = Env.resolve_tmpdir env in
-  let profile = Option.map (fun name -> Profile.load env ~name) cli.Cli.profile in
+  let config = Config_file.load env in
+  let profile =
+    match cli.Cli.profile with
+    | None -> Profile.empty
+    | Some name -> Profile.load env ~name
+  in
+  let layers =
+    Profile.overlay
+      ~base:(Profile.overlay ~base:Profile.builtin ~over:config.Config_file.layer)
+      ~over:profile
+  in
   let hosts_file = Hosts_file.read env in
-  let cfg = Resolve.resolve ~env ~cli ~profile ~tmpdir ~hosts_file in
+  let cfg =
+    Resolve.resolve ~env ~cli ~layers ~config_sections:config.Config_file.matched ~tmpdir
+      ~hosts_file
+  in
   match (cfg.Types.dump, emit) with
   | Types.Dump_config, _ | _, None ->
       Dump.print cfg;
@@ -107,18 +120,33 @@ let man =
        the CSB_LATEST and CSB_VERBOSE environment defaults -- for one run. A \
        flag and its --no- partner in the same invocation is an error rather than \
        last-wins.";
-    `S "PROFILES";
+    `S "CONFIGURATION";
+    `P
+      "Four layers, lowest first: built-in defaults, the matching sections of \
+       ~/.config/csb/config and then ~/.config/csb/config.local, the profile \
+       named by -p, and the command line. A scalar or boolean goes to the \
+       highest layer that sets it; every list unions across all of them.";
+    `P
+      "The config files are KEY=VALUE lines with '#' comments, grouped under \
+       [SELECTOR] section headers. A selector is matched against the physical \
+       main checkout root -- so a linked worktree selects its repository's \
+       sections -- with '*' matching any characters, including '/', and nothing \
+       else special: [*] is every repo, [*work*] and [*/csb] are patterns, and a \
+       selector without '*' is one exact path. Every matching section applies, \
+       in document order, and --dump-config reports which ones did.";
     `P
       "-p NAME reads ~/.config/csb/profiles/NAME, then the optional gitignored \
-       NAME.local overlay, as KEY=VALUE lines with '#' comments. The keys are: \
-       ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, \
-       real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
-       nix_target_claude, seed_creds, seed_home, accent, args, keep, setenv, \
-       deny_read, allow_write, allow_socket, filter_egress, allow_host, \
-       allow_port, paranoid_deny_read, paranoid_allow_read.";
+       NAME.local overlay, in the same grammar without the section headers. \
+       Every layer takes the same keys: ns, token_cmd, latest, verbose, yolo, \
+       paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, \
+       nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, \
+       accent, args, keep, setenv, deny_read, allow_write, allow_socket, \
+       filter_egress, allow_host, allow_port, paranoid_deny_read, \
+       paranoid_allow_read.";
     `P
-      "Scalars and booleans are last-wins across the two files and are beaten by \
-       an explicit CLI flag; lists accumulate across every source.";
+      "The three HOME selectors -- ns, ephemeral, real_home -- are one axis, as \
+       are the three nix_target keys: a layer naming any key on an axis replaces \
+       the whole axis below it.";
     `S Manpage.s_environment;
     `I
       ( "CSB_SELF",
@@ -131,11 +159,19 @@ let man =
          before re-checking. Default 86400, daily; 0 checks every run." );
     `I ("CSB_VERBOSE", "Non-empty defaults -v/--verbose on.");
     `I ("CSB_TMPDIR", "The host scratch directory: the launched process's TMPDIR, the base for an ephemeral HOME, and a write root.");
-    `I ("XDG_CONFIG_HOME", "Where the profiles and the allowed-hosts file live. Default ~/.config.");
+    `I ("XDG_CONFIG_HOME", "Where the config files, the profiles and the allowed-hosts file live. Default ~/.config.");
+    `I
+      ( "CSB_MAIN_ROOT",
+        "Select the config sections for this main checkout root instead of the \
+         one csb derives from git. Empty selects none." );
     `I ("CSB_CONFIG_BIN", "Use this csb-config binary verbatim instead of searching for one.");
     `I ("CSB_PROXY_BIN", "Use this csb-proxy binary verbatim instead of resolving it from CSB_SELF.");
     `I ("CSB_BWRAP_BIN", "Linux: use this bubblewrap binary verbatim instead of building it via nix.");
     `S Manpage.s_files;
+    `I
+      ( "~/.config/csb/config",
+        "The per-repo configuration, in [SELECTOR] sections, plus its optional \
+         gitignored config.local overlay." );
     `I ("~/.config/csb/profiles/NAME", "A named profile, plus its optional NAME.local overlay.");
     `I ("~/.config/csb/allowed-hosts", "The user-global egress allowlist, add-only, one host or *.suffix per line.");
     `I ("~/.config/csb/home", "The default template --seed-home copies into a fresh launch HOME.");

@@ -235,7 +235,75 @@ default (`repo-<key>`), any others from sibling repos, and the shared `@` ones.
 None are ever auto-removed. Dirs left over from the pre-0.3 per-branch layout are
 flagged as legacy; remove them manually when convenient.
 
+## Config layers
+
+Four layers answer every knob. Lowest first:
+
+1. **built-in defaults**
+2. **`${XDG_CONFIG_HOME:-~/.config}/csb/config`**, then the gitignored
+   **`config.local`** beside it -- the sections matching this repository
+3. **the profile** named by `-p NAME`, then its gitignored `NAME.local`
+4. **the command line**
+
+Layer 1 ships two environment defaults, `DISABLE_AUTOUPDATER=1` and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`: claude is pinned by nix, so an
+auto-update could only target a read-only store path, and the non-essential
+traffic is telemetry. Both are plain `setenv=` entries any layer above can
+override.
+
+A scalar or boolean goes to the highest layer that sets it. Every list
+(`keep=`, `setenv=`, `deny_read=`, `allow_write=`, `allow_socket=`,
+`allow_host=`, `allow_port=`, `paranoid_deny_read=`, `paranoid_allow_read=`)
+**unions across all four**, so a global `allow_port=5432` and a per-repo
+`allow_port=6379` give the sandbox both.
+
+The config files take the same `KEY=VALUE` grammar and the same keys as a
+profile (listed below), grouped under `[SELECTOR]` section headers:
+
+```ini
+# ~/.config/csb/config          (shared, commit it to your dotfiles)
+[*]
+paranoid = true
+
+[*work*]
+allow_host = api.internal.corp
+
+[/Volumes/src/work/api]
+nix_target = release
+
+# ~/.config/csb/config.local    (gitignored, this machine only)
+[*]
+nix_target = ci                 # wins: the last matching section to set it
+```
+
+A selector is matched against the repository's **physical main checkout root**,
+so a linked worktree selects its repository's sections rather than its own path.
+`*` matches any characters **including `/`**, and nothing else is special --
+which is all three shapes at once: `[*]` is every repo, `[*work*]` and `[*/csb]`
+are patterns, and a selector with no `*` is one exact path (`~/` expands).
+
+**Every matching section applies, in document order** -- `config` in full, then
+`config.local`, top to bottom. The last one to set a scalar wins; lists union
+regardless of order. Order is *not* by specificity, so a machine-local `[*]`
+overrides a shared exact-path section rather than losing to it. A selector that
+matches nothing is silent, so `--dump-config` reports the ones that did:
+
+```
+$ csb --here --dump-config | grep config_sections
+config_sections=config[*]|config[*work*]|config.local[*]
+```
+
+Two keys on the same **axis** move together: a layer that names any of `ns=`,
+`ephemeral=`, `real_home=` (which HOME) replaces all three below it, and the
+same holds for the three `nix_target*` keys. Per-repo config lives here and not
+in the repo itself, deliberately: the repo is writable inside the sandbox, so an
+in-repo `.csb/config` would let a launch edit the policy of the next one.
+
 ## Profiles
+
+Named variants for one repo -- a work token versus a personal one, a yolo
+variant -- chosen per invocation. Everything keyed to the repo itself belongs in
+the config layer above.
 
 `${XDG_CONFIG_HOME:-~/.config}/csb/profiles/<name>` -- one file per profile,
 `KEY=VALUE` lines (`#` comments allowed). Profile values are **defaults**:
@@ -251,7 +319,11 @@ latest=true                               # as -L/--latest; beats CSB_LATEST, lo
 verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, loses to explicit -v
 yolo=true                                 # as -y/--yolo (allow-all)
 paranoid=true                             # as --paranoid (whitelist reads; see below)
+pasteboard=true                           # as --pasteboard (macOS pbcopy/pbpaste)
 sandbox=false                             # as --no-sandbox (shell only; drops the fs lockdown)
+nix_target=release                        # as --nix-target: devShells.<system>.NAME
+nix_target_shell=dev                      # as --nix-target-shell; beats nix_target for -s runs
+nix_target_claude=ci                      # as --nix-target-claude; beats nix_target for claude runs
 real_home=true                            # as --real-home; excludes ns=/ephemeral= (HOME axis)
 here=true                                 # as --here; an explicit BRANCH wins (with a warning)
 ephemeral=true                            # as -E; excludes ns= in the same profile
@@ -267,6 +339,9 @@ setenv=CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1 # repeatable; injected post-scrub
 deny_read=~/notes                         # as --deny-read: extra read deny (both modes); repeatable
 allow_write=~/scratch                     # as --allow-write: extra write root (both modes); repeatable
 allow_socket=/tmp/.s.PGSQL.5432           # as --allow-socket: reachable unix socket (macOS); repeatable
+filter_egress=true                        # as --filter-egress: HTTPS only via csb-proxy, allowlisted
+allow_host=api.anthropic.com              # as --allow-host: allowed under filtering; repeatable
+allow_port=5432                           # as --allow-port: allowed localhost TCP port; repeatable
 paranoid_deny_read=/Volumes               # as --paranoid-deny-read: extra deny under --paranoid; repeatable
 paranoid_allow_read=~/ref                 # as --paranoid-allow-read: re-expose read-only under --paranoid;
                                           # repeatable; rejected if it overlaps a deny
@@ -279,7 +354,7 @@ any worktree/namespace side effects. In `-s` shell mode `token_cmd=` is skipped
 and `seed_creds=` is ignored with a warning (a shell runs no claude).
 
 **Host-specific overlay.** A profile `NAME` can have a sibling, gitignored
-`NAME.local` layered on top after it is read: same syntax/sections, but its
+`NAME.local` layered on top after it is read: same syntax, but its
 scalar values win and its list values (`keep=`, `setenv=`, `deny_read=`,
 `allow_write=`, `allow_socket=`, `paranoid_deny_read=`, `paranoid_allow_read=`)
 accumulate.
@@ -652,10 +727,12 @@ before any launch, HOME seeding, credential seeding, or `token_cmd`. Both are
 safe to run anywhere and never print a secret, so they double as the seam the
 test suite (`docs/PLAN-005-tests.md`) drives.
 
-- `--dump-config` -- print the resolved knobs as stable `KEY=VALUE` lines
-  (flags + profile + `.local` + env, after all precedence). Git-free: it exits
-  before locating the repo, so the default (per-repo) namespace shows as an empty
-  `namespace=` plus `branch=`. `token_cmd` is reported `present`/`absent` (never
+- `--dump-config` -- print the resolved knobs as stable `KEY=VALUE` lines (all
+  four layers, after all precedence), plus the `config_sections=` this repo
+  selected. It looks up the main checkout root to select those sections and
+  stops there -- no worktree lookup -- so the default (per-repo) namespace shows
+  as an empty `namespace=` plus `branch=`, and outside a repository it still
+  runs, selecting nothing. `token_cmd` is reported `present`/`absent` (never
   run), and `setenv` lists VAR names only (never their values).
 
   ```

@@ -8,6 +8,11 @@ type t = {
   latest : bool;        (* CSB_LATEST non-empty *)
   verbose : bool;       (* CSB_VERBOSE non-empty *)
   tmpdir : string option;  (* CSB_TMPDIR, as given *)
+  (* CSB_MAIN_ROOT: the physical main checkout root the config sections are
+     selected by. bin/csb derives it from git and passes it in, so repo identity
+     has one implementation and this stays a function of its inputs. Absent
+     outside a repository, where no section matches. *)
+  main_root : string option;
 }
 
 let getenv_nonempty name =
@@ -26,10 +31,13 @@ let of_process () =
     latest = getenv_nonempty "CSB_LATEST" <> None;
     verbose = getenv_nonempty "CSB_VERBOSE" <> None;
     tmpdir = getenv_nonempty "CSB_TMPDIR";
+    main_root = getenv_nonempty "CSB_MAIN_ROOT";
   }
 
 let profiles_dir env = Filename.concat env.config_dir "profiles"
 let allowed_hosts_file env = Filename.concat env.config_dir "allowed-hosts"
+let config_file env = Filename.concat env.config_dir "config"
+let config_local_file env = config_file env ^ ".local"
 
 (* Expand a LITERAL leading ~/ against HOME; every other value passes through. *)
 let expand_tilde env v =

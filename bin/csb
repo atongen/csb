@@ -106,14 +106,23 @@ worktree_path() {
   echo "$repo_root/.worktrees/$(encode_branch "$branch")"
 }
 
+# The physical main-checkout root: the one path that identifies a repository,
+# whichever of its worktrees you are standing in. Resolving the common dir +
+# pwd -P maps every path into a repo onto one root. Empty outside a repository.
+# It is both the namespace key below and the path csb-config matches its config
+# sections against.
+main_checkout_root() {
+  local root="${1:-.}" gc
+  gc=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  (cd "$(dirname "$gc")" 2>/dev/null && pwd -P) || true
+}
+
 # Stable, filesystem-safe repo identity: basename of the physical main-checkout
-# root + a short hash of its full path (keeps same-named checkouts apart).
-# Resolving the common dir + pwd -P maps every path into a repo onto one key, so
+# root + a short hash of its full path (keeps same-named checkouts apart), so
 # namespaces scoped by it never share (or -d) config across repos.
 repo_key() {
-  local root="$1" main phys
-  main=$(dirname "$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)")
-  phys=$(cd "$main" && pwd -P)
+  local phys
+  phys=$(main_checkout_root "$1")
   printf '%s-%x\n' "$(basename "$phys")" "$(printf '%s' "$phys" | cksum | cut -d' ' -f1)"
 }
 
@@ -467,8 +476,9 @@ setup_namespace() {
 # Two filesystem policies for the launched process (see README for rationale):
 #   READS:  default-allow minus a deny-list (built-in floor + add-only
 #           deny_read=/--deny-read); the active namespace is re-allowed.
-#   WRITES: default-deny plus an allow-list (worktree, git common dir minus
-#           hooks/config, namespace HOME, tmp, /dev; + allow_write=/--allow-write).
+#   WRITES: default-deny plus an allow-list (worktree minus its own .git file,
+#           git common dir minus hooks/config, namespace HOME, tmp, /dev;
+#           + allow_write=/--allow-write).
 
 # True when realpath'd absolute paths $1 and $2 are equal or one contains the
 # other. Used to reject a --paranoid-allow-read that overlaps any deny root.
@@ -891,7 +901,7 @@ build_deny_wrapper() {
   refuse_ipc_brokers "allow_write" "${allow_write_paths[@]+"${allow_write_paths[@]}"}"
   build_socket_allows
   local ns_real="" gc_real="" hooks_deny="" config_deny="" cfgwt_deny="" \
-        wt_gitdir="" wt_cfgwt_deny="" real_home
+        wt_gitdir="" wt_cfgwt_deny="" wt_gitfile_deny="" real_home
   real_home=$(realpath "$HOME")
   # Extra --paranoid read-deny/allow roots (paranoid_deny_read=/--paranoid-deny-read
   # and paranoid_allow_read=/--paranoid-allow-read), canonicalized and existence-
@@ -944,7 +954,15 @@ build_deny_wrapper() {
     wt_gitdir=$(git -C "$worktree" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)
     if [[ -n "$wt_gitdir" && -e "$wt_gitdir" ]]; then
       wt_gitdir=$(realpath "$wt_gitdir")
-      [[ "$wt_gitdir" != "$gc_real" ]] && wt_cfgwt_deny="$wt_gitdir/config.worktree"
+      if [[ "$wt_gitdir" != "$gc_real" ]]; then
+        wt_cfgwt_deny="$wt_gitdir/config.worktree"
+        # A linked worktree's .git is a FILE naming that gitdir, and it sits
+        # inside the writable worktree. It is what every later launch resolves
+        # the main checkout from -- and with it the namespace HOME and the
+        # config sections that grant capability -- so repointing it chooses
+        # policy, which is the .git/hooks class of vector.
+        wt_gitfile_deny="$(realpath "$worktree")/.git"
+      fi
     fi
   fi
 
@@ -1112,12 +1130,12 @@ build_deny_wrapper() {
         if [[ -n "$ns_real" ]]; then
           printf '(allow file-write* (subpath "%s"))\n' "$ns_real"
         fi
-        # Host code-execution vectors inside the writable git common dir
+        # Host code-execution and policy vectors inside the writable git trees
         # (string-matched by seatbelt, so nonexistence doesn't weaken them).
         if [[ -n "$hooks_deny" ]]; then
           printf '(deny file-write* (subpath "%s"))\n' "$hooks_deny"
         fi
-        for p in "$config_deny" "$cfgwt_deny" "$wt_cfgwt_deny"; do
+        for p in "$config_deny" "$cfgwt_deny" "$wt_cfgwt_deny" "$wt_gitfile_deny"; do
           [[ -n "$p" ]] || continue
           printf '(deny file-write* (literal "%s"))\n' "$p"
         done
@@ -1179,7 +1197,7 @@ build_deny_wrapper() {
         mkdir -p "$hooks_deny"
         deny_wrapper+=(--ro-bind "$hooks_deny" "$hooks_deny")
       fi
-      for p in "$config_deny" "$cfgwt_deny" "$wt_cfgwt_deny"; do
+      for p in "$config_deny" "$cfgwt_deny" "$wt_cfgwt_deny" "$wt_gitfile_deny"; do
         [[ -n "$p" ]] || continue
         [[ -e "$p" ]] || touch "$p"
         deny_wrapper+=(--ro-bind "$p" "$p")
@@ -1295,8 +1313,13 @@ resolve_config() {
   # it is read.
   emit="$(mktemp "${TMPDIR:-/tmp}/csb-resolve.XXXXXX")"
   # exec -a so csb-config's diagnostics, usage line and version name the program
-  # the operator actually typed.
-  ( export CSB_EMIT_TO="$emit"; exec -a "$PROG" "$bin" "$@" ) || rc=$?
+  # the operator actually typed. CSB_MAIN_ROOT carries the repo identity its
+  # config sections are selected by: git stays on this side of the seam, so
+  # there is one derivation of it. An inherited value is honoured verbatim, an
+  # inherited EMPTY one included -- that is how the tests select sections
+  # without a repository.
+  ( export CSB_EMIT_TO="$emit" CSB_MAIN_ROOT="${CSB_MAIN_ROOT-$(main_checkout_root)}"
+    exec -a "$PROG" "$bin" "$@" ) || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     rm -f "$emit"
     # 2 means csb-config answered the operator itself (--help, --version,

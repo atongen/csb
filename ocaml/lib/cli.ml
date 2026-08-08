@@ -215,10 +215,11 @@ let term env pre =
   and+ dump_config =
     flag [ "dump-config" ] ~docs:s_seams
       ~doc:
-        "Resolve flags, profile (and .local) and environment, print the final \
-         KEY=VALUE knobs, and exit: no launch, no repository lookup, no \
-         token_cmd. Never prints a secret -- token_cmd shows present or absent, \
-         and setenv shows variable names only."
+        "Resolve flags, config sections, profile (and .local) and environment, \
+         print the final KEY=VALUE knobs, and exit: no launch, no worktree \
+         lookup, no token_cmd. config_sections reports which config sections \
+         the repository selected. Never prints a secret -- token_cmd shows \
+         present or absent, and setenv shows variable names only."
   and+ dump_sandbox =
     flag [ "dump-sandbox" ] ~docs:s_seams
       ~doc:
@@ -384,9 +385,9 @@ let term env pre =
       ~doc:
         "Load launch defaults from ~/.config/csb/profiles/NAME. A gitignored \
          NAME.local is layered on top for host-specific values, and its values \
-         win; explicit CLI flags beat both. Bare 'csb -p NAME' with no BRANCH \
-         launches --here, while plain 'csb' still lists worktrees. See the \
-         PROFILES section for the keys."
+         win; explicit CLI flags beat both, and both beat the config sections. \
+         Bare 'csb -p NAME' with no BRANCH launches --here, while plain 'csb' \
+         still lists worktrees. See the CONFIGURATION section for the keys."
   and+ keep =
     opt_str_all [ "k"; "keep" ] ~docv:"VAR"
       ~doc:"Also keep environment variable VAR across the scrub. Repeatable."

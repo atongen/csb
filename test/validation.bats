@@ -168,6 +168,44 @@ load helpers
 }
 
 # bats test_tags=dump-sandbox
+@test "a linked worktree's own .git file is write-denied" {
+  # It sits inside the writable worktree and names the gitdir csb resolves the
+  # main checkout from -- and with it the namespace HOME and the config sections
+  # that grant capability. Repointing it would let the sandbox choose the policy
+  # of its own next launch, the .git/hooks class of vector (PLAN-008 section 5).
+  local repo wt; repo="$(fake_repo)"
+  wt="$TEST_TMP/wt"
+  git -C "$repo" worktree add -q -b wtbranch "$wt"
+  [[ -f "$wt/.git" ]] || fail "expected a linked worktree with a .git file"
+  local gitfile; gitfile="$(realpath "$wt")/.git"
+  dump_sandbox "$wt"
+  assert_success
+  if [[ "$(uname -s)" == Darwin ]]; then
+    assert_line "(deny file-write* (literal \"$gitfile\"))"
+  else
+    # bwrap argv, one token per line: the deny is a read-only bind over the file.
+    assert_output --partial "--ro-bind"$'\n'"$gitfile"$'\n'"$gitfile"
+  fi
+}
+
+# bats test_tags=dump-sandbox
+@test "the main checkout's .git directory keeps its write allow" {
+  # The control for the deny above: there .git is the writable common dir, and
+  # a literal deny of it would break every commit.
+  local repo gitdir; repo="$(fake_repo)"
+  gitdir="$(realpath "$repo")/.git"
+  dump_sandbox "$repo"
+  assert_success
+  if [[ "$(uname -s)" == Darwin ]]; then
+    refute_line "(deny file-write* (literal \"$gitdir\"))"
+    assert_line "(allow file-write* (subpath \"$gitdir\"))"
+  else
+    refute_output --partial "--ro-bind"$'\n'"$gitdir"$'\n'"$gitdir"
+    assert_output --partial "--bind"$'\n'"$gitdir"$'\n'"$gitdir"
+  fi
+}
+
+# bats test_tags=dump-sandbox
 @test "a paranoid-allow-read overlapping a deny root is refused" {
   local repo; repo="$(fake_repo)"
   mkdir -p "$TEST_TMP/deny/sub"

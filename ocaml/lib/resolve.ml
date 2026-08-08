@@ -1,10 +1,12 @@
 (* Fold the layers into the one resolved config --dump-config prints.
 
-   Precedence: CLI beats profile beats env default for scalars and booleans;
-   lists union, CLI first, then the profile (base then .local), then the
-   add-only allowed-hosts file. The order of the steps below is bin/csb's own,
-   because two of them are observable: warnings reach stderr as they are
-   reached, and a die stops everything after it. *)
+   `layers` arrives already stacked -- built-in defaults, then the matched
+   config sections, then the profile -- so precedence here is only CLI beats
+   layers beats env default for scalars and booleans; lists union, CLI first,
+   then the layers bottom-up, then the add-only allowed-hosts file. The order of
+   the steps below is bin/csb's own, because two of them are observable:
+   warnings reach stderr as they are reached, and a die stops everything after
+   it. *)
 
 let opt_or higher lower = match higher with Some _ -> higher | None -> lower
 
@@ -29,9 +31,10 @@ let expand_word env w =
   done;
   Env.expand_tilde env (Buffer.contents buf)
 
-let resolve ~(env : Env.t) ~(cli : Cli.t) ~(profile : Profile.t option) ~tmpdir ~hosts_file =
-  let pf sel = match profile with None -> None | Some p -> sel p in
-  let plist sel = match profile with None -> [] | Some p -> sel p in
+let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections ~tmpdir
+    ~hosts_file =
+  let pf sel = sel layers in
+  let plist sel = sel layers in
 
   let shell = bool_layer ~cli:cli.shell ~profile:(pf (fun p -> p.shell)) ~default:false in
 
@@ -211,4 +214,5 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(profile : Profile.t option) ~tmpdir 
     allow_ports = cli.allow_ports @ plist (fun p -> p.allow_ports);
     paranoid_deny_read;
     paranoid_allow_read;
+    config_sections;
   }

@@ -27,8 +27,9 @@ setup() {
   mkdir -p "$HOME" "$CSB_PROFILES"
 
   # A clean, deterministic baseline: no env-driven defaults, no host token, no
-  # network-reaching --latest. Individual tests opt back in explicitly.
-  unset CSB_LATEST CSB_VERBOSE CLAUDE_CODE_OAUTH_TOKEN
+  # network-reaching --latest, and no inherited main checkout root (config.bats
+  # sets that per test; unset, csb derives it from the working directory).
+  unset CSB_LATEST CSB_VERBOSE CLAUDE_CODE_OAUTH_TOKEN CSB_MAIN_ROOT
   # Pin bwrap to a placeholder so --dump-sandbox on Linux prints a stable path
   # instead of running `nix build .#bwrap` (nix is not on PATH in the devShell,
   # and the dump never execs it). A no-op on macOS (seatbelt ignores it).
@@ -59,6 +60,12 @@ fake_repo() {
 write_profile() {
   local name="$1"; shift
   printf '%s\n' "$@" > "$CSB_PROFILES/$name"
+}
+
+# write_config FILE LINE... -- create ~/.config/csb/FILE (config or config.local).
+write_config() {
+  local name="$1"; shift
+  printf '%s\n' "$@" > "$XDG_CONFIG_HOME/csb/$name"
 }
 
 # dump_config ARGS... -- run `csb --dump-config ARGS`. --dump-config exits before

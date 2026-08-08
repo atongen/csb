@@ -143,7 +143,8 @@ test-proxy: ocaml-build ## Egress-proxy tests (real proxy + curl; not in `make t
 # Every Tier-1 test that reaches csb only through --dump-config. The
 # dump-sandbox tag marks the rest: those need the profile generator, which
 # lives in bin/csb.
-OCAML_ORACLE := --filter-tags '!dump-sandbox' test/precedence.bats test/lists.bats test/validation.bats
+OCAML_ORACLE := --filter-tags '!dump-sandbox' test/precedence.bats test/lists.bats \
+                test/validation.bats test/config.bats
 
 ocaml-test: ocaml-build ## Config-layer oracle: the bats config tests against csb-config
 	@if command -v bats >/dev/null 2>&1; then \

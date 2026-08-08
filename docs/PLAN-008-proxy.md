@@ -10,7 +10,7 @@ Verified against upstream `HEAD` and against `bin/csb` on 2026-08-05.
 
 ---
 
-## Handoff (updated 2026-08-06, for a fresh context)
+## Handoff (updated 2026-08-07, for a fresh context)
 
 Read this, then section 0, then section 9. Sections 1-8 are the design; the
 appendices are decision record and can be skipped until something questions the
@@ -27,20 +27,23 @@ decision itself.
 | `csb-config` milestone 2 (the parser) | **DONE (2026-08-06)**, 73/73 in `make ocaml-test` |
 | **adoption -- `bin/csb` delegates resolution to `csb-config`** | **DONE (2026-08-06)**, 99/99 in `make test`; see below. NOT yet exercised by a real launch |
 | parity tier (`make test-parity`) | **DELETED** with the bash resolution path, as planned -- it compared csb-config to itself |
-| P3 -- layered INI config, union-for-lists | designed (section 5), not started; Phase B |
+| P3 -- layered INI config, union-for-lists | **DONE (2026-08-07)**, 122/122 in `make test`; see below. NOT yet exercised by a real launch |
 | P4 -- Linux netns so `--filter-egress` enforces there | not started; the big one |
 
 ### The expected numbers -- run these first to detect drift
 
     make check          # shellcheck clean
-    make test           # 99 ok   (Tier 1+2; snapshots SKIP inside csb, by design)
+    make test           # 122 ok  (Tier 1+2; snapshots SKIP inside csb, by design)
     make test-proxy     # 11 ok   (needs network for 2 of them; rest are offline)
-    make ocaml-test     # 73 ok   (csb-config alone, without the bash wrapper)
-    diff <(./bin/csb --dump-config) <(./ocaml/_build/default/bin/csb_config_cli.exe)
-                        # must be empty: 37 keys, byte-identical
+    make ocaml-test     # 94 ok   (csb-config alone, without the bash wrapper)
+    ( export CSB_MAIN_ROOT="$(pwd -P)"
+      diff <(./bin/csb --dump-config) <(./ocaml/_build/default/bin/csb_config_cli.exe) )
+                        # must be empty: 38 keys, byte-identical
 
 If any of those four moves, something regressed -- fix that before starting
-anything new.
+anything new. The guard exports `CSB_MAIN_ROOT` because that is what `bin/csb`
+derives and passes down (P3, below), and a bare `VAR=x diff <(a) <(b)` would not
+reach either substitution -- landmine 13's shape, one construct over.
 
 ### Adoption, as built
 
@@ -98,11 +101,18 @@ installing it:
   or not `token_cmd` ever fires. Run with it unset --
   `( unset CLAUDE_CODE_OAUTH_TOKEN; csb --here -p <profile> )` -- and a session
   that authenticates can only have got its token across the seam. It did.
+- **`keep` and `setenv` arrive in the launched environment**, from both a
+  profile and `-k`, with an unkept variable absent as the control. The
+  load-bearing case was a `setenv` value carrying spaces *and* an interior `=`
+  (`CSB_TEST_B=has spaces and=an equals sign`), which arrived whole: the seam
+  splits each record at the FIRST `=` only, so a value may contain as many more
+  as it likes.
 
-Still unconfirmed by a launch: `keep` and `setenv` (the `emittest` profile in
-this section's sibling notes exercises both, including a `setenv` value carrying
-spaces and an interior `=`), and `make install` on a real HOME rather than the
-fake one used in-session.
+So every key that crosses the emit seam has now been observed on the far side of
+a real launch, which is the only place any of them is observable.
+
+Still unconfirmed: `make install` on a real HOME rather than the fake one used
+in-session.
 
 A note for whoever trials a branch build side by side with an installed csb: the
 working-tree fallback is relative to `$0`'s directory, so a **symlink** shim in a
@@ -170,20 +180,93 @@ in one step, and `packages.csb` gained `csb-tools` in `runtimeInputs` so
 csb resolving with an empty PATH and no env). **The flake half is not: nix is
 absent in here.** `nix build .#csb` is an operator check.
 
+### P3, as built (2026-08-07)
+
+Section 5's design landed as specified. Four layers now fold into one
+`Profile.t` before `Resolve` ever runs: `Profile.builtin`, the matched sections
+of `config` then `config.local` (`lib/config_file.ml`), the `-p` profile, and
+the CLI on top. `Resolve` barely changed -- it took `profile : Profile.t option`
+and now takes `layers : Profile.t`, so every existing precedence rule kept
+working unedited. That is what "additive" meant, and it held.
+
+**The one design question section 5 left open was where repo identity comes
+from**, because a selector is matched against the physical main checkout root
+and `csb-config` has no git. **`bin/csb` derives it and passes it down as
+`CSB_MAIN_ROOT`**, beside `CSB_EMIT_TO` on the same `exec -a` line. Git stays on
+the bash side of the seam, so there is exactly one derivation of repo identity
+-- `main_checkout_root()` in `bin/csb`, which `repo_key` now calls too, so the
+namespace HOME and the config sections cannot disagree about which repo this
+is. The alternative, teaching csb-config to shell out to git, would have put an
+exec on the policy path and a second implementation of `--git-common-dir`
+semantics in the tree.
+
+An inherited `CSB_MAIN_ROOT` is honoured verbatim, an **inherited empty one
+included** (`${CSB_MAIN_ROOT-...}`, not `:-`). That is what makes the layering
+testable without a repository: `test/config.bats` is 21 hermetic tests that set
+the root directly, and it runs in both tiers -- it is in `OCAML_ORACLE`, so
+`make ocaml-test` covers it too (landmine 12: the oracle names its files).
+
+Five decisions the implementation forced, none of them in section 5:
+
+1. **The grammar trims whitespace around `=`,** in profiles as well. Section 5's
+   own example writes `paranoid = true`, which the profile parser rejected. One
+   grammar for all the layers means the profile parser had to learn it; the
+   price is that a value cannot carry a leading or trailing space.
+2. **A non-matching section is still parsed and validated.** Only the matching
+   ones apply, but a typo'd key or a bad port in another repo's section is fatal
+   now rather than lying in wait until that repo is the one launching. Same
+   reasoning as the allowed-hosts file's eager validation.
+3. **A `KEY=VALUE` before any section header is an error.** The alternative --
+   treating the preamble as an implicit `[*]` -- makes a global setting look
+   local to whatever section follows it.
+4. **`setenv` is deduplicated by variable name, keeping the highest layer.**
+   The launch exports these in order and a later `env` argument wins, so a
+   surviving duplicate would decide precedence silently, off the end of a list
+   nobody reads. One VAR, one entry, and the dump shows it.
+5. **The two multi-key axes move as a unit across layers.** A layer naming any
+   of `ns=`/`ephemeral=`/`real_home=` replaces all three below it, and the same
+   for the three `nix_target*` keys -- the rule the CLI already applied to the
+   profile, now applied between every pair of layers. Without it a config `ns=`
+   and a profile `ephemeral=true` would both survive into resolution and be
+   ranked by an accident of evaluation order.
+
+**The prerequisite deny is in**: a linked worktree's own `.git` FILE is
+write-denied (`wt_gitfile_deny`, in the same literal-deny loop as
+`.git/config`), with a test on each platform plus the main-checkout control --
+there `.git` is the writable common dir and denying it would break every commit.
+No golden churn: `--dump-sandbox` is driven with `--here`, and every existing
+snapshot is a main checkout.
+
+`--dump-config` gained a 38th key, `config_sections`, listing what matched as
+`config[*]|config.local[*work*]` in application order. It is **dump-only** -- the
+emit seam does not carry it, because `bin/csb` consumes nothing from it and an
+unrecognized key there is fatal by design.
+
+`Types.default` was deleted rather than updated. It had no callers, and a
+second, unused statement of the defaults sitting beside a real layer 1 is a
+drift trap.
+
+Not verified: a real launch. The dump seams cover resolution and the profile,
+and `config_sections` makes the selection visible, but landmine 8 still holds --
+`setenv` reaching the launch environment is only observable by launching.
+
 ### The immediate next task
 
-Two independent halves, in either order:
-
-- **P3 / Phase B (section 5), in OCaml, in-session.** Config layers 2-3 with
-  union-for-lists. Adoption is what makes this worth doing: `csb-config` owns
-  the whole resolution now, so a new layer between the built-in defaults and the
-  profile reaches the launch for free. No nix, no launch, no operator handoff.
 - **P4 (section 4), on a NixOS host.** `--unshare-net` + pasta + nftables so
   `--filter-egress` enforces on Linux instead of disabling itself. Cannot be
   done from inside a csb sandbox at all.
 
-Before either, the operator checks adoption left open: a real launch, `nix build
-.#csb`, and `make install`.
+Before it, the operator checks what adoption and P3 left open: a real launch,
+`nix build .#csb`, and `make install`. For P3 specifically, the launch worth
+running is one with a real `~/.config/csb/config` -- `csb --here --dump-config`
+first, to see `config_sections=` name the sections it should, then a launch and
+`env | grep DISABLE_AUTOUPDATER` inside it.
+
+Also open, and not P3's to fix: the README documented no egress surface at all
+until this pass (its profile key list had been missing `filter_egress`,
+`allow_host`, `allow_port`, `pasteboard` and the three `nix_target*` keys since
+P2). Those keys are listed now, but P2's `--filter-egress` workflow still has no
+section of its own.
 
 ### No decisions left open
 
@@ -270,6 +353,11 @@ what makes the two agree.
     read and write of one file in the same construct. The fix is also the better
     code: record the fault, `break`, and unlink once after the loop, so the
     temp file is removed on every path rather than only on the fatal one.
+16. **An assignment prefix does not reach a process substitution either.**
+    `VAR=x diff <(a) <(b)` runs `a` and `b` in children of the SHELL, set up
+    before `diff` is executed, so neither sees `VAR` -- landmine 13's rule in a
+    second construct. The drift guard at the top of this file is exactly that
+    shape, which is why it exports first, in a subshell.
 
 ### Conventions that are not obvious from the code
 
@@ -499,34 +587,131 @@ Requirement (operator, 2026-08-05): global `allowed_ports=5432` plus project A
 **Precedence chain**, lowest to highest, with one rule doing the work --
 **lists union across layers; scalars and booleans override**:
 
-    1. built-in defaults
-    2. global      ~/.config/csb/config   [global] section
-    3. per-repo    ~/.config/csb/config   [<repo>] section
-    4. profile     -p NAME (+ NAME.local), optional
-    5. env         CSB_LATEST / CSB_VERBOSE / CSB_TMPDIR
-    6. CLI flags
+    1. built-in defaults        (including the privacy setenv= entries, below)
+    2. matched sections   ~/.config/csb/config, then config.local
+    3. profile            -p NAME (+ NAME.local), optional
+    4. env                CSB_LATEST / CSB_VERBOSE / CSB_TMPDIR
+    5. CLI flags
 
 Union for lists is not new: the five list flags already accumulate across CLI and
 profile today. The exact env-vs-profile ordering must be transcribed from the 36
 precedence tests, not re-derived.
 
-Operator's chosen shape: **one INI-style file, `~/.config/csb/config`**:
+### DECIDED (2026-08-07): selectors, and document order
 
-    [global]
-    allowed_hosts = api.anthropic.com, *.githubusercontent.com
-    allowed_ports = 5432
+The requirement, in the operator's words: aggregate configuration for *sets* of
+repositories -- a global set, repos matching a pattern, and specific repos --
+added lowest to highest with lists unioning and scalars overwriting. Plus
+machine-local overlays, because the same `~/.config/csb` is shared between a
+macOS and a NixOS box.
 
-    [/Volumes/src/git.grandrew.com/atongen/csb]
-    allowed_ports = 6379
+**Three selector kinds. Section headers are matched against the physical main
+checkout root** (`~` expanded; the same path `repo_key` derives, so running from
+a linked worktree selects the repo's sections, not the worktree's):
 
-A section header is either an absolute path (`~` expanded, resolved to the same
-physical main-checkout root `repo_key` uses at `bin/csb:276`, so any path into a
-repo matches its section) or a literal `repo-<key>`. Paths are readable;
-`repo_key` survives a repo move. Accept both.
+| kind | example | matches |
+|---|---|---|
+| everything | `[*]` | every repo |
+| glob | `[*work*]`, `[*/work/*]`, `[*/csb]`, `[/Volumes/src/*/client-a]` | by pattern |
+| exact path | `[/Volumes/src/git.grandrew.com/atongen/csb]` | one repo |
+
+**`*` matches any character INCLUDING `/`.** That one rule is what lets the glob
+kind absorb the two the operator also asked for: `*work*` is a substring match,
+and `*/csb` is a match-by-name. Offering `substring` and `name` as separate
+syntaxes would be two more ways to say the same thing, and would immediately
+raise the question of how they rank against a glob.
+
+**`repo-<key>` is NOT a selector.** Section 5 originally offered it on the
+grounds that it "survives a repo move". Measured 2026-08-07: it does not.
+`repo_key` is `basename-<cksum>` of the *physical main checkout path*
+(`bin/csb`), so a move changes the key. As a selector it is exactly as fragile as
+the path and unreadable besides.
+
+**Ordering is DOCUMENT ORDER, not specificity**: `config` in full, then
+`config.local` in full, and within each, top to bottom. Every matching section
+applies; the last one to set a scalar wins, and lists union across all of them
+regardless of order.
+
+This is a deliberate rejection of the operator's first framing (rank by
+specificity, least to most). Two reasons, the second decisive:
+
+- **Specificity is not a total order.** Is `*work*` more specific than
+  `*/client-a/*`? There is no true answer, so any answer is a rule to memorize,
+  and a wrong guess is silent.
+- **Specificity fights the machine-local overlay.** Given a shared
+  `config` with `[/Volumes/src/work/api] nix_target=release` and a gitignored
+  `config.local` with `[*] nix_target=ci`, specificity ranking makes the exact
+  path win and the machine-local override is *ignored* -- backwards, and the
+  operator would have to restate every specific selector in `.local` to
+  override anything.
+
+Document order costs nothing here because **the operator's model IS document
+order**, given the file is written the way it was described: `*` first, then
+groups, then specifics. And getting the order wrong has a small blast radius,
+since lists union regardless and only scalars care.
+
+    # ~/.config/csb/config          (shared, committed)
+    [*]
+    paranoid = true
+    [*work*]
+    allow_host = api.internal.corp
+    [/Volumes/src/work/api]
+    nix_target = release
+
+    # ~/.config/csb/config.local    (gitignored, this machine only)
+    [*]
+    nix_target = ci                 # wins: last to set the scalar
+
+**`--dump-config` must report which sections matched, in application order.** A
+typo'd selector matches nothing and is otherwise invisible, which is this repo's
+recurring failure mode; this makes the whole layering debuggable.
 
 The value grammar is the one `~/.config/csb/profiles/NAME` already uses --
 `KEY=VALUE`, `#` comments, blanks ignored -- so **one parser serves profiles and
 this file**, differing only in section headers.
+
+### Prerequisite: deny the linked worktree's own `.git` file -- DONE (2026-08-07)
+
+Config sections grant capability (`allow_write`, `allow_host`, `sandbox=false`,
+`paranoid=false`), and they are selected by a path derived from git. A linked
+worktree's `.git` is a FILE at the worktree root, inside write root 22, and it
+is what `--git-common-dir` reads to produce `main_root`. Measured 2026-08-07:
+
+    (allow file-write* (subpath ".../wtprobe/wt"))            <- holds wt/.git
+    (deny  file-write* (literal ".../main/.git/config"))
+    (deny  file-write* (literal ".../main/.git/worktrees/wt/config.worktree"))
+    # no deny for ".../wt/.git"
+
+So a sandboxed agent can `git init` somewhere writable, repoint that file, and
+make the next launch resolve a `main_root` of its choosing -- selecting whichever
+config section it likes. Today that buys little; under this section it selects
+policy, which is the `.git/hooks` persistence class that `PLAN-007-escape.md`
+closed. **The deny landed before the layering.** It is safe: csb writes that file at
+worktree creation, outside the sandbox, and git does not rewrite it in normal
+operation (`git worktree repair` would, and is a host-side command).
+
+### Shipped defaults for layer 1 -- DECIDED (2026-08-07)
+
+Section 9a established that the allowlist and its companion environment are one
+unit. Two of the three go into the built-in defaults as `setenv=` entries,
+because they cost nothing:
+
+- `DISABLE_AUTOUPDATER=1` -- no loss whatever: csb pins claude via nix, so a
+  successful update would target a read-only store path. It *removes* the false
+  "Auto-update failed - Run claude doctor" banner that section 9a measured.
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` -- Anthropic receives no telemetry
+  or crash reports. No functional loss known. Open question: whether
+  feature-flag delivery rides along, which would gate newer features.
+
+`ENABLE_CLAUDEAI_MCP_SERVERS=false` is **deliberately NOT a default**, though
+section 9a lists it as droppable. The operator has a live claude.ai-hosted MCP
+connector (Drip), and defaulting it off would silently remove that tool surface
+from every launch. It stays a per-section opt-in, which is precisely what the
+layering makes cheap.
+
+Note this does not turn `--filter-egress` on; it stays off by default (section 8,
+and section 7 item 4 for why). These two variables are free, and the allowlist is
+the part with a real usability price.
 
 ### Per-project config CANNOT live in the repo. Measured.
 
@@ -572,12 +757,16 @@ So profiles shrink to "optional named overlay". Ship layers 2-3, then look at
 what is left in `~/.config/csb/profiles/` after a month. Bundling the removal in
 turns one reversible change into two irreversible ones.
 
-### When it lands
+### When it landed -- DONE (2026-08-07)
 
-**Phase B of the csb-config work (section 9), not bash.** Phase A must first
-reproduce today's behavior exactly -- the parity oracle only works while the spec
-is frozen. Doing this in bash means writing tri-state plus union semantics twice
-and rewriting the precedence tests twice.
+**Phase B of the csb-config work (section 9), not bash.** Phase A had to
+reproduce today's behavior exactly first -- the parity oracle only worked while
+the spec was frozen -- and adoption then made `csb-config` the only
+implementation. So this was purely additive OCaml: a layer between the built-in
+defaults and the profile, plus the section-header parse. It reached the launch
+for free, needed no nix and no launch to verify, and was done entirely inside a
+csb sandbox. What it cost, and the five decisions it forced, are in the handoff
+at the top of this file.
 
 ---
 
@@ -748,8 +937,8 @@ and rewriting the precedence tests twice.
   working-tree builds, mirroring `CSB_BWRAP_BIN`. In-tree artifact names are
   unchanged, so the Makefile paths still hold, and `--dump-sandbox` still
   resolves nothing (the placeholder keeps that seam nix-free).
-- **P3 -- config surface.** Layers 2-3 with union semantics (section 5), which is
-  Phase B of section 9.
+- **P3 -- config surface. DONE (2026-08-07).** Layers 2-3 with union semantics
+  (section 5), which is Phase B of section 9; see the handoff for what it cost.
 - **P4 -- Linux netns.** `--unshare-net` + pasta + nftables, plus NixOS
   verification and an F4/abstract-socket re-measurement.
 
@@ -788,7 +977,8 @@ lookup".
 
 (That reads as of the spec being frozen. Since adoption there is no dump block
 in `bin/csb` to be the spec: `csb-config` owns `--dump-config`, and `bin/csb`
-passes the flag through. The 37 keys and their order are unchanged.)
+passes the flag through. The 37 keys and their order are unchanged; P3 appended
+a 38th, `config_sections`.)
 
 Acceptance: `CSB=./csb-config` makes `lists.bats` (10) + `precedence.bats` (36)
 plus the 27 dump-config tests in `validation.bats` pass **unchanged** -- 73
@@ -958,7 +1148,9 @@ by a test:
 - **Adoption: DONE (2026-08-06).** `bin/csb` delegates; the bash resolution path
   and the parity tier are deleted. The contract is in the handoff at the top of
   this file -- read that, not this paragraph, before touching either side.
-- **B:** add config layers 2-3 with union-for-lists (section 5). Additive.
+- **B: DONE (2026-08-07).** Config layers 2-3 with union-for-lists (section 5),
+  additive as predicted: `Resolve` took a stacked `Profile.t` in place of an
+  optional one and no precedence rule changed.
 - **C:** revisit `-p` after real use.
 
 Adoption was strangler-fig and came out close to the sketch: `bin/csb` runs

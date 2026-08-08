@@ -77,6 +77,9 @@ type t = {
   allow_ports : int list;
   paranoid_deny_read : string list;
   paranoid_allow_read : string list;
+  (* Which config sections were selected, in application order: provenance for
+     the layer above, reported by --dump-config and by nothing else. *)
+  config_sections : string list;
 }
 
 let no_nix_targets = { shared = None; for_shell = None; for_claude = None }
@@ -93,37 +96,3 @@ let effective_nix_target c =
   | Some s -> s
   | None -> ( match c.nix_targets.shared with Some s -> s | None -> "default")
 
-let default =
-  {
-    mode = Launch;
-    dump = No_dump;
-    no_launch = false;
-    target = List_worktrees;
-    runner = Claude;
-    home = Per_repo;
-    paranoid = false;
-    pasteboard = false;
-    sandbox = true;
-    yolo = false;
-    latest = false;
-    verbose = false;
-    reseed = false;
-    seed_creds = false;
-    nix_targets = no_nix_targets;
-    profile = None;
-    token_cmd = None;
-    seed_home = None;
-    accent = None;
-    cfg_tmpdir = None;
-    claude_args = [];
-    keep = [];
-    setenv = [];
-    deny_read = [];
-    allow_write = [];
-    allow_socket = [];
-    filter_egress = false;
-    allow_hosts = [];
-    allow_ports = [];
-    paranoid_deny_read = [];
-    paranoid_allow_read = [];
-  }
