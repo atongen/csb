@@ -887,6 +887,28 @@ start_egress_proxy() {
   vecho "$PROG: egress filtered via csb-proxy on 127.0.0.1:$proxy_port (${#allow_host_list[@]} hosts); log: $proxy_log"
 }
 
+# The nftables ruleset the Linux --filter-egress namespace runs under, as text,
+# from a comma-separated port set ($1). One generator for both the launch and
+# --dump-sandbox, so the seam renders the bytes the launch actually loads.
+nft_ruleset() {
+  local ports="$1"
+  echo "table inet csb_filter_egress {"
+  echo "  chain output {"
+  echo "    type filter hook output priority 0; policy drop;"
+  # Loopback replies traverse this same hook with dport set to the client's
+  # ephemeral port, so without this the accept below passes the SYN and drops
+  # the SYN-ACK -- a sandbox that cannot reach even its own proxy. It must
+  # precede the accept for the same reason it exists.
+  echo "    ct state established,related accept"
+  # `tcp dport { }` is a parse error, so an empty set emits no rule and the
+  # chain's drop policy stands alone.
+  if [[ -n "$ports" ]]; then
+    printf '    oif "lo" tcp dport { %s } accept\n' "$ports"
+  fi
+  echo "  }"
+  echo "}"
+}
+
 build_deny_wrapper() {
   deny_wrapper=()
   build_deny_paths
@@ -1279,30 +1301,14 @@ build_deny_wrapper() {
           ports+="$p"
         done
         # Under --dump-sandbox no file is written, matching proxy_port's own
-        # placeholder above -- but the port list itself is real (nothing here
-        # needed a live process), so it stays visible for --dump-sandbox to
-        # cover the same way it covers every other generated rule.
+        # placeholder above -- but the ruleset is pure text, so the seam renders
+        # it verbatim where the path would go. That keeps the rules themselves
+        # testable at Tier 1 and Tier 2, not only by a real launch.
         if [[ -n "$dump" ]]; then
-          nft_rules_file="<NFT_RULES:$ports>"
+          nft_rules_file="$(printf '<NFT_RULES:\n%s>' "$(nft_ruleset "$ports")")"
         else
           nft_rules_file="$(mktemp "${TMPDIR:-/tmp}/csb-nft.XXXXXX")"
-          {
-            echo "table inet csb_filter_egress {"
-            echo "  chain output {"
-            echo "    type filter hook output priority 0; policy drop;"
-            # Loopback replies traverse this same hook with dport set to the
-            # client's ephemeral port, so without this the accept below passes
-            # the SYN and drops the SYN-ACK -- a sandbox that cannot reach even
-            # its own proxy.
-            echo "    ct state established,related accept"
-            # `tcp dport { }` is a parse error, so an empty set emits no rule
-            # and the chain's drop policy stands alone.
-            if [[ -n "$ports" ]]; then
-              printf '    oif "lo" tcp dport { %s } accept\n' "$ports"
-            fi
-            echo "  }"
-            echo "}"
-          } >"$nft_rules_file"
+          nft_ruleset "$ports" >"$nft_rules_file"
         fi
         # bash -c is pasta's COMMAND: load the ruleset into the namespace pasta
         # just made, THEN exec the real bwrap invocation -- so nothing runs

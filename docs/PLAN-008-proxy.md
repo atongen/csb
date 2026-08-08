@@ -1,6 +1,11 @@
 # plan 008 -- csb's own egress control (allowed hosts + allowed ports)
 
-Status: **DECIDED (2026-08-05) -- build it in csb, do not rebase on
+Status: **COMPLETE (2026-08-08).** P1-P6 are built and verified end-to-end on
+both aarch64-darwin and x86_64-linux; nothing in the plan is outstanding. The
+residuals are named under "What is still open", and section 10 holds the
+questions that were always questions rather than gaps.
+
+Decision: **DECIDED (2026-08-05) -- build it in csb, do not rebase on
 agent-sandbox.nix.** This started as a feasibility study for rebasing csb on
 [agent-sandbox.nix](https://github.com/archie-judd/agent-sandbox.nix) and ended
 by rejecting it. That evaluation is retained as Appendix A because it is the
@@ -31,17 +36,19 @@ decision itself.
 | P3b -- one layer type, clearing across layers, flag parity | **DONE (2026-08-08)**, 143/143 `make test` and 115/115 `make ocaml-test`; section 5. NOT yet exercised by a real launch, and `ocaml/lib/layer.ml` needs `git add` before `nix build` |
 | P4 -- Linux netns so `--filter-egress` enforces there | **DONE and VERIFIED END-TO-END on x86_64-linux (2026-08-08)**, on the NixOS host outside any sandbox. 145/145 `make test`, `make check` clean, goldens regenerated. One real bug found and fixed in the process (the nft ruleset dropped loopback replies -- see below). Section 8 has the measurements. |
 | macOS host adoption (`make install`, `make test`, P3/P3b smoke launches) | **DONE (2026-08-08)**, on the aarch64-darwin host. `make install` on a real HOME, a host `make test` (so the Tier-2 goldens ran), a `~/.config/csb/config` launch confirming `config_sections` and a config-file `setenv=` reaching the launch environment, and a `--per-repo` launch against a section setting `ns=`. Every "not yet exercised by a real launch" above is now discharged on both platforms. |
-| P5 -- the worktreesetup call site fails closed | **DONE (2026-08-08)**, both halves of landmine 19. 145/145 `make test`, `make check` clean, Darwin dump byte-identical to P4. **Tier-3 VERIFIED on aarch64-darwin (2026-08-08)** via `csb -n <branch>`, which stops after `run_worktreesetup` and before `start_egress_proxy`; it also found that pre-P5 macOS did not fail open there but crashed the launch outright. **Linux Tier-3 still open.** |
+| P5 -- the worktreesetup call site fails closed | **DONE (2026-08-08)**, both halves of landmine 19. **Tier-3 VERIFIED on BOTH platforms (2026-08-08)** via `csb -n <branch>`, which stops after `run_worktreesetup` and before `start_egress_proxy`; the Darwin pass also found that pre-P5 macOS did not fail open there but crashed the launch outright. |
+| P6 -- the nft ruleset seam | **DONE (2026-08-08)**, on the NixOS host. `--dump-sandbox` renders the generated ruleset verbatim instead of a port-list placeholder, from one generator shared with the launch. 146/146 `make test`, golden regenerated. Section 8 has it. |
+| README -- the egress surface | **DONE (2026-08-08)**. A `--filter-egress` workflow section (what it is, that it is enforced not advisory, the two mechanisms, what it costs); the Known-gaps row for Linux abstract unix sockets now says closed under the flag; the "egress is open" claims in the intro, the threat model and the hardening list now say "by default" and point at the flag; `templates/allowed-hosts` is listed in Files. |
 
 ### The expected numbers -- run these first to detect drift
 
     make check          # shellcheck clean
-    make test           # 145 ok  (Tier 1+2, up from 143 as of P4 -- section 8.
-                        #          bats reports a skip as `ok N # skip`, so 145
+    make test           # 146 ok  (Tier 1+2, up from 145 as of P6 -- section 8.
+                        #          bats reports a skip as `ok N # skip`, so 146
                         #          is the total on every platform and what
                         #          varies is how many are skips: 16 inside csb
                         #          on Linux -- 12 Tier-2 goldens plus 4
-                        #          macOS-only cases -- and fewer on a host,
+                        #          macOS-only cases -- and 4 on a Linux host,
                         #          where the goldens run.)
     make test-proxy     # 11 ok   (needs network for 2 of them; rest are offline)
     make ocaml-test     # 115 ok  (csb-config alone, without the bash wrapper)
@@ -118,10 +125,8 @@ installing it:
   as it likes.
 
 So every key that crosses the emit seam has now been observed on the far side of
-a real launch, which is the only place any of them is observable.
-
-Still unconfirmed: `make install` on a real HOME rather than the fake one used
-in-session.
+a real launch, which is the only place any of them is observable. `make install`
+on a real HOME was the last gap here and the macOS host pass closed it.
 
 A note for whoever trials a branch build side by side with an installed csb: the
 working-tree fallback is relative to `$0`'s directory, so a **symlink** shim in a
@@ -435,33 +440,98 @@ The Darwin `--dump-sandbox` byte-identity was re-checked here directly against
 copy at a path named `csb`, with `CSB_CONFIG_BIN` pinned to the built
 `csb_config_cli.exe`): identical on all four variants. `make check` clean,
 `make test` exit 0 numbering through 145 with the three Linux-only egress cases
-skipping, and the `--dump-config` guard empty.
+skipping, and the `--dump-config` guard empty. (P6 below added one test, so the
+total a macOS session should now see is 146.)
 
-**Linux is untouched by this.** Its Tier-3 launch, and a host `make test` for
-the ruleset change, still need the NixOS host -- both Linux `--dump-sandbox`
-tests skip on macOS.
+### P5 Tier-3 -- DONE on x86_64-linux (2026-08-08)
+
+Same seam and the same scratch repo shape as the Darwin pass: a tracked,
+executable `.worktreesetup.sh` whose `up` connects with bash `/dev/tcp` --
+the signal is TCP connect, not an HTTP artifact -- against `1.1.1.1:443` and
+two host listeners on 18080 and 18081, driven by `csb -n p5` so the launch stops
+at exactly the call site P5 is about. `CSB_PASTA_BIN`/`CSB_NFT_BIN` pinned to
+`nix build .#pasta .#nft` outputs, `CSB_SELF=path:$(pwd -P)`.
+
+| run | 1.1.1.1:443 | 127.0.0.1:18080 | 127.0.0.1:18081 |
+|---|---|---|---|
+| control, no flag | CONNECTED | CONNECTED | CONNECTED |
+| `--filter-egress --allow-port 18080` | BLOCKED | CONNECTED | BLOCKED |
+| `--filter-egress`, no ports | BLOCKED | BLOCKED | BLOCKED |
+
+Byte-for-byte the Darwin table. Row 2 is both claims at once -- the call site
+fails closed, and the `--allow-port` rules still emit there. Row 3 is the empty
+port set producing a ruleset that is valid rather than broken, and this is a
+stronger result on Linux than the table shows: an unparseable ruleset makes
+`nft -f` fail, the shim `exit 1`, and `run_worktreesetup` abort the launch. The
+probes ran, so `nft` accepted a chain carrying only `policy drop` plus
+`ct state established,related accept`.
+
+**One Linux-specific behavior the Darwin write-up does not predict.** nftables
+`policy drop` **drops**; seatbelt **refuses**. So a blocked loopback connect
+hangs until the client's own timeout rather than returning EPERM -- measured at
+19s wall for row 3, which is two 8s `timeout`s plus launch overhead. Off-host
+is fast either way (`connect: Network is unreachable`), because P4 established
+the namespace has no route at all. Worth knowing before debugging a
+`.worktreesetup.sh` that appears to hang under filtering: it is not hung, it is
+denied.
+
+The table was re-measured after P6's refactor moved the ruleset text into a
+shared generator, and it is unchanged. So was the main launch path
+(`csb --here -s --filter-egress --allow-host api.anthropic.com`), which
+re-discharges all four enforcement claims on Linux: `404` to the allowed host
+through the proxy, `rc=7` to an unlisted one, `rc=7` on a `--noproxy '*'` direct
+dial to the ALLOWED host, and both decisions in `$CSB_PROXY_LOG`.
+`make test-escape` is 12/12.
+
+### P6 -- the nft ruleset gets a seam (2026-08-08)
+
+The blind spot three sections of this document complained about is closed.
+`--dump-sandbox` used to emit `<NFT_RULES:<ports>>` -- the port set only -- so
+the rule bodies were invisible to Tier 1 and Tier 2, which is how a ruleset that
+dropped every loopback reply passed 145/145 in P4. It now renders the ruleset
+verbatim in the token where the file path goes:
+
+    <NFT_RULES:
+    table inet csb_filter_egress {
+      chain output {
+        type filter hook output priority 0; policy drop;
+        ct state established,related accept
+        oif "lo" tcp dport { <PROXY_PORT>, 5432 } accept
+      }
+    }>
+
+**The seam is only worth having because there is one generator.** `nft_ruleset`
+takes the port set and returns the text; the launch writes it to the temp file
+and the dump embeds it. A seam that rendered a second, parallel copy of the
+rules would assert that the copy is right, which is the drift trap `Types.default`
+was deleted for. The dump emitter needed no change at all: it is
+`printf '%s\n' "${deny_wrapper[@]}"`, one token per line, and a token already
+spans lines (the `bash -c` shim does).
+
+Three Tier-1/Tier-2 assertions ride on it, the middle one being P4's bug as a
+regression guard: the `policy drop` line, that `ct state` precedes the `tcp
+dport` accept (loopback replies carry an ephemeral dport, so the reverse order
+passes the SYN and drops the SYN-ACK), and the exact port set. `make test` is
+146; `test/snapshots/linux/filter-egress` moved `+8 / -1` and no other golden
+moved, on either platform.
+
+**What it still does not reach.** Under `--dump-sandbox` `proxy_port` is always
+the `<PROXY_PORT>` placeholder, so the empty-port-set arm -- the P5 one -- is
+unreachable from any dump and stays Tier-3-only. That is now measured on both
+platforms, so the residual is narrow, but it is a residual: a dump seam cannot
+see a ruleset built before the proxy exists.
 
 ### What is still open
 
-- **Tier-3 verification of P5 on Linux**, plus a host `make test` on NixOS for
-  the Linux ruleset change. Darwin is done -- `csb -n <branch>` against a repo
-  with a `.worktreesetup.sh` is the seam, and it works unchanged on Linux.
-- **The nft ruleset deserves a seam.** `--dump-sandbox` emits the placeholder
-  `<NFT_RULES:<ports>>`, so the rule bodies are invisible to every tier -- which
-  is how a ruleset that dropped every loopback reply passed 145/145. Two things
-  on the egress path are still invisible to Tier 1 and Tier 2 (the ruleset text
-  and the launch environment); P5's wrapper was the third until `csb -n` turned
-  out to reach it. P2 and P4 each judged "once is not enough evidence"; P5 makes
-  three, and its Darwin crash is what a seam here would have caught at Tier 1.
-- The README has no `--filter-egress` workflow section, and its Known-gaps row
-  for Linux abstract unix sockets still reads "open, unfixable without closing
-  network egress" -- P4 measured it closed under `--filter-egress`.
+Nothing blocking. The two residuals worth naming:
 
-Also open, and not P3's to fix: the README documented no egress surface at all
-until this pass (its profile key list had been missing `filter_egress`,
-`allow_host`, `allow_port`, `pasteboard` and the three `nix_target*` keys since
-P2). Those keys are listed now, but P2's `--filter-egress` workflow still has no
-section of its own.
+- **The launch environment still has no seam** (landmine 8). `--dump-config`
+  covers resolved config, `--dump-sandbox` covers the profile and now the nft
+  ruleset, and `env_overrides` between them remains observable only by
+  launching.
+- **The empty-port ruleset is Tier-3-only**, per P6 above.
+
+Section 10 holds the open questions that are questions rather than gaps.
 
 ### No decisions left open
 
@@ -601,6 +671,14 @@ what makes the two agree.
     `env_overrides` applies only to the final launch), so there is no version of
     this where its egress "works" through the proxy without moving the proxy
     start AND injecting the env.
+20. **A scratch repo for a Tier-3 run inherits the operator's GLOBAL gitignore.**
+    `git add -A` in a fresh `git init` silently skipped `.worktreesetup.sh`,
+    because `~/.gitignore` lists it -- so the worktree came up without the file,
+    `run_worktreesetup` returned 0 at its `[[ -f ]]` guard, and the run printed
+    a clean launch that had tested nothing. `git add -f`, and check
+    `git ls-files` before trusting the first result. Landmine 9's shape again: a
+    silent no-op that reads as a pass, this time in the harness rather than in
+    csb.
 
 ### Conventions that are not obvious from the code
 
@@ -1627,13 +1705,20 @@ at the top of this file.
   8. **`.worktreesetup.sh` with `filter_egress=true` runs on Linux**: the setup
      script executes and the launch proceeds. Note this measured the
      skip-the-wrap guard, which P5 then replaced -- under P5 that call site gets
-     a netns with no egress instead of the host's network, so this item wants
-     re-running on both platforms.
+     a netns with no egress instead of the host's network. Re-run on both
+     platforms under P5; see the two Tier-3 sections in the handoff.
 
-- **P5 -- the worktreesetup call site fails closed. DONE (2026-08-08).** Both
-  halves of landmine 19, on one rule: a rule per port that exists, and no path
-  to open egress under `filter_egress=true`. The handoff's P5 section has the
-  reasoning and what stays unverified.
+- **P5 -- the worktreesetup call site fails closed. DONE (2026-08-08),
+  Tier-3-verified on both platforms.** Both halves of landmine 19, on one rule:
+  a rule per port that exists, and no path to open egress under
+  `filter_egress=true`. The handoff's two P5 Tier-3 sections have the tables.
+- **P6 -- the nft ruleset seam. DONE (2026-08-08).** `--dump-sandbox` renders
+  the generated ruleset rather than a port-list placeholder, from a single
+  `nft_ruleset` generator the launch also uses, so the dump shows the bytes the
+  launch loads. Three assertions ride on it, including rule ORDER as a
+  regression guard for P4's dropped-reply bug. `make test` 146; the Linux
+  golden moved `+8 / -1` and nothing else did. The handoff's P6 section has the
+  reasoning and the one arm it still cannot reach.
 
 P1+P2 are the cheap, high-value half and are independently shippable. P4 is the
 bulk and deserves its own verification pass. P3 can land before or after P2 --
@@ -2062,13 +2147,17 @@ the source of truth. `claude --debug` writes the client's own view to
    so the sandbox needs no DNS. Whether removing the `mDNSResponder` allows breaks
    anything unrelated (git, tooling) is unmeasured -- keep them until P2 is
    working, then remove and re-run `make test-proxy` plus a real session.
-4. **Linux F4 re-measure.** `bats test/escape/escape.bats` on NixOS with
-   `--unshare-net`, to see whether the abstract-socket residual closes.
+4. **Linux abstract-socket residual -- ANSWERED (P4).** It closes under
+   `--filter-egress`: A/B against a host `socat ABSTRACT-LISTEN`, REACHED
+   without the flag and `Connection refused` with it, because abstract sockets
+   are network-namespace scoped. The host is headless, so the literal
+   `@/tmp/.X11-unix/X0` instance is inferred from the same mechanism rather than
+   measured.
 5. **Does anything legitimate need plain HTTP?** Section 2 refuses non-CONNECT
    requests outright. Verify against a real session before committing to it.
 
 Resolved: `-E` stays and error-on-both is approved (section 9); proxy support and
-the host list are settled (section 9a).
+the host list are settled (section 9a); the abstract-socket question is item 4.
 
 ---
 

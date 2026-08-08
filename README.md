@@ -25,9 +25,11 @@ three layers:
 >
 > Two reasons, both deliberate and both load-bearing:
 >
-> - **Network and host services stay open by design**, so claude (and the `-s`
->   shell) can reach local db/redis/etc for testing. csb is not an egress
->   firewall: anything readable is exfiltratable.
+> - **Network and host services stay open by default**, so claude (and the `-s`
+>   shell) can reach local db/redis/etc for testing -- anything readable is
+>   exfiltratable. [`--filter-egress`](#filtering-egress---filter-egress) narrows
+>   outbound traffic to an allowlist, but it is off unless you ask for it and it
+>   costs you WebFetch for every host you don't list.
 > - **The sandbox constrains filesystem operations, and IPC only where it can.**
 >   A host service that acts on the sandboxed process's behalf does its work
 >   *outside* the sandbox, as you. Verified escapes of this shape existed on
@@ -710,6 +712,83 @@ it was measured not to reopen the escape, and `test/escape/escape.bats` keeps
 that a regression guard. No-op on Linux (an X11/Wayland concern) and under
 `--no-sandbox`.
 
+## Filtering egress (`--filter-egress`)
+
+**Off by default.** Turn it on and the sandbox's only route out is `csb-proxy`,
+a CONNECT proxy csb starts *outside* the sandbox that dials allowlisted hosts on
+port 443 and nothing else. An unlisted host, an IP literal, a plain-HTTP
+request, any other port: refused, and logged.
+
+```sh
+csb -s --here --filter-egress --allow-host api.anthropic.com
+csb mybranch --filter-egress             # hosts from the config layers
+```
+
+Hosts union from `--allow-host` (repeatable), a config section's or profile's
+`allow_host=`, and `${XDG_CONFIG_HOME:-~/.config}/csb/allowed-hosts` -- one host
+per line, `#` comments; copy `templates/allowed-hosts` for a starting set
+covering Claude Code's own endpoints. A leading `*.` matches subdomains only, so
+list a bare parent separately when you want it too. `--filter-egress` with an
+empty allowlist is an error rather than a silent blackhole.
+
+`--allow-port PORT` (profile `allow_port=`) re-opens one **localhost** TCP port,
+so a dev server or database on the host stays reachable while everything else
+stays filtered.
+
+### It is enforced, not advisory
+
+A direct dial that ignores `HTTPS_PROXY` fails *even to an allowed host* --
+`curl --noproxy '*' https://api.anthropic.com/` gets nothing. The sandbox has no
+independent egress capability, so the allowlist is applied at the only endpoint
+it can reach, and a proxy-unaware or hostile client is not a bypass. Verified
+end-to-end on both platforms.
+
+The mechanisms differ, the guarantee does not:
+
+- **macOS** -- the seatbelt profile's blanket IP-egress allow is *replaced* by
+  the proxy's loopback port plus any `--allow-port`, so no rule ordering can let
+  a wildcard win.
+- **Linux** -- bwrap has no socket filter, so the whole launch runs inside a
+  network namespace created by `pasta`, with an nftables default-drop ruleset
+  loaded before anything in the sandbox runs. The namespace gets no address and
+  no default route, so off-host traffic has nowhere to go; pasta forwards its
+  loopback to the host's, and the ruleset narrows that forwarding to the allowed
+  ports.
+
+The Linux namespace also closes the abstract-unix-socket gap (X11 keystroke
+injection) as a side effect -- abstract sockets are namespace-scoped. See
+[Known gaps](#known-gaps).
+
+`.worktreesetup.sh` is covered too. It runs before the proxy exists, so it gets
+a sandbox with the `--allow-port` ports and **no** general egress -- never the
+host's open network, which would hand a file the agent can write exactly the
+capability the flag was bought to remove.
+
+### What it costs, and what it does not buy
+
+WebFetch and everything else stops working for hosts you didn't list. That is
+the feature, and it is why the flag is off by default.
+
+The proxy does not decrypt, so it controls **who** the sandbox talks to, not
+**what** is said. Allowing `github.com` allows gists; there is no per-path or
+per-method filtering, no body inspection, and the refusal log records
+`host:port` rather than method and path. Treat the allowlist as bounding the
+*destinations* of an exfiltration, not preventing one.
+
+Its decisions land in `$CSB_PROXY_LOG` inside the launch HOME, readable from
+in-sandbox, so a denied fetch is self-diagnosable rather than an opaque
+transport error:
+
+```
+[csb-proxy] ALLOW api.anthropic.com:443
+[csb-proxy] DENY host not allowed: example.com
+```
+
+Two things to expect. Under `--no-sandbox` egress is **not** filtered -- the
+sandbox profile is the enforcement -- and csb says so rather than pretending.
+And on Linux a blocked port is *dropped*, not refused, so a connection to one
+hangs until the client's own timeout; macOS refuses immediately.
+
 ## Choosing the nix target
 
 By default csb runs in the repo's `devShells.<system>.default`. Point it at a
@@ -782,19 +861,22 @@ instructions**. It is built to (a) prevent *accidental* damage and *accidental*
 exposure of the obvious credentials, and (b) keep separate work (namespaces,
 other repos) from bleeding into each other. It is **weaker** against *untrusted
 instructions* -- prompt injection from a fetched page, a malicious dependency, a
-poisoned issue/PR -- because the two capabilities csb deliberately keeps open
+poisoned issue/PR -- because the two capabilities csb leaves open by default
 (broad filesystem *reads* and open *network egress*) are exactly the exfiltration
 primitive: anything the agent can read, injected instructions can read, and
-anything readable can be shipped off-box. csb does not defend against a hostile
-agent.
+anything readable can be shipped off-box.
+[`--filter-egress`](#filtering-egress---filter-egress) closes the second half by
+destination, which narrows the exfiltration surface without eliminating it. csb
+does not defend against a hostile agent.
 
 Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
 
-- **Open network egress.** Unrestricted outbound. This is the price of claude
-  reaching local services for real testing. seatbelt filters by ip/port only,
-  **not by hostname**, so host-based egress control needs a filtering proxy
-  (deliberately out of scope). `localhost`-only egress *is* natively expressible
-  and is the basis of the possible lockdown mode below.
+- **Open network egress, by default.** Unrestricted outbound unless you ask for
+  otherwise. This is the price of claude reaching local services for real
+  testing. Neither seatbelt nor bwrap filters by hostname, so host-based control
+  needs a proxy: csb ships one, opt in per launch or per profile with
+  [`--filter-egress`](#filtering-egress---filter-egress). Left off, anything
+  readable is exfiltratable.
 - **Read deny-list fails open.** Anything not on the floor under your real HOME
   (a stray `.env`, files under `~/Documents`, a dotfile the floor didn't
   anticipate) is readable. A read allow-list would close this but breaks
@@ -861,7 +943,7 @@ normal mode. Full detail, evidence and reproductions in
 | host unix sockets generally (tmux, editor IPC, docker, ssh-agent) | both | not exhaustively probed, but the same shape as the nix daemon | macOS: **closed as a class**. Linux: **open, accepted** |
 | `task_for_pid` / debugger attach to host processes | macOS | would be code injection into a process outside the sandbox | **denied as a class** -- never demonstrated reachable (the OS already gates it), so this is belt-and-braces, not a closed hole |
 | `sysctl kern.procargs2` reads other processes' argv + environment | macOS | discloses secrets from your other shells and dev servers -- disclosure, not execution | **open, unfixable** with seatbelt |
-| Linux abstract unix sockets (e.g. X11) | Linux | keystroke injection into your session | **open, unfixable** without closing network egress |
+| Linux abstract unix sockets (e.g. X11) | Linux | keystroke injection into your session | **open by default; closed under `--filter-egress`**, which puts the launch in its own network namespace -- abstract sockets are namespace-scoped, so they go as a class |
 
 The macOS fixes work by flipping whole seatbelt filter *classes* to
 deny-by-default rather than by blacklisting service names -- a name blacklist
@@ -935,9 +1017,11 @@ order of leverage:
    scheduled, or promised** -- it is the direction that would be needed, sketched
    in `docs/PLAN-003.md` and `docs/TODO.md`, and it may never be built. Assume it
    will not be.
-2. **Restrict egress** -- not natively possible by hostname. A VM makes it
-   straightforward; without one, the achievable native step is a `localhost`-only
-   egress mode, useful only for tasks that don't need claude's network mid-run.
+2. **Restrict egress** -- [`--filter-egress`](#filtering-egress---filter-egress)
+   with an allowlist as short as the task tolerates. It is enforced rather than
+   advisory on both platforms, so it bounds where anything read can be shipped;
+   it does not bound *what* is sent to an allowed host, since the proxy does not
+   decrypt.
 
 ## What a repo needs
 
@@ -988,9 +1072,10 @@ bin/csb                    the orchestrator (worktree + deny-list + launch)
 ocaml/                     csb-config (config resolution, --help, --dump-config)
                            and csb-proxy (the --filter-egress CONNECT proxy)
 LICENSE                    MIT
-flake.nix                  packages {csb, csb-tools, claude, bwrap (linux)} + apps
+flake.nix                  packages {csb, csb-tools, claude, bwrap/pasta/nft (linux)} + apps
 templates/repo/            scaffold: a standalone dev-shell flake for a consuming repo
 templates/home/            starter seed-home skeleton (copy to ~/.config/csb/home)
+templates/allowed-hosts    starter egress allowlist (copy to ~/.config/csb/allowed-hosts)
 Makefile                   install, lint, test, and build targets (make help)
 test/                      bats test suite (make test); see docs/PLAN-005-tests.md
 docs/PLAN-002.md           the implemented design (single mode, deny-list, profiles)

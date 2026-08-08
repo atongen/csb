@@ -8,7 +8,14 @@ nft_bin="$1"; rules="$2"; shift 2
                                exec "$@"
 csb-netns-shim
 <NFT>
-<NFT_RULES:<PROXY_PORT>, 5432>
+<NFT_RULES:
+table inet csb_filter_egress {
+  chain output {
+    type filter hook output priority 0; policy drop;
+    ct state established,related accept
+    oif "lo" tcp dport { <PROXY_PORT>, 5432 } accept
+  }
+}>
 <BWRAP>
 --ro-bind
 /

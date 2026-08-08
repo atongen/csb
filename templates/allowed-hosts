@@ -1,4 +1,6 @@
-# Default egress allowlist for csb-proxy: the hosts Claude Code needs.
+# Starter egress allowlist: the hosts Claude Code needs. Copy it to
+# ${XDG_CONFIG_HOME:-~/.config}/csb/allowed-hosts, where csb reads it under
+# --filter-egress. It is also what `make proxy-run` serves by default.
 #
 # Derived from Anthropic's documented network requirements, not guessed:
 # https://code.claude.com/docs/en/network-config
@@ -9,9 +11,9 @@
 # `*.` matches subdomains only, so list a bare parent domain separately when it
 # is also wanted.
 #
-# Transitional: this becomes the built-in default (config layer 1) once
-# csb-config owns config resolution. Until then csb-proxy reads it directly, and
-# it is re-read only at startup.
+# These entries are add-only: they union with --allow-host and any config
+# layer's allow_host=. The file is read once per launch, so an edit applies to
+# the next one.
 
 # --- required -----------------------------------------------------------------
 # API requests, WebFetch domain safety check, feature flags.

@@ -123,9 +123,10 @@
       (Tart/UTM/Lima) with a controllable network, which is also sandbox-exec's
       documented successor. macOS seatbelt has no process-isolation primitive,
       so this cannot be a profile tweak.
-    * lower-leverage companion: opt-in localhost-only egress mode (seatbelt
-      `(deny network-outbound)` + `(allow ... (remote ip "localhost:*"))`,
-      verified working; hostname allowlisting is NOT natively possible and
-      would mean re-adding the removed proxy subsystem). NOTE: PLAN-007 already
-      ships `(deny network-outbound)` + `(allow ... (remote ip "*:*"))`, so this
-      is now a one-token change to an existing line rather than new machinery.
+    * companion, now SHIPPED: `--filter-egress` (PLAN-008, complete 2026-08-08)
+      is opt-in per-host egress control on both platforms -- a CONNECT allowlist
+      proxy outside the sandbox, enforced by the seatbelt profile on macOS and
+      by a pasta netns + nftables default-drop on Linux. It bounds the
+      destinations of an exfiltration, not its content: the proxy does not
+      decrypt, so there is no per-path or per-method filtering. The second
+      boundary above remains the higher-leverage move.

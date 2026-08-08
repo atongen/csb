@@ -353,9 +353,27 @@ load helpers
   refute_output --partial "macOS-only"
   assert_line "$CSB_PASTA_BIN"
   assert_line "$CSB_NFT_BIN"
-  assert_line "<NFT_RULES:<PROXY_PORT>>"
+  assert_line "<NFT_RULES:"
+  assert_line '    oif "lo" tcp dport { <PROXY_PORT> } accept'
   # bwrap itself never unshares net -- that namespace is pasta's.
   refute_line "--unshare-net"
+}
+
+# bats test_tags=dump-sandbox
+@test "the Linux nft ruleset drops by default and accepts replies before ports" {
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-port 5432
+  assert_success
+  assert_line "    type filter hook output priority 0; policy drop;"
+  assert_line "    ct state established,related accept"
+  # Loopback replies reach this hook with an ephemeral dport, so a ct-state
+  # accept placed AFTER the port rule passes the SYN and drops the SYN-ACK --
+  # egress that reaches nothing at all, its own proxy included.
+  local ct port
+  ct="$(printf '%s\n' "$output" | grep -n 'ct state established,related accept' | cut -d: -f1)"
+  port="$(printf '%s\n' "$output" | grep -n 'tcp dport' | cut -d: -f1)"
+  (( ct < port ))
 }
 
 # bats test_tags=dump-sandbox
@@ -374,8 +392,9 @@ load helpers
   local repo; repo="$(fake_repo)"
   dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-port 5432
   assert_success
-  assert_line "<NFT_RULES:<PROXY_PORT>, 5432>"
+  assert_line '    oif "lo" tcp dport { <PROXY_PORT>, 5432 } accept'
   dump_sandbox "$repo" --allow-port 5432
   assert_success
   refute_line "$CSB_NFT_BIN"
+  refute_output --partial "csb_filter_egress"
 }
