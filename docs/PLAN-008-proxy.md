@@ -150,7 +150,7 @@ help *renderer* from `TERM`, not from whether anyone is watching, so a piped
 a bare `-h`/`--help` to `--help=plain` when stdout is not a tty.
 
 `CSB_VERSION` moved out of `bin/csb` into `ocaml/lib/version.ml`, so there is one
-copy. `csb --version` still prints `csb 0.3.1`.
+copy. `csb --version` renders it as `csb <version>`.
 
 ### How `csb-config` is found, and why not the way `csb-proxy` is
 
