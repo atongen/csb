@@ -31,6 +31,28 @@ load helpers
   assert_snapshot filter-egress "$repo"
 }
 
+@test "linux: --filter-egress remaps the payload off pasta's uid 0" {
+  # pasta spawns its user namespace with the caller mapped to root, so bwrap has
+  # to map back or the payload runs as uid 0 (which claude refuses to combine with
+  # --dangerously-skip-permissions). The golden holds placeholders; the concrete
+  # ids are asserted here, along with their absence when no netns is spawned.
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS filters egress without a netns)"
+  local repo; repo="$(fake_repo feature/x)"
+  dump_sandbox_snapshot "$repo" --filter-egress
+  assert_success
+  assert_line "--unshare-user"
+  assert_line "--uid"
+  assert_line "$(id -u)"
+  assert_line "--gid"
+  assert_line "$(id -g)"
+
+  dump_sandbox_snapshot "$repo"
+  assert_success
+  refute_line "--unshare-user"
+  refute_line "--uid"
+  refute_line "--gid"
+}
+
 @test "linux: every IPC broker path present on this host gets a --tmpfs" {
   # The goldens collapse this block to <IPC-TMPFS> because csb emits a --tmpfs
   # only for the paths that exist, which differs per host (a NixOS box has all

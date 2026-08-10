@@ -17,6 +17,11 @@ table inet csb_filter_egress {
   }
 }>
 <BWRAP>
+--unshare-user
+--uid
+<UID>
+--gid
+<GID>
 --ro-bind
 /
 /

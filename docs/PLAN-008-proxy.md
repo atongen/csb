@@ -680,6 +680,27 @@ what makes the two agree.
     silent no-op that reads as a pass, this time in the harness rather than in
     csb.
 
+21. **pasta spawns its user namespace with the caller mapped to uid 0, and the
+    payload inherits it.** `pasta -f -- COMMAND` writes `0 <uid> 1` to its own
+    `uid_map`, i.e. `unshare -r` semantics. That mapping is load-bearing -- it is
+    what gives the shim's `nft -f` CAP_NET_ADMIN over the namespace it just made
+    -- but bwrap runs inside and preserves the uid, so under `--filter-egress`
+    everything in the sandbox ran as root. claude then refuses to start: its gate
+    is `getuid() === 0 && IS_SANDBOX !== "1" && !CLAUDE_CODE_BUBBLEWRAP`, so
+    `csb -y --filter-egress` died on Linux with "--dangerously-skip-permissions
+    cannot be used with root/sudo privileges for security reasons" and nothing
+    else did. Setting either env var would have silenced the check while leaving
+    the payload root; the wrap maps the ids back instead
+    (`--unshare-user --uid $(id -u) --gid $(id -g)` on the bwrap argv), which
+    also fixes every other tool that reasonably objects to running as root.
+    Two details make this specific rather than obvious: bwrap only *implies*
+    `--unshare-user` when its own uid is nonzero (`getuid() != 0` in
+    `bubblewrap.c`), which inside pasta it is not, so the flag has to be named or
+    `--uid` dies; and the nested map is legal unprivileged because it maps the
+    writer's own outer id (`1000 0 1`), the one case the kernel allows without
+    CAP_SETUID. Ownership reads correctly at both levels: the operator's files
+    appear as uid 0 in pasta's namespace, then as the operator again in bwrap's.
+
 ### Conventions that are not obvious from the code
 
 - **The operator does all git.** Do not commit, branch, or push.
