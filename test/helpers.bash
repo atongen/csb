@@ -172,7 +172,22 @@ normalize_sandbox() {
   prog+="s#$(_sed_escape "$CSB_PASTA_BIN")#<PASTA>#g;"
   prog+="s#$(_sed_escape "$CSB_NFT_BIN")#<NFT>#g;"
 
-  printf '%s\n' "$output" | sed "$prog" | collapse_ipc_tmpfs
+  printf '%s\n' "$output" | sed "$prog" | collapse_ipc_tmpfs | collapse_ids
+}
+
+# Read a bwrap argv on stdin (one token per line) and replace the operand of
+# --uid/--gid (the invoking user's numeric ids, emitted verbatim under the
+# --filter-egress pasta wrap) with stable placeholders. A no-op elsewhere: no
+# other argv carries those flags, and a seatbelt profile has no such tokens.
+collapse_ids() {
+  local line
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    case "$line" in
+      --uid) IFS= read -r line; printf '%s\n' "<UID>" ;;
+      --gid) IFS= read -r line; printf '%s\n' "<GID>" ;;
+    esac
+  done
 }
 
 # Read a bwrap argv on stdin (one token per line) and replace the IPC tmpfs

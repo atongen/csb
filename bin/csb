@@ -1314,13 +1314,23 @@ build_deny_wrapper() {
         # just made, THEN exec the real bwrap invocation -- so nothing runs
         # inside it unfiltered even for one packet. $0 names the shim in any
         # diagnostic the same way path_shim below names itself.
+        # pasta maps the caller to uid 0 in the user namespace it spawns -- the
+        # mapping that gives the shim's `nft -f` CAP_NET_ADMIN over that netns.
+        # A nested bwrap user namespace maps that back to the operator's ids, so
+        # the payload runs unprivileged (claude refuses
+        # --dangerously-skip-permissions at uid 0) and file ownership still reads
+        # as the operator's. --unshare-user is explicit because bwrap only implies
+        # it when its own uid is nonzero, which inside pasta it is not. Spliced in
+        # here rather than into the argv above: the remap belongs to the wrap.
         # shellcheck disable=SC2016  # $nft_bin/$rules/$@ expand at shim runtime, not here
         deny_wrapper=("$pasta_bin" -f --
                       bash -c 'nft_bin="$1"; rules="$2"; shift 2
                                "$nft_bin" -f "$rules" || exit 1
                                exec "$@"' \
                       csb-netns-shim "$nft_bin" "$nft_rules_file"
-                      "${deny_wrapper[@]}")
+                      "${deny_wrapper[0]}" --unshare-user
+                      --uid "$(id -u)" --gid "$(id -g)"
+                      "${deny_wrapper[@]:1}")
       fi
       ;;
     *)
