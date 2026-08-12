@@ -54,6 +54,34 @@ load helpers
   assert_line "pasteboard=true"
 }
 
+# --- allow_loopback (widen --filter-egress to every loopback port) -----------
+
+@test "allow_loopback defaults off" {
+  dump_config
+  assert_success
+  assert_line "allow_loopback=false"
+}
+
+@test "CLI --allow-loopback beats profile allow_loopback=false" {
+  write_profile p "allow_loopback=false"
+  dump_config -p p --allow-loopback
+  assert_success
+  assert_line "allow_loopback=true"
+}
+
+@test "CLI --no-allow-loopback beats profile allow_loopback=true" {
+  write_profile p "allow_loopback=true"
+  dump_config -p p --no-allow-loopback
+  assert_success
+  assert_line "allow_loopback=false"
+}
+
+@test "profile allow_loopback=true applies with no CLI override" {
+  write_profile p "allow_loopback=true"
+  dump_config -p p
+  assert_line "allow_loopback=true"
+}
+
 # --- nix_target (which devShells.<system>.NAME to run under) -----------------
 
 @test "nix_target defaults empty, resolving to the flake's default" {

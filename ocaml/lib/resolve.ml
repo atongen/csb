@@ -68,6 +68,9 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
   let filter_egress =
     bool_layer ~cli:cli.filter_egress ~profile:(pf (fun p -> p.filter_egress)) ~default:false
   in
+  let allow_loopback =
+    bool_layer ~cli:cli.allow_loopback ~profile:(pf (fun p -> p.allow_loopback)) ~default:false
+  in
 
   (* One CLI target of any kind takes the layers' whole set out of play, which is
      now just the axis being one field. *)
@@ -106,6 +109,15 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     | Layer.Set v -> Some (Env.checked_tmpdir env ~where:"tmpdir" v)
     | Layer.Cleared -> None
     | Layer.Unset -> tmpdir
+  in
+  (* The one directory every temp path a launch writes sits under, resolved here
+     so bin/csb consumes an answer rather than recomputing the fallback. Its
+     whole job is to be stable: a launch execs through `nix develop`, which
+     rewrites TMPDIR, so a base read at use time would move mid-launch. *)
+  let tmp_base =
+    match cfg_tmpdir with
+    | Some d -> d
+    | None -> ( match env.Env.system_tmpdir with Some d -> d | None -> "/tmp")
   in
   let accent = Layer.value (Layer.over cli.accent (pf (fun p -> p.accent))) in
 
@@ -179,6 +191,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     seed_home;
     accent;
     cfg_tmpdir;
+    tmp_base;
     claude_args;
     keep = cli.keep @ plist (fun p -> p.keep);
     setenv = Profile.dedupe_setenv (plist (fun p -> p.setenv) @ cli.setenv);
@@ -186,6 +199,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     allow_write;
     allow_socket;
     filter_egress;
+    allow_loopback;
     allow_hosts = cli.allow_hosts @ plist (fun p -> p.allow_hosts) @ hosts_file;
     allow_ports = cli.allow_ports @ plist (fun p -> p.allow_ports);
     paranoid_deny_read;

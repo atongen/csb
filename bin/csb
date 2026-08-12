@@ -21,13 +21,13 @@
 #                 "$CSB_SELF#csb-tools" (same purpose, for --filter-egress).
 #      CSB_PASTA_BIN, CSB_NFT_BIN (Linux) as CSB_BWRAP_BIN, for the pasta
 #                 network namespace and nftables ruleset --filter-egress needs
-#                 there (docs/PLAN-008-proxy.md section 4).
+#                 there (docs/PLAN-009-proxy.md section 4).
 #      CSB_CONFIG_BIN use this csb-config binary verbatim instead of searching
 #                 beside this script, then ~/.csb/bin, then $PATH.
 #
 # Config resolution -- the flag grammar, the profiles, the validation, --help
 # and --dump-config -- belongs to csb-config, not to this script; see
-# docs/PLAN-008-proxy.md section 9. This script keeps git, nix and exec.
+# docs/PLAN-009-proxy.md section 9. This script keeps git, nix and exec.
 
 set -euo pipefail
 
@@ -56,6 +56,11 @@ CSB_NS_ROOT="$HOME/.csb/claudes"
 CSB_TOOLS_DIR="$HOME/.csb/bin"
 CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"
 CSB_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/csb"
+# Proxy ownership stamps. One fixed place, deliberately NOT under the temp base:
+# the process table the janitor matches against is global, so a stamp store that
+# moves with $TMPDIR leaves proxies launched under a transient one (every run
+# under `nix develop`) unreachable from an ordinary shell.
+CSB_RUN_DIR="$HOME/.csb/run"
 
 die() { echo "$PROG: $*" >&2; exit 1; }
 
@@ -823,11 +828,24 @@ emit_ancestor_metadata() {
 # active namespace, and build_write_roots for the write policy. sandbox-exec is
 # deprecated-but-stable (nix's own darwin sandbox uses the same libsandbox); if
 # it ever disappears, this helper is the single place to swap the mechanism.
+# Every temp path a launch creates lives under this base, and the janitor scans
+# the same one, so cleanup cannot look somewhere creation never wrote.
+# resolve_config's emit file is the one exception, and says why there. Proxy
+# ownership stamps deliberately do NOT live here -- see CSB_RUN_DIR.
+#
+# csb-config resolves it (cfg_tmpdir, else TMPDIR, else /tmp) and --dump-config
+# reports it, so the answer is stated once and inspectable. Reading it back here
+# rather than recomputing matters because a launch execs through `nix develop`,
+# which rewrites TMPDIR: recomputing later would move the base mid-launch.
+tmp_base() {
+  printf '%s' "$cfg_tmp_base"
+}
+
 # Set proxy_port for the profile's one IP-egress rule. Under --filter-egress the
 # proxy runs OUTSIDE the sandbox, as the operator, and the sandbox reaches it on
 # loopback and nothing else -- on both platforms: on Linux the pasta netns
 # build_deny_wrapper adds forwards the namespace's own loopback to the host's
-# (docs/PLAN-008-proxy.md section 4), so the same 127.0.0.1:$proxy_port the
+# (docs/PLAN-009-proxy.md section 4), so the same 127.0.0.1:$proxy_port the
 # sandbox is told about on macOS also resolves there. Under --dump-sandbox
 # nothing is started: a placeholder keeps the seam hermetic and its goldens
 # stable.
@@ -866,13 +884,13 @@ start_egress_proxy() {
     || die "--filter-egress resolved csb-proxy to a non-executable path: $bin"
   [[ ${#allow_host_list[@]} -gt 0 ]] \
     || die "--filter-egress with an empty host allowlist would block all egress: add --allow-host, a profile allow_host=, or $CSB_CONFIG_DIR/allowed-hosts"
-  proxy_allow_file="$(mktemp "${TMPDIR:-/tmp}/csb-allow.XXXXXX")"
+  proxy_allow_file="$(mktemp "$(tmp_base)/csb-allow.XXXXXX")"
   printf '%s\n' "${allow_host_list[@]}" >"$proxy_allow_file"
   # The decision log goes in the launch HOME so the SANDBOX can read it: a denied
   # CONNECT reaches the agent as an opaque transport error, and this file is the
   # only way it can tell policy from packet loss.
-  proxy_log="${claude_home:-${TMPDIR:-/tmp}}/csb-proxy.log"
-  fifo="$(mktemp -u "${TMPDIR:-/tmp}/csb-proxyport.XXXXXX")"
+  proxy_log="${claude_home:-$(tmp_base)}/csb-proxy.log"
+  fifo="$(mktemp -u "$(tmp_base)/csb-proxyport.XXXXXX")"
   mkfifo "$fifo"
   # Decisions arrive on the proxy's stderr; appending it to the log keeps one
   # writer (and captures a failed start, which --log-file would not). stdout is
@@ -884,14 +902,142 @@ start_egress_proxy() {
   rm -f "$fifo"
   [[ "$proxy_port" =~ ^[0-9]+$ ]] \
     || die "csb-proxy did not report a port (see $proxy_log)"
+  # The janitor reaps by this record, never by process shape: owner pid, proxy
+  # pid, allowlist. `exec` preserves $$, so the owner names this session for its
+  # whole life. Written after the proxy answers, so a stamp always names a proxy
+  # that started; the janitor's rule for the gap is to report and not kill. It
+  # lives in CSB_RUN_DIR rather than beside the allowlist it names, so cleanup
+  # reaches a proxy whatever $TMPDIR the launch had.
+  mkdir -p "$CSB_RUN_DIR"
+  proxy_stamp="$(mktemp "$CSB_RUN_DIR/csb-owner.XXXXXX")"
+  printf '%s\n%s\n%s\n' "$$" "$proxy_pid" "$proxy_allow_file" >"$proxy_stamp"
   vecho "$PROG: egress filtered via csb-proxy on 127.0.0.1:$proxy_port (${#allow_host_list[@]} hosts); log: $proxy_log"
+  if [[ "$allow_loopback" == "true" ]]; then
+    vecho "$PROG: --allow-loopback: every loopback TCP port is reachable, the host's services included"
+  fi
+}
+
+# The janitor: sessions reclaim what DEAD sessions left behind. A launch ends
+# in `exec`, which replaces this process, so the EXIT trap never fires on the
+# normal path and a session cannot clean up after itself; instead every real
+# launch (and --reap, the on-demand form) runs the passes below.
+#
+# Egress proxies are reaped by the ownership stamp start_egress_proxy wrote, not
+# by process shape: a proxy's parent is NOT a reliable signal on Linux, where a
+# subreaper (systemd --user) collects orphans instead of pid 1. The stamp states
+# what the process tree could only imply.
+#
+# A recorded pid can be reused, so a dead owner is not enough to kill by: the
+# argv must still name csb-proxy reading that stamp's allowlist. Both must
+# coincide, and allowlist paths are mktemp-random. This guard has no counterpart
+# in reap_dead_homes, where reuse can only delay cleanup, never misfire.
+#
+# The allowlist and the stamp go once the owner is dead, whether or not the
+# proxy is still there -- that is what reclaims a proxy that died some other way.
+# Prints "<reaped> <malformed>".
+reap_orphan_proxies() {
+  local stamp owner proxy allow args reaped=0 malformed=0
+  for stamp in "$CSB_RUN_DIR"/csb-owner.*; do
+    [[ -f "$stamp" ]] || continue
+    owner=""; proxy=""; allow=""
+    { read -r owner; read -r proxy; read -r allow; } <"$stamp" 2>/dev/null || true
+    if [[ ! "$owner" =~ ^[0-9]+$ || ! "$proxy" =~ ^[0-9]+$ || "$allow" != /* ]]; then
+      malformed=$((malformed + 1))
+      continue
+    fi
+    kill -0 "$owner" 2>/dev/null && continue
+    args="$(ps -o args= -p "$proxy" 2>/dev/null || true)"
+    if [[ "$args" == */csb-proxy\ "$allow" || "$args" == */csb_proxy_cli.exe\ "$allow" ]]; then
+      kill "$proxy" 2>/dev/null && reaped=$((reaped + 1))
+      vecho "$PROG: reaped proxy $proxy ($allow)"
+    fi
+    rm -f "$allow" "$stamp"
+  done
+  echo "$reaped $malformed"
+}
+
+# What the stamped pass cannot claim, reported so a human can sweep it: proxies
+# and allowlists from before the stamp existed, or whose stamp was lost. Run
+# AFTER reap_orphan_proxies, so every remaining stamp names a live session and
+# anything unclaimed is genuinely unowned. Nothing here is ever deleted -- an
+# unclaimed artifact is indistinguishable from one mid-creation, which is the
+# same rule that protects unstamped HOMEs.
+#
+# The two halves have different reach, and the caller says so: stamps are global,
+# so an unclaimed PROCESS is unowned outright, while allowlists are found only
+# under the tmp base this invocation resolves. Prints "<procs> <files>".
+report_unowned_proxy_artifacts() {
+  local base stamp owner proxy allow args me pid procs=0 files=0 claimed=" "
+  base="$(tmp_base)"
+  me="$(id -un)"
+  for stamp in "$CSB_RUN_DIR"/csb-owner.*; do
+    [[ -f "$stamp" ]] || continue
+    owner=""; proxy=""; allow=""
+    { read -r owner; read -r proxy; read -r allow; } <"$stamp" 2>/dev/null || true
+    claimed+="$proxy $allow "
+  done
+  while read -r pid args; do
+    [[ "$args" == */csb-proxy\ /* || "$args" == */csb_proxy_cli.exe\ /* ]] || continue
+    [[ "$claimed" == *" $pid "* ]] && continue
+    procs=$((procs + 1))
+    vecho "$PROG: unowned proxy $pid (no stamp; not killed): $args"
+  done < <(ps -u "$me" -o pid=,args= 2>/dev/null)
+  for allow in "${base%/}"/csb-allow.*; do
+    [[ -f "$allow" ]] || continue
+    [[ "$claimed" == *" $allow "* ]] && continue
+    files=$((files + 1))
+    vecho "$PROG: unowned allowlist $allow (no stamp; not removed)"
+  done
+  echo "$procs $files"
+}
+
+# Random ephemeral HOMEs: each carries its owner's pid in .csb-owner (stamped
+# at creation; `exec` preserves the pid, so the stamp names the session for its
+# whole life), and a stamp whose pid is gone marks a dead session's HOME --
+# with --seed-creds it holds a live credential, so the OS temp reaper is not
+# enough. A dir without a valid stamp is never deleted, only counted: it cannot
+# be told apart from one mid-creation. The glob matches only mktemp's
+# csb-home.XXXXXX shape (a named -E=NAME HOME is csb-home-NAME and may be
+# shared across panes; namespace HOMEs and --real-home live elsewhere), under
+# the same tmp base the current config creates them in. Prints
+# "<removed> <unstamped>".
+reap_dead_homes() {
+  local base home stamp pid="" removed=0 unstamped=0
+  base="$(tmp_base)"
+  for home in "${base%/}"/csb-home.*; do
+    [[ -d "$home" ]] || continue
+    stamp="$home/.csb-owner"
+    if [[ ! -f "$stamp" ]] || ! read -r pid 2>/dev/null <"$stamp" \
+       || [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+      unstamped=$((unstamped + 1))
+      continue
+    fi
+    kill -0 "$pid" 2>/dev/null && continue
+    rm -rf "$home"
+    removed=$((removed + 1))
+    vecho "$PROG: removed dead-session HOME $home (owner $pid gone)"
+  done
+  echo "$removed $unstamped"
+}
+
+# The elements of $2.. joined by $1. One port list, two renderings: nft's set
+# wants "a, b", pasta's forwarding spec wants "a,b".
+join_by() {
+  local sep="$1" out="" p
+  shift
+  for p in "$@"; do
+    [[ -z "$out" ]] || out+="$sep"
+    out+="$p"
+  done
+  printf '%s' "$out"
 }
 
 # The nftables ruleset the Linux --filter-egress namespace runs under, as text,
-# from a comma-separated port set ($1). One generator for both the launch and
-# --dump-sandbox, so the seam renders the bytes the launch actually loads.
+# from a comma-separated port set ($1) and the --allow-loopback answer ($2). One
+# generator for both the launch and --dump-sandbox, so the seam renders the bytes
+# the launch actually loads.
 nft_ruleset() {
-  local ports="$1"
+  local ports="$1" loopback="$2"
   echo "table inet csb_filter_egress {"
   echo "  chain output {"
   echo "    type filter hook output priority 0; policy drop;"
@@ -900,9 +1046,12 @@ nft_ruleset() {
   # the SYN-ACK -- a sandbox that cannot reach even its own proxy. It must
   # precede the accept for the same reason it exists.
   echo "    ct state established,related accept"
-  # `tcp dport { }` is a parse error, so an empty set emits no rule and the
-  # chain's drop policy stands alone.
-  if [[ -n "$ports" ]]; then
+  # --allow-loopback subsumes the port set, so the two are alternatives rather
+  # than both emitted. `tcp dport { }` is a parse error, so an empty set emits
+  # no rule and the chain's drop policy stands alone.
+  if [[ "$loopback" == "true" ]]; then
+    echo '    oif "lo" accept'
+  elif [[ -n "$ports" ]]; then
     printf '    oif "lo" tcp dport { %s } accept\n' "$ports"
   fi
   echo "  }"
@@ -998,13 +1147,13 @@ build_deny_wrapper() {
   case "$(uname -s)" in
     Darwin)
       local profile p
-      profile=$(mktemp "${TMPDIR:-/tmp}/csb-deny.XXXXXX")
+      profile=$(mktemp "$(tmp_base)/csb-deny.XXXXXX")
       # Reap the profile if csb dies between here and the final exec. The trap
       # deliberately does NOT fire on the exec itself: sandbox-exec reads the
       # file after csb is gone; the temp dir reaps it eventually (paths only,
       # no secrets).
       seatbelt_profile="$profile"
-      trap 'rm -f "$seatbelt_profile" "$proxy_allow_file"; [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null' EXIT
+      trap 'rm -f "$seatbelt_profile" "$proxy_allow_file" "$proxy_stamp"; [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null' EXIT
       {
         echo "(version 1)"
         echo "(allow default)"
@@ -1067,25 +1216,32 @@ build_deny_wrapper() {
         # Enforcement is structural, not cooperative: HTTP_PROXY tells a client
         # where to go, but this rule is what leaves it nowhere else.
         if [[ "$filter_egress" == "true" ]]; then
-          # One rule per port that EXISTS. run_worktreesetup calls
-          # build_deny_wrapper before start_egress_proxy has run, so there is no
-          # proxy port at that call site and .worktreesetup.sh gets only the
-          # --allow-port rules: filtering stays applied wherever it was asked
-          # for, rather than falling back to open egress at one call site.
-          if [[ -n "$proxy_port" ]]; then
-            printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$proxy_port"
+          # --allow-loopback: one rule for every loopback port, for a test runner
+          # whose helper process listens on a port the kernel picks. It subsumes
+          # the two rules below, so those are not also emitted.
+          if [[ "$allow_loopback" == "true" ]]; then
+            echo '(allow network-outbound (remote ip "localhost:*"))'
+          else
+            # One rule per port that EXISTS. run_worktreesetup calls
+            # build_deny_wrapper before start_egress_proxy has run, so there is no
+            # proxy port at that call site and .worktreesetup.sh gets only the
+            # --allow-port rules: filtering stays applied wherever it was asked
+            # for, rather than falling back to open egress at one call site.
+            if [[ -n "$proxy_port" ]]; then
+              printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$proxy_port"
+            fi
+            # --allow-port: host-local TCP services (a dev server, postgres over
+            # TCP) the proxy cannot carry, since it speaks CONNECT to public names.
+            for p in "${allow_port_list[@]+"${allow_port_list[@]}"}"; do
+              printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$p"
+            done
           fi
-          # --allow-port: host-local TCP services (a dev server, postgres over
-          # TCP) the proxy cannot carry, since it speaks CONNECT to public names.
-          for p in "${allow_port_list[@]+"${allow_port_list[@]}"}"; do
-            printf '(allow network-outbound (remote ip "localhost:%s"))\n' "$p"
-          done
         else
           echo '(allow network-outbound (remote ip "*:*"))'
         fi
         # Kept under filtering too: the proxy resolves names, but removing these
         # was never measured, and DNS is not the egress channel -- the IP rule
-        # above is. See PLAN-008-proxy.md s10 item 3.
+        # above is. See PLAN-009-proxy.md s10 item 3.
         echo '(allow network-outbound (literal "/private/var/run/mDNSResponder"))'
         echo '(allow network-outbound (literal "/var/run/mDNSResponder"))'
         # Unix sockets INSIDE the sandbox's own trees: a Rails tmp/sockets/
@@ -1187,7 +1343,7 @@ build_deny_wrapper() {
       # see the Darwin trap above for why that is a failure-path net, not the
       # normal-path cleanup). Registered here so it is armed before any of this
       # branch's mktemp calls, not only the --filter-egress ones below.
-      trap 'rm -f "$proxy_allow_file" "$nft_rules_file"; [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null' EXIT
+      trap 'rm -f "$proxy_allow_file" "$nft_rules_file" "$proxy_stamp"; [[ -z "$proxy_pid" ]] || kill "$proxy_pid" 2>/dev/null' EXIT
       deny_wrapper=("$bwrap_bin" --ro-bind / / --dev-bind /dev /dev --proc /proc
                     --unshare-pid --die-with-parent)
       # IPC policy (docs/PLAN-007-escape.md). `--ro-bind / /` carries every host
@@ -1246,7 +1402,7 @@ build_deny_wrapper() {
         deny_wrapper+=(--bind "$ns_real" "$ns_real")
       fi
       deny_wrapper+=(--)
-      # --filter-egress (docs/PLAN-008-proxy.md section 4): bwrap alone cannot
+      # --filter-egress (docs/PLAN-009-proxy.md section 4): bwrap alone cannot
       # block egress -- it has no socket filter, so HTTP_PROXY is advisory and
       # a process can dial out directly. Enforcement wraps the whole bwrap
       # invocation in a pasta-owned network namespace instead:
@@ -1254,18 +1410,25 @@ build_deny_wrapper() {
       #     COMMAND, so bwrap runs INSIDE the namespace pasta made, and never
       #     passes --unshare-net itself -- doing so would unshare a SECOND,
       #     empty net namespace on top of pasta's and cut it off).
-      #   - pasta brings up loopback in that namespace and, by default,
-      #     forwards a namespace-loopback connection to the same port on the
-      #     HOST's loopback (its documented "auto" TCP forwarding for ports
-      #     already bound on the other side). start_egress_proxy runs before
-      #     this, so csb-proxy is already listening -- which is why the env
-      #     vars below stay 127.0.0.1, unchanged from macOS: pasta is what
-      #     makes that address resolve to the host's proxy from inside.
-      #   - that forwarding is indiscriminate: EVERY port bound on the host's
-      #     loopback is reachable from inside, not just the proxy's. nftables
-      #     is what narrows it -- a ruleset loaded into the namespace BEFORE
-      #     bwrap's target runs drops everything on the way out except
-      #     loopback to the proxy port and any --allow-port ports.
+      #   - pasta brings up loopback in that namespace, and -T names the only
+      #     ports a namespace-loopback connection is carried out to the HOST's
+      #     loopback on: the proxy's, plus any --allow-port. start_egress_proxy
+      #     runs before this, so csb-proxy is already listening -- which is why
+      #     the env vars below stay 127.0.0.1, unchanged from macOS: that
+      #     forwarding is what makes the address resolve to the host's proxy
+      #     from inside.
+      #   - the namespace's loopback is otherwise PRIVATE. pasta's default is
+      #     `auto` in both directions, which carries every port bound on either
+      #     side; -t/-u/-U none and an explicit -T replace it, so a host service
+      #     the operator did not name has no presence inside at all. That is a
+      #     property of the namespace rather than of a rule, which is what makes
+      #     --allow-loopback affordable: it widens what the sandbox may DIAL,
+      #     over a loopback that reaches nothing it was not given.
+      #   - nftables narrows it a second time, independently: a ruleset loaded
+      #     into the namespace BEFORE bwrap's target runs drops everything on
+      #     the way out except loopback to those same ports (or, under
+      #     --allow-loopback, all of loopback). Two mechanisms, neither resting
+      #     on the other.
       #     Routable egress needs no rule: pasta configures an address and a
       #     default route only under --config-net, which is not passed here,
       #     so the namespace has neither and off-host traffic has nowhere to
@@ -1279,7 +1442,8 @@ build_deny_wrapper() {
       # .worktreesetup.sh the host's own network namespace, which is open
       # egress in the one configuration that asked for the opposite.
       if [[ "$filter_egress" == "true" ]]; then
-        local pasta_bin nft_bin ports
+        local pasta_bin nft_bin nft_ports pasta_ports
+        local -a fwd_ports=()
         if [[ -n "${CSB_PASTA_BIN:-}" ]]; then
           pasta_bin="$CSB_PASTA_BIN"
         else
@@ -1290,25 +1454,31 @@ build_deny_wrapper() {
         else
           nft_bin="$(nix build "$CSB_SELF#nft" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/sbin/nft"
         fi
-        # Only ports that exist reach the set; an absent proxy port contributes
-        # nothing rather than an empty element.
-        ports=""
+        # Only ports that exist reach the list; an absent proxy port contributes
+        # nothing rather than an empty element. One list feeds both narrowings --
+        # what pasta carries out of the namespace, and what nft lets the sandbox
+        # dial -- so the two cannot drift apart.
         for p in "$proxy_port" "${allow_port_list[@]+"${allow_port_list[@]}"}"; do
           [[ -n "$p" ]] || continue
-          if [[ -n "$ports" ]]; then
-            ports+=", "
-          fi
-          ports+="$p"
+          fwd_ports+=("$p")
         done
+        nft_ports="$(join_by ", " "${fwd_ports[@]+"${fwd_ports[@]}"}")"
+        # `none` is pasta's own spelling for "carry nothing", which is what the
+        # run_worktreesetup call site gets when it names no --allow-port: a
+        # namespace whose loopback goes nowhere, matching the empty nft set.
+        pasta_ports="$(join_by "," "${fwd_ports[@]+"${fwd_ports[@]}"}")"
+        [[ -n "$pasta_ports" ]] || pasta_ports="none"
         # Under --dump-sandbox no file is written, matching proxy_port's own
         # placeholder above -- but the ruleset is pure text, so the seam renders
         # it verbatim where the path would go. That keeps the rules themselves
         # testable at Tier 1 and Tier 2, not only by a real launch.
         if [[ -n "$dump" ]]; then
-          nft_rules_file="$(printf '<NFT_RULES:\n%s>' "$(nft_ruleset "$ports")")"
+          nft_rules_file="$(printf '<NFT_RULES:\n%s>' "$(nft_ruleset "$nft_ports" "$allow_loopback")")"
         else
-          nft_rules_file="$(mktemp "${TMPDIR:-/tmp}/csb-nft.XXXXXX")"
-          nft_ruleset "$ports" >"$nft_rules_file"
+          # The shim removes this once nft has loaded it: the launch execs, so
+          # the EXIT trap below is a failure-path net and would never reach it.
+          nft_rules_file="$(mktemp "$(tmp_base)/csb-nft.XXXXXX")"
+          nft_ruleset "$nft_ports" "$allow_loopback" >"$nft_rules_file"
         fi
         # bash -c is pasta's COMMAND: load the ruleset into the namespace pasta
         # just made, THEN exec the real bwrap invocation -- so nothing runs
@@ -1323,9 +1493,11 @@ build_deny_wrapper() {
         # it when its own uid is nonzero, which inside pasta it is not. Spliced in
         # here rather than into the argv above: the remap belongs to the wrap.
         # shellcheck disable=SC2016  # $nft_bin/$rules/$@ expand at shim runtime, not here
-        deny_wrapper=("$pasta_bin" -f --
+        deny_wrapper=("$pasta_bin" -f
+                      -t none -u none -U none -T "$pasta_ports" --
                       bash -c 'nft_bin="$1"; rules="$2"; shift 2
                                "$nft_bin" -f "$rules" || exit 1
+                               rm -f "$rules"
                                exec "$@"' \
                       csb-netns-shim "$nft_bin" "$nft_rules_file"
                       "${deny_wrapper[0]}" --unshare-user
@@ -1386,7 +1558,7 @@ run_token_cmd() {
 # csb-config owns the flag grammar, the profiles, their validation, --help and
 # --dump-config. It answers those three itself and otherwise hands back a
 # resolved configuration, so this script never re-derives a knob the two could
-# then disagree about. See docs/PLAN-008-proxy.md section 9.
+# then disagree about. See docs/PLAN-009-proxy.md section 9.
 
 # The csb-config binary, in order: CSB_CONFIG_BIN verbatim, one sitting beside
 # this script, this repo's own dune build, $CSB_TOOLS_DIR where `make install`
@@ -1417,7 +1589,8 @@ csb_config_bin() {
 csb_config_scalars=(dump mode no_launch here shell paranoid pasteboard
                     nix_target_effective sandbox real_home yolo latest verbose
                     namespace branch ephemeral ephemeral_name profile seed_creds
-                    seed_home reseed accent cfg_tmpdir token_cmd filter_egress)
+                    seed_home reseed accent cfg_tmpdir tmp_base token_cmd filter_egress
+                    allow_loopback)
 
 # Run csb-config over this invocation's argv and read the resolution back into
 # the globals below. The wire format is NUL-terminated KEY=VALUE records, a list
@@ -1428,7 +1601,8 @@ resolve_config() {
   local bin emit rc=0 rec k v unknown="" seen=" "
   bin="$(csb_config_bin)"
   # The file carries token_cmd, so it is created private and unlinked as soon as
-  # it is read.
+  # it is read. The one temp path that cannot use tmp_base: this call is what
+  # resolves cfg_tmpdir, so the value does not exist yet.
   emit="$(mktemp "${TMPDIR:-/tmp}/csb-resolve.XXXXXX")"
   # exec -a so csb-config's diagnostics, usage line and version name the program
   # the operator actually typed. CSB_MAIN_ROOT carries the repo identity its
@@ -1474,8 +1648,10 @@ resolve_config() {
       reseed)               reseed="$v" ;;
       accent)               accent="$v" ;;
       cfg_tmpdir)           cfg_tmpdir="$v" ;;
+      tmp_base)             cfg_tmp_base="$v" ;;
       token_cmd)            token_cmd="$v" ;;
       filter_egress)        filter_egress="$v" ;;
+      allow_loopback)       allow_loopback="$v" ;;
       claude_args)          claude_args+=("$v") ;;
       keep)                 extra_keep+=("$v") ;;
       setenv)               profile_setenv+=("$v") ;;
@@ -1522,8 +1698,10 @@ seed_home=""
 reseed="false"
 accent=""
 cfg_tmpdir=""
+cfg_tmp_base="/tmp"  # replaced by csb-config's resolved answer
 token_cmd=""
 filter_egress="false"
+allow_loopback="false"
 claude_args=()
 extra_keep=()
 profile_setenv=()
@@ -1538,8 +1716,9 @@ paranoid_allow_read_paths=()
 # Launch state, not configuration: filled in as the launch proceeds.
 seatbelt_profile=""  # macOS: generated profile path, reaped by trap on abnormal exit
 proxy_port=""        # resolved at launch; a placeholder under --dump-sandbox
-proxy_pid=""         # reaped by the launch trap
+proxy_pid=""         # killed by the trap on abnormal exit; orphans by the janitor
 proxy_allow_file=""  # temp file csb-proxy reads the allowlist from
+proxy_stamp=""       # ownership record the janitor reaps this proxy by
 proxy_log=""         # decision log, inside the launch HOME so the agent can read it
 nft_rules_file=""    # Linux: temp file the pasta-netns nft ruleset is loaded from
 ns_dir=""
@@ -1580,6 +1759,30 @@ for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 if [[ "$mode" == "launch" && "$no_launch" != "true" && "$shell" != "true" \
       && -z "$dump" && ( -n "$branch" || "$here" == "true" ) ]]; then
   run_token_cmd
+fi
+
+# --- reap mode --------------------------------------------------------------------
+#
+# Dispatched before the repository is located: an orphan belongs to no repo, and
+# the operator cleaning them up is rarely standing in one. Every real launch
+# runs the same two passes quietly; this is the on-demand form, and it reports.
+
+if [[ "$mode" == "reap" ]]; then
+  [[ -z "$branch" ]] || die "--reap takes no BRANCH argument"
+  read -r proxies badstamps <<<"$(reap_orphan_proxies)"
+  read -r homes unstamped <<<"$(reap_dead_homes)"
+  read -r unowned_procs unowned_files <<<"$(report_unowned_proxy_artifacts)"
+  echo "$PROG: reaped $proxies orphaned egress proxy process(es)"
+  echo "$PROG: removed $homes dead-session ephemeral HOME(s) under $(tmp_base)"
+  [[ "$unstamped" -eq 0 ]] \
+    || echo "$PROG: left $unstamped csb-home dir(s) with no owner stamp -- inspect and remove by hand"
+  [[ "$badstamps" -eq 0 ]] \
+    || echo "$PROG: left $badstamps unreadable csb-proxy stamp(s) -- inspect and remove by hand"
+  [[ "$unowned_procs" -eq 0 ]] \
+    || echo "$PROG: left $unowned_procs csb-proxy process(es) with no stamp -- inspect and kill by hand"
+  [[ "$unowned_files" -eq 0 ]] \
+    || echo "$PROG: left $unowned_files csb-allow file(s) with no stamp under $(tmp_base) -- inspect and remove by hand"
+  exit 0
 fi
 
 # --- locate repo ----------------------------------------------------------------
@@ -1716,6 +1919,14 @@ if [[ "$no_launch" == "true" ]]; then
   exit 0
 fi
 
+# The janitor pass: a real launch reclaims what dead sessions left behind, so a
+# leaked proxy or HOME lives at most until the next launch. The dump seams are
+# read-only and skip it.
+if [[ -z "$dump" ]]; then
+  reap_orphan_proxies >/dev/null
+  reap_dead_homes >/dev/null
+fi
+
 # csb runs inside a devShell. Prefer the repo's own flake devShell; if the repo
 # has none for this system, fall back to a generic devShell from csb's own
 # flake so the sandbox can still run against repos that don't ship a flake.
@@ -1749,8 +1960,9 @@ fi
 # flake inputs (all nix runs host-side, unsandboxed — the trust model).
 #  - persistent namespace -> HOME=<ns>, CLAUDE_CONFIG_DIR=<ns>/.claude (set
 #    explicitly so .claude.json lands there too).
-#  - -E/--ephemeral        -> a throwaway HOME under $TMPDIR (the OS reaps it;
-#    deliberately not under any denied path, so it needs no re-allow).
+#  - -E/--ephemeral        -> a throwaway HOME under $TMPDIR (the janitor reaps
+#    a random one once its session is gone, the OS the named kind; deliberately
+#    not under any denied path, so it needs no re-allow).
 env_overrides=()
 if [[ "$real_home" == "true" ]]; then
   # --real-home: no HOME / CLAUDE_CONFIG_DIR override -- the env scrub keeps the
@@ -1770,15 +1982,18 @@ elif [[ -n "$ephemeral_name" ]]; then
   # ~/.csb/claudes entry, no provenance stamp, untracked by --list-ns; the OS
   # reaps it from tmp. Both panes must resolve the same base (set tmpdir= in
   # config, or keep $TMPDIR stable) for the paths to coincide.
-  claude_home="${cfg_tmpdir:-${TMPDIR:-/tmp}}/csb-home-$ephemeral_name"
+  claude_home="$(tmp_base)/csb-home-$ephemeral_name"
   (umask 077; mkdir -p "$claude_home")
   env_overrides=("HOME=$claude_home")
   claude_json="$claude_home/.claude.json"
   vecho "$PROG: named ephemeral HOME (reusable): $claude_home"
 else
-  claude_home="$(mktemp -d "${cfg_tmpdir:-${TMPDIR:-/tmp}}/csb-home.XXXXXX")"
+  claude_home="$(mktemp -d "$(tmp_base)/csb-home.XXXXXX")"
   env_overrides=("HOME=$claude_home")
   claude_json="$claude_home/.claude.json"
+  # The owner stamp reap_dead_homes reads: this HOME is nobody else's, and it
+  # dies with pid $$ (preserved by the launch exec).
+  printf '%s\n' "$$" >"$claude_home/.csb-owner"
   vecho "$PROG: ephemeral HOME: $claude_home"
 fi
 # Seed user-level files into the launch HOME from the template dir, BEFORE the

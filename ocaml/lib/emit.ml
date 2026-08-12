@@ -48,8 +48,10 @@ let records c =
       ("reseed", b c.reseed);
       ("accent", s (Dump.opt c.accent));
       ("cfg_tmpdir", s (Dump.opt c.cfg_tmpdir));
+      ("tmp_base", s c.tmp_base);
       ("token_cmd", s (Dump.opt c.token_cmd));
       ("filter_egress", b c.filter_egress);
+      ("allow_loopback", b c.allow_loopback);
       ("claude_args", c.claude_args);
       ("keep", c.keep);
       ("setenv", setenv_words);

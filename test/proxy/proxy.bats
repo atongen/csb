@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Egress-proxy tests (docs/PLAN-008-proxy.md section 2).
+# Egress-proxy tests (docs/PLAN-009-proxy.md section 2).
 #
 # NOT part of `make test`: that tier is dump-only and hermetic. These start a
 # real csb-proxy and drive curl through it. Most cases are still offline -- a

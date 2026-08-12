@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 # Tier 1: the repo-selected config layer -- ~/.config/csb/config and its
-# config.local overlay (docs/PLAN-008-proxy.md section 5).
+# config.local overlay (docs/PLAN-009-proxy.md section 5).
 #
 # Sections are selected by the physical main checkout root, which reaches
 # csb-config as CSB_MAIN_ROOT: setting it directly is what keeps these tests
@@ -279,6 +279,45 @@ setup_root() { export CSB_MAIN_ROOT="$REPO"; }
   assert_success
   dump_config --no-tmpdir
   assert_line "cfg_tmpdir="
+}
+
+# tmp_base is the RESOLVED answer cfg_tmpdir is only an input to: bin/csb reads
+# it back rather than recomputing the fallback, so an operator can ask where csb
+# writes on a given host instead of remembering per-platform rules.
+@test "tmp_base resolves to the tmpdir when one is set" {
+  setup_root
+  mkdir -p "$TEST_TMP/td"
+  write_config config "[*]" "tmpdir=$TEST_TMP/td"
+  dump_config
+  assert_success
+  # Compared to each other, never to the literal that was written: a tmpdir= is
+  # path-resolved, and on macOS /tmp is a symlink to /private/tmp, so the value
+  # that comes back is not the string given. The invariant is that a set knob IS
+  # the base, whatever spelling it resolved to.
+  local cfg base
+  cfg="$(printf '%s\n' "$output" | sed -n 's/^cfg_tmpdir=//p')"
+  base="$(printf '%s\n' "$output" | sed -n 's/^tmp_base=//p')"
+  [ -n "$cfg" ]
+  [ "$base" = "$cfg" ]
+}
+
+@test "tmp_base falls back to TMPDIR, then to /tmp" {
+  setup_root
+  mkdir -p "$TEST_TMP/systmp"
+  # No knob: the plain environment answers, and cfg_tmpdir stays empty -- the
+  # two are input and resolved answer, not synonyms. The fallback is taken
+  # VERBATIM, unlike a tmpdir= above: it is never validated, so an operator's
+  # stale TMPDIR cannot make every launch fatal, and it is not path-resolved
+  # either. That asymmetry is the reason this asserts a literal and the test
+  # above does not.
+  TMPDIR="$TEST_TMP/systmp" dump_config --no-tmpdir
+  assert_success
+  assert_line "cfg_tmpdir="
+  assert_line "tmp_base=$TEST_TMP/systmp"
+
+  TMPDIR= dump_config --no-tmpdir
+  assert_success
+  assert_line "tmp_base=/tmp"
 }
 
 @test "a tmpdir that does not exist is fatal" {

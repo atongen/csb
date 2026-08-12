@@ -27,6 +27,7 @@ type t = {
   accent : string Layer.t;
   args : string Layer.t;
   filter_egress : bool option;
+  allow_loopback : bool option;
   keep : string list;
   setenv : (string * string) list;
   deny_read : string list;
@@ -45,7 +46,7 @@ let empty =
     pasteboard = None; sandbox = None; here = None; seed_creds = None;
     seed_home = Layer.Unset; tmpdir = Layer.Unset; accent = Layer.Unset;
     args = Layer.Unset;
-    filter_egress = None; keep = []; setenv = []; deny_read = [];
+    filter_egress = None; allow_loopback = None; keep = []; setenv = []; deny_read = [];
     allow_write = []; allow_socket = []; allow_hosts = []; allow_ports = [];
     paranoid_deny_read = []; paranoid_allow_read = [];
   }
@@ -87,8 +88,8 @@ let known_keys =
   "ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, \
    real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
    nix_target_claude, seed_creds, seed_home, tmpdir, accent, args, keep, setenv, \
-   deny_read, allow_write, allow_socket, filter_egress, allow_host, \
-   allow_port, paranoid_deny_read, paranoid_allow_read"
+   deny_read, allow_write, allow_socket, filter_egress, allow_loopback, \
+   allow_host, allow_port, paranoid_deny_read, paranoid_allow_read"
 
 (* An empty value RETRACTS the key, so no layer below answers either: a repo
    default in ~/.config/csb/config is cancelled by `token_cmd=` in the profile
@@ -134,6 +135,7 @@ let apply env ~where d key value =
   | "allow_write" -> keep_layer { p with allow_write = p.allow_write @ [ path () ] }
   | "allow_socket" -> keep_layer { p with allow_socket = p.allow_socket @ [ path () ] }
   | "filter_egress" -> keep_layer { p with filter_egress = b () }
+  | "allow_loopback" -> keep_layer { p with allow_loopback = b () }
   | "allow_host" ->
       keep_layer
         { p with
@@ -265,6 +267,7 @@ let overlay ~base ~over =
     accent = Layer.over over.accent base.accent;
     args = Layer.over over.args base.args;
     filter_egress = s over.filter_egress base.filter_egress;
+    allow_loopback = s over.allow_loopback base.allow_loopback;
     keep = base.keep @ over.keep;
     setenv = dedupe_setenv (base.setenv @ over.setenv);
     deny_read = base.deny_read @ over.deny_read;

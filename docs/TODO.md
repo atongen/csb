@@ -90,7 +90,7 @@
       working tree. Reason: operator choice -- csb stays private and
       unredistributed for now, and licensing implications are deferred (the
       agent-sandbox rebase that raised the question was since rejected on
-      technical grounds). See docs/PLAN-008-proxy.md appendix A.1.
+      technical grounds). See docs/PLAN-009-proxy.md appendix A.1.
 - [ ] revisit the deny-list defaults after the first month of use (blacklist
       completeness is the standing risk; see docs/PLAN-002.md risks). Floor was
       expanded once already; `--paranoid` (whitelist reads) is the escape hatch
@@ -130,3 +130,21 @@
       destinations of an exfiltration, not its content: the proxy does not
       decrypt, so there is no per-path or per-method filtering. The second
       boundary above remains the higher-leverage move.
+- [ ] VERIFY ON NIXOS: the Linux `--filter-egress` namespace now has a PRIVATE
+      loopback -- pasta runs with `-t none -u none -U none` and an explicit
+      `-T <proxy_port>[,<allow_port>...]` instead of the default `auto`
+      forwarding, which had mapped every host-bound loopback port into the
+      namespace and left the nft port set as the only thing narrowing it. Two
+      payoffs: the isolation stops depending on one rule, and `--allow-loopback`
+      costs nothing on Linux (intra-sandbox loopback free, host loopback still
+      shut) rather than what it costs on macOS, where one shared loopback makes
+      the same split impossible. A third payoff was not the goal: `-t auto` had
+      also published ports the SANDBOX bound onto the host's loopback, since
+      that direction's `auto` forwards "all ports currently bound in namespace"
+      -- a dev server started inside a filtered sandbox was reachable from the
+      host without anything asking for it. `-t none` closes it.
+      Flag semantics confirmed against pasta 2025_09_19.623dbf6 (`-T/--tcp-ns`
+      is the namespace->host direction, `none` and comma-lists valid for all
+      four). RUNTIME still unmeasured: `make test-escape` plus a `curl` through
+      the proxy is what settles it, and the proxy path is what breaks if the
+      forwarding is wrong.

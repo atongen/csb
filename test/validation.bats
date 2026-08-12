@@ -279,7 +279,7 @@ load helpers
   assert_success
 }
 
-# --- egress filtering (docs/PLAN-008-proxy.md P2) ---------------
+# --- egress filtering (docs/PLAN-009-proxy.md P2) ---------------
 
 @test "an invalid --allow-host is refused" {
   dump_config --allow-host 'bad host'
@@ -345,6 +345,30 @@ load helpers
 }
 
 # bats test_tags=dump-sandbox
+@test "--allow-loopback replaces the per-port rules with a loopback wildcard" {
+  [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-port 5432 --allow-loopback
+  assert_success
+  assert_line '(allow network-outbound (remote ip "localhost:*"))'
+  # Subsumed, so not also emitted -- a reader sees one answer for loopback.
+  refute_line '(allow network-outbound (remote ip "localhost:<PROXY_PORT>"))'
+  refute_line '(allow network-outbound (remote ip "localhost:5432"))'
+  # Off-host egress is still only the proxy's business.
+  refute_line '(allow network-outbound (remote ip "*:*"))'
+}
+
+# bats test_tags=dump-sandbox
+@test "--allow-loopback widens nothing without --filter-egress" {
+  [[ "$(uname -s)" == Darwin ]] || skip "macOS only (Linux --dump-sandbox emits bwrap argv, which has no network rules)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --allow-loopback
+  assert_success
+  assert_line '(allow network-outbound (remote ip "*:*"))'
+  refute_line '(allow network-outbound (remote ip "localhost:*"))'
+}
+
+# bats test_tags=dump-sandbox
 @test "--filter-egress on Linux wraps bwrap in a pasta netns with an nft ruleset" {
   [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS enforces via the seatbelt profile)"
   local repo; repo="$(fake_repo)"
@@ -357,6 +381,42 @@ load helpers
   assert_line '    oif "lo" tcp dport { <PROXY_PORT> } accept'
   # bwrap itself never unshares net -- that namespace is pasta's.
   refute_line "--unshare-net"
+}
+
+# bats test_tags=dump-sandbox
+@test "the Linux namespace carries only the named ports off its loopback" {
+  # pasta's default is `auto` in both directions: every port bound on the host's
+  # loopback would exist inside the namespace, leaving the nft set as the only
+  # thing between the sandbox and them. The explicit spec is what makes the
+  # namespace's loopback private, so assert the whole shape rather than -T alone
+  # -- an `auto` creeping back into any one direction is the regression.
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS has one loopback, shared with the host)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-port 5432
+  assert_success
+  assert_output --partial "-t
+none
+-u
+none
+-U
+none
+-T
+<PROXY_PORT>,5432"
+  refute_line "auto"
+}
+
+# bats test_tags=dump-sandbox
+@test "--allow-loopback does not widen what the Linux namespace carries" {
+  # The two narrowings are independent: --allow-loopback is about what the
+  # sandbox may DIAL, and must not put a host service back inside the namespace.
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-loopback
+  assert_success
+  assert_output --partial "-T
+<PROXY_PORT>"
+  refute_line "auto"
+  refute_line "all"
 }
 
 # bats test_tags=dump-sandbox
@@ -397,4 +457,17 @@ load helpers
   assert_success
   refute_line "$CSB_NFT_BIN"
   refute_output --partial "csb_filter_egress"
+}
+
+# bats test_tags=dump-sandbox
+@test "--allow-loopback replaces the Linux nft port set with a loopback accept" {
+  [[ "$(uname -s)" == Linux ]] || skip "Linux only (macOS enforces via the seatbelt profile)"
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --filter-egress --allow-host a.example.com --allow-port 5432 --allow-loopback
+  assert_success
+  assert_line '    oif "lo" accept'
+  refute_output --partial "tcp dport"
+  # The namespace still has no address and no default route, and the chain still
+  # drops what does not leave over lo.
+  assert_line "    type filter hook output priority 0; policy drop;"
 }

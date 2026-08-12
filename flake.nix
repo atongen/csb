@@ -69,7 +69,7 @@
           # on the host. (macOS uses /usr/bin/sandbox-exec — nothing to build.)
           bwrap = pkgs.bubblewrap;
 
-          # --filter-egress on Linux (docs/PLAN-008-proxy.md section 4): bwrap
+          # --filter-egress on Linux (docs/PLAN-009-proxy.md section 4): bwrap
           # has no socket filter, so enforcing the proxy allowlist needs a real
           # network namespace. pasta (same binary as passt, `pkgs.passt`)
           # creates and services it; nftables drops everything in that
@@ -98,7 +98,7 @@
               (pkgs.bats.withLibraries (p: [ p.bats-support p.bats-assert ]))
 
               # OCaml toolchain for the config-resolution layer under ocaml/
-              # (docs/PLAN-008-proxy.md section 9). cmdliner parses csb-config's
+              # (docs/PLAN-009-proxy.md section 9). cmdliner parses csb-config's
               # flag surface; yojson serializes the bash <-> OCaml seam.
               pkgs.ocamlPackages.ocaml
               pkgs.dune_3

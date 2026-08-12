@@ -1,4 +1,4 @@
-(* csb-config -- csb's config-resolution layer (docs/PLAN-008-proxy.md section 9).
+(* csb-config -- csb's config-resolution layer (docs/PLAN-009-proxy.md section 9).
 
    A pure function of (argv, config files, env): no git, no nix, no exec, and no
    writes beyond the emit file. It answers --dump-config, --help and --version
@@ -148,7 +148,7 @@ let man =
        paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, \
        nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, \
        tmpdir, accent, args, keep, setenv, deny_read, allow_write, \
-       allow_socket, filter_egress, allow_host, allow_port, \
+       allow_socket, filter_egress, allow_loopback, allow_host, allow_port, \
        paranoid_deny_read, paranoid_allow_read.";
     `P
       "The three HOME selectors -- ns, ephemeral, real_home -- are one axis, as \

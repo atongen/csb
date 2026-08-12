@@ -22,7 +22,7 @@ table inet csb_filter_egress {
   chain output {
     type filter hook output priority 0; policy drop;
     ct state established,related accept
-    oif "lo" tcp dport { <PROXY_PORT>, 5432 } accept
+    oif "lo" accept
   }
 }>
 <BWRAP>

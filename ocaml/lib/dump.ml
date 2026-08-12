@@ -11,6 +11,7 @@ let mode_name = function
   | Launch -> "launch"
   | Delete -> "delete"
   | List_ns -> "list_ns"
+  | Reap -> "reap"
 
 let is_here = function Here -> true | List_worktrees | Branch _ -> false
 let branch_name = function Branch b -> b | Here | List_worktrees -> ""
@@ -59,6 +60,7 @@ let to_lines c =
     ("reseed", string_of_bool c.reseed);
     ("accent", opt c.accent);
     ("cfg_tmpdir", opt c.cfg_tmpdir);
+    ("tmp_base", c.tmp_base);
     ("token_cmd", (match c.token_cmd with Some _ -> "present" | None -> "absent"));
     ("claude_args", joined c.claude_args);
     ("keep", joined c.keep);
@@ -67,6 +69,7 @@ let to_lines c =
     ("allow_write", joined c.allow_write);
     ("allow_socket", joined c.allow_socket);
     ("filter_egress", string_of_bool c.filter_egress);
+    ("allow_loopback", string_of_bool c.allow_loopback);
     ("allow_host", joined c.allow_hosts);
     ("allow_port", joined (List.map string_of_int c.allow_ports));
     ("paranoid_deny_read", joined c.paranoid_deny_read);

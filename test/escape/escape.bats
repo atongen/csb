@@ -18,7 +18,10 @@ setup() {
   bats_load_library bats-assert
 
   CSB="${CSB:-$BATS_TEST_DIRNAME/../../bin/csb}"
-  REPO="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
+  # pwd -P: an absolute path through a symlinked ancestor under the real HOME
+  # (a common layout: ~/src -> /Volumes/src) is unreadable from inside the
+  # sandbox -- the HOME read deny covers the symlink itself.
+  REPO="$(cd "$BATS_TEST_DIRNAME/../.." && pwd -P)"
 
   # sandbox-exec cannot nest, and bwrap-in-bwrap is not what these assert.
   [[ -z "${CSB_SANDBOX:-}" ]] || skip "already inside csb (nested launch is impossible)"
@@ -28,9 +31,12 @@ setup() {
 # csb_run ARGS... -- a real, sandboxed, shell-mode launch in csb's own repo.
 # -E keeps it off the operator's namespace; --here avoids creating a worktree.
 csb_run() {
-  run bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$REPO" \
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
     "$CSB" -s -E --here -- "$@"
 }
+# 3>&- above and at every direct launch below: a --filter-egress proxy outlives
+# its launch by design, and holding bats' fd 3 would make the suite wait on an
+# EOF that never comes. See usable.bats for the long form.
 
 @test "escape: open(1) cannot reach LaunchServices (F1)" {
   [[ "$(uname -s)" == Darwin ]] || skip "macOS only"
@@ -51,7 +57,7 @@ csb_run() {
   # makes the pasteboard allows hand LaunchServices a route back, this fails
   # and the flag has to go.
   [[ "$(uname -s)" == Darwin ]] || skip "macOS only"
-  run bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$REPO" \
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
     "$CSB" -s -E --here --pasteboard -- /usr/bin/open -g -a Calculator
   assert_failure
 }
@@ -63,7 +69,7 @@ csb_run() {
   [[ "$(uname -s)" == Darwin ]] || skip "macOS only"
   local host; host="$(/usr/bin/pbpaste | wc -c | tr -d ' ')"
   [[ "$host" != "0" ]] || skip "host clipboard is empty; nothing to measure"
-  run bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$REPO" \
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
     "$CSB" -s -E --here --pasteboard -- bash -c '/usr/bin/pbpaste | wc -c'
   assert_success
   assert_output --partial "$host"
@@ -112,7 +118,7 @@ csb_run() {
   sdrun="$(command -v systemd-run || echo /run/current-system/sw/bin/systemd-run)"
   [[ -x "$sdrun" ]] || skip "no systemd-run"
   # Set the vars the escape needs: the env scrub removing them is not the fix.
-  run bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$REPO" \
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
     "$CSB" -s -E --here -- env "XDG_RUNTIME_DIR=/run/user/$(id -u)" \
       "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" \
       "$sdrun" --user --wait --unit=csb-escape-test /bin/sh -c 'exit 0'

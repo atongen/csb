@@ -129,6 +129,7 @@ csb -E=work --here               # named ephemeral: reusable throwaway HOME (att
 csb -n feature/foo               # just prepare/reuse the worktree, don't launch (prints its path)
 csb -d feature/foo               # remove the worktree (branch and per-repo HOME are kept)
 csb --list-ns                    # list csb namespace configs (per-repo + shared @)
+csb --reap                       # reclaim what dead sessions left (proxies, ephemeral HOMEs)
 csb                              # list csb worktrees
 ```
 
@@ -213,7 +214,9 @@ normally live in `$HOME` (npm, bundler, ...) rebuild there and persist. The whol
   never auto-removes it (retire it manually: `rm -rf ~/.csb/claudes/@NAME`).
 - **`-E`, `--ephemeral`** -- throwaway config/HOME under `$TMPDIR`, no namespace.
   Mutually exclusive with `--ns`. A bare `-E` mints a random throwaway dir, so
-  there is nothing a second invocation can reattach to.
+  there is nothing a second invocation can reattach to; once its session ends,
+  the next launch (or `csb --reap`) deletes it -- it may hold a seeded
+  credential, so it does not wait on the OS temp reaper.
 - **`-E=NAME`, `--ephemeral=NAME`** -- a **named** ephemeral: the throwaway HOME
   is `$TMPDIR/csb-home-NAME` (deterministic) instead of random, so a sibling
   shell in another pane can attach to the exact same environment:
@@ -241,6 +244,14 @@ branch checked out in the main tree or a hand-made worktree is left alone.
 default (`repo-<key>`), any others from sibling repos, and the shared `@` ones.
 None are ever auto-removed. Dirs left over from the pre-0.3 per-branch layout are
 flagged as legacy; remove them manually when convenient.
+
+`csb --reap` reclaims what sessions that no longer exist left behind: orphaned
+`csb-proxy` processes (each is killed and its allowlist file removed) and random
+`-E` HOMEs whose owning session is gone. Every launch runs the same pass
+quietly, so leftovers live at most until the next launch; `--reap` is the
+on-demand form and reports what it did. A live session is never touched: a
+running proxy has a live parent, and a random HOME carries its owner's pid in
+`.csb-owner` -- a dir without that stamp is only reported, never deleted.
 
 ## Config layers
 
@@ -352,6 +363,9 @@ allow_socket=/tmp/.s.PGSQL.5432           # as --allow-socket: reachable unix so
 filter_egress=true                        # as --filter-egress: HTTPS only via csb-proxy, allowlisted
 allow_host=api.anthropic.com              # as --allow-host: allowed under filtering; repeatable
 allow_port=5432                           # as --allow-port: allowed localhost TCP port; repeatable
+allow_loopback=true                       # as --allow-loopback: every localhost TCP port, for a test
+                                          # runner whose helper picks its own; widens what --allow-port
+                                          # names one at a time
 paranoid_deny_read=/Volumes               # as --paranoid-deny-read: extra deny under --paranoid; repeatable
 paranoid_allow_read=~/ref                 # as --paranoid-allow-read: re-expose read-only under --paranoid;
                                           # repeatable; rejected if it overlaps a deny
@@ -735,6 +749,34 @@ empty allowlist is an error rather than a silent blackhole.
 so a dev server or database on the host stays reachable while everything else
 stays filtered.
 
+### `--allow-loopback`, when the port cannot be named
+
+Some toolchains talk to a helper process over loopback on a port the *kernel*
+picks: `flutter test` binds `127.0.0.1:0` and has `flutter_tester` connect back,
+and a dart VM service or a browser driver does the same. There is no port to pass
+to `--allow-port`, so under filtering the connect is refused on macOS and dropped
+on Linux -- which is a hang, not an error.
+
+`--allow-loopback` (profile `allow_loopback=`) allows **every** loopback TCP port
+instead. It replaces the per-port rules rather than adding to them, so there is
+one loopback answer per platform: `(remote ip "localhost:*")` in the seatbelt
+profile, `oif "lo" accept` in the nft ruleset. Off-host egress is untouched --
+still the proxy and the allowlist, nothing else.
+
+What it costs differs, because one platform can separate the sandbox's loopback
+from the host's and the other cannot:
+
+- **Linux** -- nothing beyond the sandbox itself. The namespace's loopback is
+  private: pasta carries only the proxy port and any `--allow-port` out to the
+  host, so widening what the sandbox may dial reaches its own processes and no
+  one else's.
+- **macOS** -- every service listening on the host's loopback becomes reachable
+  again. There is one loopback, shared, and seatbelt cannot tell the sandbox's
+  own peer from the host's. That includes every other live csb session's
+  `csb-proxy`: a loopback-widened sandbox can CONNECT through a sibling
+  session's proxy, so its effective egress allowlist is the union of every
+  concurrent session's. Prefer `--allow-port` here whenever the port is known.
+
 ### It is enforced, not advisory
 
 A direct dial that ignores `HTTPS_PROXY` fails *even to an allowed host* --
@@ -746,14 +788,20 @@ end-to-end on both platforms.
 The mechanisms differ, the guarantee does not:
 
 - **macOS** -- the seatbelt profile's blanket IP-egress allow is *replaced* by
-  the proxy's loopback port plus any `--allow-port`, so no rule ordering can let
-  a wildcard win.
+  the proxy's loopback port plus any `--allow-port` (or, under
+  `--allow-loopback`, by loopback at large), so no rule ordering can let a
+  wildcard win.
 - **Linux** -- bwrap has no socket filter, so the whole launch runs inside a
   network namespace created by `pasta`, with an nftables default-drop ruleset
   loaded before anything in the sandbox runs. The namespace gets no address and
-  no default route, so off-host traffic has nowhere to go; pasta forwards its
-  loopback to the host's, and the ruleset narrows that forwarding to the allowed
-  ports.
+  no default route, so off-host traffic has nowhere to go. Its loopback is
+  private: pasta is told to carry exactly the proxy port and any `--allow-port`
+  out to the host's loopback and nothing else, so a host service the operator
+  did not name has no presence inside the namespace at all -- and the ruleset
+  then narrows what the sandbox may dial a second time, independently. The
+  privacy runs both ways: a server the sandbox itself listens on is not
+  published to the host either, so under `--filter-egress` a dev server started
+  inside is not reachable from a host browser.
 
 The Linux namespace also closes the abstract-unix-socket gap (X11 keystroke
 injection) as a side effect -- abstract sockets are namespace-scoped. See
@@ -788,6 +836,12 @@ Two things to expect. Under `--no-sandbox` egress is **not** filtered -- the
 sandbox profile is the enforcement -- and csb says so rather than pretending.
 And on Linux a blocked port is *dropped*, not refused, so a connection to one
 hangs until the client's own timeout; macOS refuses immediately.
+
+The proxy lives only as long as its session: one whose session is gone is an
+orphan, killed (with its allowlist file removed) by the next launch's janitor
+pass or by `csb --reap`. This matters beyond tidiness -- an orphan still
+listens on the host's loopback with its old allowlist, and on macOS
+`--allow-loopback` would let a later sandbox reach it.
 
 ## Choosing the nix target
 
@@ -1083,7 +1137,7 @@ docs/PLAN-003.md           roadmap: VM second boundary (not implemented)
 docs/PLAN-004.md           the pre-release audit: findings, fixes, scope decisions
 docs/PLAN-005-tests.md     the test-suite plan (dump seams + bats tiers)
 docs/PLAN-007-escape.md    the sandbox-escape investigation and what it closed
-docs/PLAN-008-proxy.md     egress filtering, and the OCaml config layer
+docs/PLAN-009-proxy.md     egress filtering, and the OCaml config layer
 docs/TODO.md               current state and next steps
 ```
 

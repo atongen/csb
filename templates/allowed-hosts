@@ -5,7 +5,7 @@
 # Derived from Anthropic's documented network requirements, not guessed:
 # https://code.claude.com/docs/en/network-config
 # Rationale per host, and the droppable ones, are in
-# docs/PLAN-008-proxy.md section 9a.
+# docs/PLAN-009-proxy.md section 9a.
 #
 # Format: one host per line; `#` comments and blank lines ignored. A leading
 # `*.` matches subdomains only, so list a bare parent domain separately when it

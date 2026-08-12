@@ -2372,3 +2372,59 @@ validity, nowhere else.
 
 **One claim retired:** section 9's spike showed the arg *parser* was never the
 OCaml selling point. The ADTs and the merge monoid are.
+
+---
+
+## Appendix C -- nice-to-have: one temp base for the host and the sandbox
+
+Found 2026-08-13 while closing out PLAN-008-loopback section 9. Not urgent, not
+a correctness bug, and deliberately NOT landed with that work -- it moves Tier-2
+goldens on BOTH platforms, so it costs a two-host round trip and would have
+invalidated a macOS run that had just gone green. Recorded so it is not
+rediscovered.
+
+### The inconsistency
+
+`tmp_base()` (`bin/csb`, resolved by csb-config and reported as `tmp_base=` in
+`--dump-config`) is the one directory every temp path a LAUNCH writes sits
+under. But two places still key off `cfg_tmpdir`, the raw knob, rather than the
+resolved base:
+
+- `bin/csb:672` -- `build_write_roots` adds `cfg_tmpdir` to the write roots.
+- `bin/csb:2001` -- the sandbox's own `TMPDIR` is forwarded ONLY when
+  `cfg_tmpdir` is set.
+
+So with no `tmpdir=` knob (macOS today) the host writes csb's litter under
+`tmp_base()` while the sandboxed agent gets whatever `nix develop` handed it --
+a transient `/tmp/nix-shell.XXXXXX`. Two temp directories per launch, and which
+one you get depends on whether a knob is set. That is the whole defect.
+
+### Do the two halves together -- B without A is a bug
+
+The obvious change is B (forward unconditionally). Alone it is WRONG: forwarding
+`TMPDIR=<tmp_base>` while the write roots still key off `cfg_tmpdir` hands the
+sandbox a `TMPDIR` it cannot write, in exactly the no-knob case the change
+exists to fix. macOS hides it (the `/var/folders` parent is already a root);
+Linux with `TMPDIR` outside `/tmp` and no knob would break. And A alone is
+nearly a no-op. One change, A first:
+
+    A. build_write_roots: cand+=("$(tmp_base)")   instead of cfg_tmpdir
+    B. env_overrides:     TMPDIR=$(tmp_base)      unconditionally
+
+### Why it is only a nice-to-have
+
+No correctness or security consequence was found. The write-root gap does not
+bite today because `/tmp` is added unconditionally (`bin/csb:668`), macOS adds
+the `/var/folders` parent, and the ephemeral HOME is added explicitly by name
+whatever the base. The only real cost is comprehensibility, plus sandbox scratch
+landing where nothing reaps it -- **measured at 2.3M across 517 `nix-shell.*`
+dirs in five weeks on the NixOS host, only 32 of them non-empty.** That number
+is the argument for leaving it alone until there is appetite.
+
+### When it is done
+
+Expect Tier-2 goldens to move on both platforms (write roots are in them), so
+`make test-update` on each host, and read the diffs rather than accepting them
+blind. `make ci` on both. Note that PLAN-008's 9.4 predicted golden movement and
+was WRONG -- the paths it moved never appear in a dump. This one genuinely does
+change the roots, so an UNCHANGED golden here is the surprise worth chasing.

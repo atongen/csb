@@ -30,6 +30,7 @@ type t = {
   latest : bool option;
   verbose : bool option;
   filter_egress : bool option;
+  allow_loopback : bool option;
   nix : Types.nix_targets Layer.t;
   home : Types.home_sel Layer.t;
   seed_home : string Layer.t;
@@ -134,12 +135,14 @@ let setting ~pos ~neg ~cleared value =
   | None, false -> Layer.Unset
   | Some _, true -> Err.die "%s and %s are mutually exclusive" pos neg
 
-let mode ~delete ~list_ns =
-  match (delete, list_ns) with
-  | true, true -> Err.die "-d/--delete and --list-ns are mutually exclusive"
-  | true, false -> Types.Delete
-  | false, true -> Types.List_ns
-  | false, false -> Types.Launch
+let mode ~delete ~list_ns ~reap =
+  match (delete, list_ns, reap) with
+  | true, true, _ | true, _, true | _, true, true ->
+      Err.die "-d/--delete, --list-ns and --reap are mutually exclusive"
+  | true, false, false -> Types.Delete
+  | false, true, false -> Types.List_ns
+  | false, false, true -> Types.Reap
+  | false, false, false -> Types.Launch
 
 let dump ~config ~sandbox =
   match (config, sandbox) with
@@ -225,6 +228,16 @@ let term env pre =
         "List the namespace configs under ~/.csb/claudes: the per-repo default, \
          repo-<key>, and the shared @ ones. Flags any leftover directories from \
          the pre-0.3 per-branch layout."
+  and+ reap =
+    flag [ "reap" ]
+      ~doc:
+        "Reclaim what dead sessions left behind: kill orphaned egress proxies \
+         (removing the allowlist file each was reading) and delete random \
+         ephemeral HOMEs whose owning session is gone. A running session's \
+         proxy and HOME are never matched, nor is a proxy kept in a terminal \
+         by 'make proxy-run'; a HOME dir without an owner stamp is reported \
+         but left alone. HOMEs are sought under the configured tmpdir (else \
+         TMPDIR). Every launch runs the same pass quietly; this form reports."
   and+ no_launch =
     flag [ "n"; "no-launch" ]
       ~doc:
@@ -361,6 +374,18 @@ let term env pre =
          default: filtering breaks WebFetch for any host not on the list."
   and+ no_filter_egress =
     flag [ "no-filter-egress" ] ~docs:s_negate ~doc:"Cancel a profile filter_egress=true."
+  and+ allow_loopback =
+    flag [ "allow-loopback" ] ~docs:s_egress
+      ~doc:
+        "Under --filter-egress, allow loopback TCP to ANY port instead of only \
+         the proxy's and --allow-port's. A test runner that talks to a helper \
+         process over 127.0.0.1 on a kernel-assigned port -- flutter test, a \
+         dart VM service, a browser driver -- cannot name its port in advance, \
+         and hangs without this. It also re-exposes every service listening on \
+         the HOST's loopback, on both platforms, so prefer --allow-port when the \
+         port is known."
+  and+ no_allow_loopback =
+    flag [ "no-allow-loopback" ] ~docs:s_negate ~doc:"Cancel a profile allow_loopback=true."
   and+ no_nix_target =
     flag [ "no-nix-target" ] ~docs:s_negate ~doc:"Cancel all three profile nix_target keys."
   and+ no_token_cmd =
@@ -477,7 +502,7 @@ let term env pre =
          Rejected if it overlaps a deny. Repeatable."
   and+ positional = Arg.(value & pos_all string [] & info [] ~docv:"BRANCH") in
   {
-    mode = mode ~delete:(given delete) ~list_ns:(given list_ns);
+    mode = mode ~delete:(given delete) ~list_ns:(given list_ns) ~reap:(given reap);
     dump = dump ~config:(given dump_config) ~sandbox:(given dump_sandbox);
     no_launch = given no_launch;
     reseed = given reseed;
@@ -501,6 +526,9 @@ let term env pre =
     filter_egress =
       pair ~pos:"--filter-egress" ~neg:"--no-filter-egress" (given filter_egress)
         (given no_filter_egress);
+    allow_loopback =
+      pair ~pos:"--allow-loopback" ~neg:"--no-allow-loopback" (given allow_loopback)
+        (given no_allow_loopback);
     nix =
       nix_targets_of
         ~shared:

@@ -10,6 +10,7 @@
 #
 #   make install                      # bin/csb -> ~/bin, csb-config -> ~/.csb/bin
 #   make install BIN_DIR=~/.local/bin # ...or elsewhere
+#   make ci                           # every suite below, cheapest first
 #   make check                        # shellcheck the shell scripts
 #   make test                         # bats suite (dump-only, fast)
 #   make test-escape                  # Tier 3: real launches, run OUTSIDE csb
@@ -17,6 +18,11 @@
 #   make ocaml-test                   # the bats config tests against csb-config
 #   make test-proxy                   # egress-proxy tests (real proxy + curl)
 #   make proxy-run                    # run csb-proxy in the foreground
+#
+# `make test` is NOT the whole suite: bats does not recurse, so it runs
+# test/*.bats only -- test/escape/ and test/proxy/ have their own targets, and
+# the config oracle re-runs a subset against csb-config. `make ci` is the one
+# that runs all of them.
 #
 # `check`/`build` prefer a tool already on PATH and fall back to csb's own
 # devShell (nix develop), so they work with only Nix installed.
@@ -34,10 +40,10 @@ TOOLS_DEST := $(TOOLS_DIR)/csb-config
 CSB_SELF ?= git+ssh://git@git.grandrew.com/atongen/csb.git
 
 .DEFAULT_GOAL := help
-.PHONY: help install uninstall check test test-escape test-update test-proxy \
+.PHONY: help install uninstall ci check test test-escape test-update test-proxy \
         build update refresh ocaml-build ocaml-test proxy-run
 
-# The OCaml config-resolution layer (docs/PLAN-008-proxy.md s9).
+# The OCaml config-resolution layer (docs/PLAN-009-proxy.md s9).
 OCAML_DIR  := ocaml
 CSB_CONFIG := $(OCAML_DIR)/_build/default/bin/csb_config_cli.exe
 CSB_PROXY  := $(OCAML_DIR)/_build/default/bin/csb_proxy_cli.exe
@@ -46,7 +52,7 @@ CSB_PROXY  := $(OCAML_DIR)/_build/default/bin/csb_proxy_cli.exe
 PROXY_ALLOW ?= templates/allowed-hosts
 # Decision log csb-proxy also writes (stderr keeps streaming either way). A path
 # the SANDBOX can read, so a denied fetch is self-diagnosable rather than an
-# opaque transport error -- see docs/PLAN-008-proxy.md s7 item 4.
+# opaque transport error -- see docs/PLAN-009-proxy.md s7 item 4.
 # TMPDIR may or may not carry a trailing slash; normalize either form.
 PROXY_LOG ?= $(patsubst %/,%,$(or $(TMPDIR),/tmp))/csb-proxy.log
 
@@ -83,7 +89,28 @@ uninstall: ## Remove csb from BIN_DIR and csb-config from TOOLS_DIR
 	@rm -f "$(DEST)" "$(TOOLS_DEST)"
 	@echo "uninstall: removed $(DEST) and $(TOOLS_DEST)"
 
-SHELLSCRIPTS := bin/csb templates/home/.claude/statusline.sh
+# Ordered cheapest and most hermetic first, so a typo fails in seconds rather
+# than after a nix-heavy Tier 3. One $(MAKE) per line: passing several targets
+# to one would let -j reorder them.
+#
+# It refuses to run inside csb rather than skipping quietly. test-escape skips
+# every arm when CSB_SANDBOX is set (a nested launch is impossible), so an
+# in-sandbox run would print a wall of `ok ... # skip` and exit 0 -- a green
+# that verified none of Tier 3. test-update is deliberately absent: it rewrites
+# the goldens, so a CI target running it could only ever pass.
+ci: ## Every suite, cheapest first; refuses to run inside csb
+	@[ -z "$$CSB_SANDBOX" ] || { \
+		echo "ci: inside csb -- Tier 3 would skip silently and report green." >&2; \
+		echo "  run this on the host instead." >&2; exit 1; }
+	@$(MAKE) check
+	@$(MAKE) test
+	@$(MAKE) ocaml-test
+	@$(MAKE) test-proxy
+	@$(MAKE) test-escape
+	@echo "ci: all suites green"
+
+SHELLSCRIPTS := bin/csb templates/home/.claude/statusline.sh \
+                test/escape/loopback-probe.sh
 
 check: ## Lint the shell scripts with shellcheck
 	@if command -v shellcheck >/dev/null 2>&1; then \

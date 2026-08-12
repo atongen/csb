@@ -8,6 +8,7 @@ type mode =
   | Launch
   | Delete
   | List_ns
+  | Reap
 
 (* Neither BRANCH nor --here is a real third state -- the worktree listing. bash
    spells it as two empty variables. *)
@@ -79,6 +80,7 @@ type t = {
   seed_home : string option;
   accent : string option;
   cfg_tmpdir : string option;
+  tmp_base : string;  (* the resolved base every launch temp path sits under *)
   claude_args : string list;
   keep : string list;
   setenv : (string * string) list;
@@ -86,6 +88,7 @@ type t = {
   allow_write : string list;
   allow_socket : string list;
   filter_egress : bool;
+  allow_loopback : bool;
   allow_hosts : string list;
   allow_ports : int list;
   paranoid_deny_read : string list;

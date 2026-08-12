@@ -23,14 +23,20 @@ setup() {
   bats_load_library bats-assert
 
   CSB="${CSB:-$BATS_TEST_DIRNAME/../../bin/csb}"
-  REPO="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)"
+  # pwd -P: see escape.bats -- a symlinked ancestor under the real HOME makes
+  # the absolute path unreadable from inside the sandbox.
+  REPO="$(cd "$BATS_TEST_DIRNAME/../.." && pwd -P)"
 
   [[ -z "${CSB_SANDBOX:-}" ]] || skip "already inside csb (nested launch is impossible)"
   command -v nix >/dev/null 2>&1 || skip "nix not on PATH"
 }
 
+# 3>&- on every launch below: under --filter-egress csb leaves its proxy running
+# for the next launch's janitor to reap, and an inherited fd 3 is bats' output
+# channel -- the suite would then wait for an EOF the surviving proxy never
+# sends. csb must not know that fd 3 means anything, so the harness closes it.
 csb_run() {
-  run bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$REPO" \
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
     "$CSB" -s -E --here -- "$@"
 }
 
@@ -71,12 +77,44 @@ csb_run() {
   /usr/bin/nc -lU "$hostsock" >/dev/null 2>&1 &
   local listener=$!
   sleep 1
-  run bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$REPO" \
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
     "$CSB" -s -E --here --allow-socket "$hostsock" -- \
     bash -c 'echo hi | /usr/bin/nc -U '"$hostsock"'; echo "named=$?"'
   kill "$listener" 2>/dev/null || true
   rm -f "$hostsock"
   assert_output --partial "named=0"
+}
+
+@test "usable: --allow-loopback reaches a loopback port nothing named" {
+  # The flag's own point: under --filter-egress a kernel-assigned port cannot be
+  # named by --allow-port, so a test runner talking to its helper over 127.0.0.1
+  # is refused (macOS) or dropped (Linux, hence the timeout). Without this
+  # assertion the flag can rot to a silent no-op.
+  #
+  # Both ends run INSIDE the sandbox, which is the case the flag exists for and
+  # the only one that holds on Linux, where the namespace's loopback is private
+  # -- a host-side listener is unreachable there no matter what nft allows.
+  # csb-proxy is the listener because the repo already builds one that binds
+  # 127.0.0.1:0 and announces its port; a CONNECT to a host its allowlist does
+  # not name is answered without dialling anything, so the 403 proves a complete
+  # loopback round trip and nothing else.
+  local proxy="$REPO/ocaml/_build/default/bin/csb_proxy_cli.exe"
+  [[ -x "$proxy" ]] || skip "proxy not built: run 'make ocaml-build'"
+  local probe="$REPO/test/escape/loopback-probe.sh"
+
+  # listener=up is asserted in BOTH runs, so the negative below means "the dial
+  # was blocked" rather than "the probe fell over before dialling".
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
+    "$CSB" -s -E --here --filter-egress --allow-host api.anthropic.com -- \
+    bash "$probe" "$proxy"
+  assert_output --partial "listener=up"
+  refute_output --partial "reply=HTTP/1.1 403"
+
+  run bash -c 'cd "$1" || exit 1; shift; exec "$@" 3>&-' _ "$REPO" \
+    "$CSB" -s -E --here --filter-egress --allow-host api.anthropic.com \
+    --allow-loopback -- bash "$probe" "$proxy"
+  assert_output --partial "listener=up"
+  assert_output --partial "reply=HTTP/1.1 403"
 }
 
 @test "usable: outbound TCP+TLS to the claude API works" {

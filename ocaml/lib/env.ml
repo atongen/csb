@@ -8,6 +8,9 @@ type t = {
   latest : bool;        (* CSB_LATEST non-empty *)
   verbose : bool;       (* CSB_VERBOSE non-empty *)
   tmpdir : string option;  (* CSB_TMPDIR, as given *)
+  (* Plain TMPDIR. Only ever the FALLBACK under cfg_tmpdir, and unlike it never
+     validated: an operator's stale TMPDIR must not turn every launch fatal. *)
+  system_tmpdir : string option;
   (* CSB_MAIN_ROOT: the physical main checkout root the config sections are
      selected by. bin/csb derives it from git and passes it in, so repo identity
      has one implementation and this stays a function of its inputs. Absent
@@ -31,6 +34,7 @@ let of_process () =
     latest = getenv_nonempty "CSB_LATEST" <> None;
     verbose = getenv_nonempty "CSB_VERBOSE" <> None;
     tmpdir = getenv_nonempty "CSB_TMPDIR";
+    system_tmpdir = getenv_nonempty "TMPDIR";
     main_root = getenv_nonempty "CSB_MAIN_ROOT";
   }
 
