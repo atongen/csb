@@ -152,6 +152,25 @@ find_worktree() {
     '
 }
 
+# Echo why `git worktree remove` would refuse WT_PATH -- locked, submodule
+# entries in its index, or uncommitted/untracked files -- else nothing.
+# --delete preflights with this so the irreversible .worktreesetup.sh `down`
+# teardown only runs once the removal that follows it can succeed.
+worktree_remove_blocker() {
+  local repo_root="$1" wt_path="$2"
+  if [[ -n "$(git -C "$repo_root" worktree list --porcelain 2>/dev/null | \
+              awk -v wt="$wt_path" '
+                /^worktree / { cur = substr($0, 10) }
+                /^locked/    { if (cur == wt) print }
+              ')" ]]; then
+    echo "is locked"
+  elif [[ -n "$(git -C "$wt_path" ls-files --stage 2>/dev/null | awk '$1 == "160000"')" ]]; then
+    echo "contains submodules"
+  elif [[ -n "$(git -C "$wt_path" status --porcelain --ignore-submodules=none 2>/dev/null)" ]]; then
+    echo "has uncommitted or untracked files"
+  fi
+}
+
 branch_exists() {
   local repo_root="$1" branch="$2"
   git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch" || \
@@ -1871,10 +1890,18 @@ if [[ "$mode" == "delete" ]]; then
   if [[ -z "$wt_path" ]]; then
     [[ "$wt_refused" == "true" ]] || echo "$PROG: no worktree for '$branch'"
   elif [[ -d "$wt_path" ]]; then
+    blocker=$(worktree_remove_blocker "$repo_root" "$wt_path")
+    if [[ -n "$blocker" ]]; then
+      echo "$PROG: not deleting: worktree $wt_path $blocker" >&2
+      echo "  clean it up (commit/stash/unlock) and re-run $PROG -d $branch --" >&2
+      echo "  or force, skipping the .worktreesetup.sh down teardown:" >&2
+      echo "  git -C $repo_root worktree remove --force $wt_path" >&2
+      exit 1
+    fi
     run_worktreesetup down "$wt_path" "$branch"
     echo "$PROG: removing worktree $wt_path"
     if ! git -C "$repo_root" worktree remove "$wt_path"; then
-      echo "$PROG: worktree remove failed (uncommitted or untracked files?)" >&2
+      echo "$PROG: worktree remove failed" >&2
       echo "  to force: git -C $repo_root worktree remove --force $wt_path" >&2
       exit 1
     fi
