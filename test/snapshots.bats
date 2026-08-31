@@ -169,7 +169,7 @@ load helpers
 @test "snapshot: --no-sandbox emits no profile (shell only)" {
   # The launch degrades to `env ... path_shim cmd`; --dump-sandbox prints a
   # sentinel instead of a seatbelt profile / bwrap argv. Needs -s (csb refuses
-  # to run claude unsandboxed).
+  # to run an agent unsandboxed).
   local repo; repo="$(fake_repo feature/x)"
   dump_sandbox_snapshot "$repo" -s --no-sandbox
   assert_success

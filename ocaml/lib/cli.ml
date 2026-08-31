@@ -18,7 +18,7 @@ type t = {
   no_launch : bool;
   reseed : bool;
   branch : string option;
-  claude_args : string list option;  (* Some _ once `--` appeared, even if empty *)
+  agent_args : string list option;  (* Some _ once `--` appeared, even if empty *)
   profile : string option;
   shell : bool option;
   yolo : bool option;
@@ -33,9 +33,11 @@ type t = {
   allow_loopback : bool option;
   nix : Types.nix_targets Layer.t;
   home : Types.home_sel Layer.t;
+  agent : Types.agent Layer.t;
   seed_home : string Layer.t;
   accent : string Layer.t;
   token_cmd : string Layer.t;
+  token_env : string Layer.t;
   tmpdir : string Layer.t;
   setenv : (string * string) list;
   keep : string list;
@@ -52,7 +54,7 @@ type t = {
 
    Two shapes cmdliner cannot express, removed before it ever sees them:
 
-   - `--` ends csb's own options; everything after is claude's argv. cmdliner
+   - `--` ends csb's own options; everything after is the agent's argv. cmdliner
      would fold those tokens into the BRANCH positional.
    - `-E=NAME` / `--ephemeral=NAME` gives one flag an optional value. Declaring
      it that way (~vopt) makes `-E feature/foo` swallow the BRANCH positional,
@@ -60,8 +62,9 @@ type t = {
      flag behind, so BRANCH survives. *)
 
 let value_taking =
-  [ "-N"; "--ns"; "--nix-target"; "--nix-target-shell"; "--nix-target-claude";
-    "--seed-home"; "--accent"; "--token-cmd"; "--tmpdir"; "--setenv";
+  [ "-N"; "--ns"; "--agent"; "--nix-target"; "--nix-target-shell";
+    "--nix-target-agent";
+    "--seed-home"; "--accent"; "--token-cmd"; "--token-env"; "--tmpdir"; "--setenv";
     "-p"; "--profile"; "-k"; "--keep"; "--deny-read";
     "--allow-write"; "--allow-socket"; "--allow-host"; "--allow-port";
     "--paranoid-deny-read"; "--paranoid-allow-read" ]
@@ -77,7 +80,7 @@ let ephemeral_named tok =
 
 type pre = {
   opts : string list;              (* what cmdliner parses *)
-  rest : string list option;       (* claude's argv, once `--` appeared *)
+  rest : string list option;       (* the agent's argv, once `--` appeared *)
   eph_name : string option;
 }
 
@@ -185,12 +188,12 @@ let home_of ~ns ~ephemeral ~eph_name ~real_home ~per_repo =
   | None, true -> Layer.Cleared
   | None, false -> Layer.Unset
 
-let nix_targets_of ~shared ~for_shell ~for_claude ~cleared =
-  let any = shared <> None || for_shell <> None || for_claude <> None in
+let nix_targets_of ~shared ~for_shell ~for_agent ~cleared =
+  let any = shared <> None || for_shell <> None || for_agent <> None in
   if any && cleared then
     Err.die "--nix-target and --no-nix-target are mutually exclusive";
   if cleared then Layer.Cleared
-  else if any then Layer.Set { Types.shared; for_shell; for_claude }
+  else if any then Layer.Set { Types.shared; for_shell; for_agent }
   else Layer.Unset
 
 (* --- the term ---------------------------------------------------------------
@@ -225,9 +228,9 @@ let term env pre =
   and+ list_ns =
     flag [ "list-ns" ]
       ~doc:
-        "List the namespace configs under ~/.csb/claudes: the per-repo default, \
-         repo-<key>, and the shared @ ones. Flags any leftover directories from \
-         the pre-0.3 per-branch layout."
+        "List the namespace configs under ~/.csb/agents: the per-repo-per-agent \
+         defaults, repo-<key>-<agent>, and the shared @ ones. Flags any leftover \
+         directories from the pre-0.3 per-branch layout."
   and+ reap =
     flag [ "reap" ]
       ~doc:
@@ -265,7 +268,10 @@ let term env pre =
          with --here in a git repository."
   and+ yolo =
     flag [ "y"; "yolo" ]
-      ~doc:"Pass --dangerously-skip-permissions to claude, allowing every tool call."
+      ~doc:
+        "Pass the agent's skip-every-prompt flag, allowing every tool call. \
+         Which flag that is belongs to the agent (claude: \
+         --dangerously-skip-permissions)."
   and+ no_yolo = flag [ "no-yolo"; "yodo" ] ~docs:s_negate ~doc:"Cancel a profile yolo=true."
   and+ paranoid =
     flag [ "paranoid" ] ~docs:s_policy
@@ -292,7 +298,7 @@ let term env pre =
     flag [ "no-sandbox" ] ~docs:s_policy
       ~doc:
         "Drop the filesystem sandbox -- the seatbelt or bubblewrap wrapper -- for \
-         the launched process. SHELL ONLY: csb refuses to run claude \
+         the launched process. SHELL ONLY: csb refuses to run an agent \
          unsandboxed. The environment scrub, devShell, HOME policy and --keep \
          still apply; only the read/write lockdown is gone, so the shell has \
          full host filesystem access. With it, --paranoid and the deny/allow \
@@ -307,9 +313,10 @@ let term env pre =
   and+ per_repo =
     flag [ "per-repo" ] ~docs:s_home
       ~doc:
-        "Select the default per-repo HOME ~/.csb/claudes/repo-<key>, retracting \
-         an ns=, ephemeral= or real_home= chosen by any lower layer. The one \
-         negation for the whole HOME axis, since the axis has one answer."
+        "Select the default per-repo-per-agent HOME \
+         ~/.csb/agents/repo-<key>-<agent>, retracting an ns=, ephemeral= or \
+         real_home= chosen by any lower layer. The one negation for the whole \
+         HOME axis, since the axis has one answer."
   and+ here =
     flag [ "here" ]
       ~doc:
@@ -322,9 +329,9 @@ let term env pre =
     flag [ "s"; "shell" ]
       ~doc:
         "Drop into an interactive bash -- or run the arguments after -- as a \
-         command -- instead of claude, in the exact environment claude would \
-         get: same worktree, devShell, environment scrub, HOME redirection and \
-         deny-list."
+         command -- instead of the agent, in the exact environment the agent \
+         would get: same worktree, devShell, environment scrub, HOME redirection \
+         and deny-list."
   and+ no_shell = flag [ "no-shell" ] ~docs:s_negate ~doc:"Cancel a profile shell=true."
   and+ ephemeral =
     flag [ "E"; "ephemeral" ] ~docs:s_home
@@ -342,7 +349,8 @@ let term env pre =
          upstream HEAD, bypassing the committed flake.lock. The upstream rev is \
          checked at most once per CSB_LATEST_TTL seconds, daily by default, and \
          cached, then pinned so the rest of the day is fully cached. Trades \
-         reproducibility for always-newest."
+         reproducibility for always-newest. Specific to the claude-code flake; \
+         every other agent tracks csb's own nixpkgs input."
   and+ no_latest =
     flag [ "no-latest" ] ~docs:s_negate ~doc:"Cancel a profile latest=true or CSB_LATEST."
   and+ verbose =
@@ -355,10 +363,11 @@ let term env pre =
   and+ seed_creds =
     flag [ "seed-creds" ] ~docs:s_seed
       ~doc:
-        "Seed the HOST's native claude session credential -- macOS keychain, or \
-         ~/.claude on Linux -- into the launch config, so the sandbox presents \
-         your live subscription session instead of a long-lived token. It shares \
-         the refresh-token family with native claude."
+        "Seed the HOST's native session credential for the agent -- the macOS \
+         keychain, or the agent's own state dir elsewhere -- into the launch \
+         HOME, so the sandbox presents your live subscription session instead of \
+         a long-lived token. It shares the refresh-token family with the host \
+         install."
   and+ no_seed_creds =
     flag [ "no-seed-creds" ] ~docs:s_negate ~doc:"Cancel a profile seed_creds=true."
   and+ filter_egress =
@@ -391,6 +400,12 @@ let term env pre =
   and+ no_token_cmd =
     flag [ "no-token-cmd" ] ~docs:s_negate
       ~doc:"Cancel a configured token_cmd= and authenticate some other way."
+  and+ no_token_env =
+    flag [ "no-token-env" ] ~docs:s_negate
+      ~doc:"Cancel a configured token_env= and use the agent's own variable."
+  and+ no_agent =
+    flag [ "no-agent" ] ~docs:s_negate
+      ~doc:"Cancel a configured agent= and use the default, claude."
   and+ no_tmpdir =
     flag [ "no-tmpdir" ] ~docs:s_negate
       ~doc:"Cancel a configured tmpdir= and fall back to CSB_TMPDIR."
@@ -412,26 +427,42 @@ let term env pre =
         "As --nix-target, for -s/--shell runs only; it beats --nix-target when a \
          shell is the mode running. Whichever target wins also applies to \
          .worktreesetup.sh, which runs in the same devShell."
-  and+ nix_target_claude =
-    opt_str [ "nix-target-claude" ] ~docv:"NAME"
-      ~doc:"As --nix-target, for claude runs only; it beats --nix-target for those runs."
+  and+ nix_target_agent =
+    opt_str [ "nix-target-agent" ] ~docv:"NAME"
+      ~doc:"As --nix-target, for agent runs only; it beats --nix-target for those runs."
+  and+ agent =
+    opt_str [ "agent" ] ~docv:"NAME"
+      ~doc:
+        "Which agent CLI to launch. csb supplies its binary from its own flake, \
+         and the agent decides the credential variable, the yolo flag, the \
+         onboarding seed and the egress allowlist file. Only 'claude' for now, \
+         which is the default."
   and+ ns =
     opt_str [ "N"; "ns" ] ~docv:"NAME" ~docs:s_home
       ~doc:
-        "Use a shared, cross-repo HOME at ~/.csb/claudes/@NAME instead of the \
-         per-repo default. NAME and @NAME are equivalent; the @ is added if you \
-         omit it. Persistent, and never auto-removed by -d."
+        "Use a shared, cross-repo HOME at ~/.csb/agents/@NAME instead of the \
+         per-repo-per-agent default. NAME and @NAME are equivalent; the @ is \
+         added if you omit it. A shared namespace is NOT agent-suffixed -- \
+         naming one is already a sharing decision, and '-N work-codex' is how \
+         you keep them apart. Persistent, and never auto-removed by -d."
   and+ seed_home =
     opt_str [ "seed-home" ] ~docv:"DIR" ~docs:s_seed
       ~doc:
         "Seed the launch HOME, without overwriting, from template DIR: the \
-         user-level files -- CLAUDE.md, settings.json, rules/ -- that \
-         in-sandbox claude should otherwise miss, since the real ~/.claude is \
-         denied and HOME is redirected. Defaults to ~/.config/csb/home."
+         user-level files -- an agent's instructions file, settings, rules/ -- \
+         that the in-sandbox agent should otherwise miss, since its real state \
+         dir is denied and HOME is redirected. Defaults to ~/.config/csb/home."
   and+ token_cmd =
     opt_str [ "token-cmd" ] ~docv:"CMD"
       ~doc:
-        "Run CMD on the host, outside the sandbox, and pass its first line into          the launch as CLAUDE_CODE_OAUTH_TOKEN -- a secrets-manager read such as          'op read op://vault/claude/token'. The command is the configuration,          never the token, so it is safe in a config file; note that a value          given here reaches ps(1) and the shell history, which a config or          profile key does not."
+        "Run CMD on the host, outside the sandbox, and pass its first line into          the launch as the agent's credential variable (see --token-env) -- a          secrets-manager read such as 'op read op://vault/claude/token'. The          command is the configuration, never the token, so it is safe in a          config file; note that a value given here reaches ps(1) and the shell          history, which a config or profile key does not."
+  and+ token_env =
+    opt_str [ "token-env" ] ~docv:"VAR"
+      ~doc:
+        "The variable --token-cmd's output is exported into, and which the env \
+         scrub keeps. Defaults to the agent's own (claude: \
+         CLAUDE_CODE_OAUTH_TOKEN); name another to authenticate an agent through \
+         a provider key instead."
   and+ tmpdir =
     opt_str [ "tmpdir" ] ~docv:"DIR"
       ~doc:
@@ -507,7 +538,7 @@ let term env pre =
     no_launch = given no_launch;
     reseed = given reseed;
     branch = branch_of positional;
-    claude_args = pre.rest;
+    agent_args = pre.rest;
     profile = need ~msg:"--profile requires a non-empty NAME" profile;
     shell = pair ~pos:"-s/--shell" ~neg:"--no-shell" (given shell) (given no_shell);
     yolo = pair ~pos:"-y/--yolo" ~neg:"--no-yolo" (given yolo) (given no_yolo);
@@ -537,10 +568,15 @@ let term env pre =
         ~for_shell:
           (Option.map (Validate.nix_target ~where:"--nix-target-shell")
              (need ~msg:"--nix-target-shell requires a NAME" nix_target_shell))
-        ~for_claude:
-          (Option.map (Validate.nix_target ~where:"--nix-target-claude")
-             (need ~msg:"--nix-target-claude requires a NAME" nix_target_claude))
+        ~for_agent:
+          (Option.map (Validate.nix_target ~where:"--nix-target-agent")
+             (need ~msg:"--nix-target-agent requires a NAME" nix_target_agent))
         ~cleared:(given no_nix_target);
+    agent =
+      Layer.map
+        (Agent.of_string ~where:"--agent")
+        (setting ~pos:"--agent" ~neg:"--no-agent" ~cleared:(given no_agent)
+           (need ~msg:"--agent requires a NAME (--no-agent resets to claude)" agent));
     home =
       home_of
         ~ns:
@@ -563,6 +599,13 @@ let term env pre =
         (need
            ~msg:"--token-cmd requires a CMD (--no-token-cmd cancels a configured one)"
            token_cmd);
+    token_env =
+      Layer.map
+        (Validate.keep_var ~msg:"invalid env var name for --token-env")
+        (setting ~pos:"--token-env" ~neg:"--no-token-env" ~cleared:(given no_token_env)
+           (need
+              ~msg:"--token-env requires a VAR (--no-token-env uses the agent's own)"
+              token_env));
     tmpdir =
       setting ~pos:"--tmpdir" ~neg:"--no-tmpdir" ~cleared:(given no_tmpdir)
         (need ~msg:"--tmpdir requires a DIR (--no-tmpdir falls back to CSB_TMPDIR)"

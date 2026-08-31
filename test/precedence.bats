@@ -100,12 +100,12 @@ load helpers
 }
 
 @test "CLI --no-nix-target clears every profile nix_target key" {
-  write_profile p "nix_target=ci" "nix_target_shell=dev" "nix_target_claude=rel"
+  write_profile p "nix_target=ci" "nix_target_shell=dev" "nix_target_agent=rel"
   dump_config -p p --no-nix-target
   assert_success
   assert_line "nix_target="
   assert_line "nix_target_shell="
-  assert_line "nix_target_claude="
+  assert_line "nix_target_agent="
   assert_line "nix_target_effective=default"
 }
 
@@ -115,8 +115,8 @@ load helpers
   assert_line "nix_target_effective=ci"
 }
 
-@test "nix_target_claude beats nix_target in claude mode" {
-  write_profile p "nix_target=ci" "nix_target_claude=rel"
+@test "nix_target_agent beats nix_target in agent mode" {
+  write_profile p "nix_target=ci" "nix_target_agent=rel"
   dump_config -p p
   assert_line "nix_target_effective=rel"
 }
@@ -283,13 +283,13 @@ load helpers
 @test "-- ARGS on the CLI replaces a profile args=" {
   write_profile p "args=--model sonnet"
   dump_config -p p -- --model opus
-  assert_line "claude_args=--model|opus"
+  assert_line "agent_args=--model|opus"
 }
 
 @test "profile args= is used when no -- ARGS are given" {
   write_profile p "args=--model sonnet"
   dump_config -p p
-  assert_line "claude_args=--model|sonnet"
+  assert_line "agent_args=--model|sonnet"
 }
 
 # --- bare -p NAME implies --here ---------------------------------------------
@@ -311,4 +311,61 @@ load helpers
   write_profile p "ns=x"
   dump_config -p p --no-here
   assert_line "here=false"
+}
+
+# --- agent (which agent CLI runs) --------------------------------------------
+
+@test "the agent defaults to claude, and the adapter answers with it" {
+  dump_config
+  assert_success
+  assert_line "agent=claude"
+  assert_line "agent_bin_attr=claude"
+  assert_line "token_env=CLAUDE_CODE_OAUTH_TOKEN"
+  assert_line "seed=json_merge:.claude/.claude.json"
+}
+
+@test "a profile agent= is honoured" {
+  write_profile p "agent=claude"
+  dump_config -p p
+  assert_success
+  assert_line "agent=claude"
+}
+
+@test "CLI --agent beats a profile agent=" {
+  write_profile p "agent=claude"
+  dump_config -p p --agent claude
+  assert_success
+  assert_line "agent=claude"
+}
+
+@test "the agent's quiet knobs are the lowest setenv layer" {
+  write_profile p "setenv=DISABLE_AUTOUPDATER=0"
+  dump_config -p p
+  assert_success
+  # A named VAR goes to the highest layer that sets it -- and to that layer's
+  # position, so the overridden knob moves to the end -- and the other survives.
+  assert_line "setenv=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC|DISABLE_AUTOUPDATER"
+}
+
+# --- token_env (which variable carries the credential) -----------------------
+
+@test "a profile token_env= replaces the agent's own variable" {
+  write_profile p "token_env=OPENROUTER_API_KEY"
+  dump_config -p p
+  assert_success
+  assert_line "token_env=OPENROUTER_API_KEY"
+}
+
+@test "CLI --token-env beats a profile token_env=" {
+  write_profile p "token_env=FROM_PROFILE"
+  dump_config -p p --token-env FROM_CLI
+  assert_success
+  assert_line "token_env=FROM_CLI"
+}
+
+@test "--no-token-env falls back to the agent's own variable" {
+  write_profile p "token_env=FROM_PROFILE"
+  dump_config -p p --no-token-env
+  assert_success
+  assert_line "token_env=CLAUDE_CODE_OAUTH_TOKEN"
 }

@@ -1,7 +1,51 @@
 # plan 010 -- agents beyond claude (opencode, codex, gemini, ...)
 
-Status: **ACCEPTED (2026-08-27), not started.** Research complete; nothing
-built.
+Status: **PASS 1 DONE (2026-08-31). Pass 2 not started.** csb is
+agent-generic with claude as the only agent; section 8's pass-1 list is
+implemented, including the HOME migration, the rename sweep and the deny-floor
+rider. What shipped, against that list:
+
+- `agent` and `token_env` are axes in csb-config, and the adapter table is
+  `ocaml/lib/agent.ml` -- one row, ten fields: `bin_attr`/`bin_name`,
+  `token_env`, `token_hint`, `yolo_flag`, `setenv`, `config_dir`/`config_env`,
+  `hosts_file`, `ns_migrate`, and the seed/credential instructions with their
+  two jq expressions. `Profile.builtin` is gone: the quiet setenv layer is now
+  the adapter's, applied in `Resolve` because which knobs they are is what the
+  layers above decide.
+- Seeding is 6b's four generic verbs (`copy`, `keychain`, `file`,
+  `json_merge`), emitted as three parallel list keys per instruction and
+  executed by `seed_apply` in `bin/csb`. `seed_claude_config` and the
+  platform-branching `seed_credentials` are gone; `credential_is_usable` and
+  `clear_seeded_credentials` run the adapter's jq expressions against
+  `cred_check`.
+- Two deltas from this document, both deliberate: the platform reaches
+  csb-config as `CSB_PLATFORM` (the `--seed-creds` source needs it, and
+  `bin/csb` already runs `uname`), and the state-dir variable is exported for
+  EVERY redirected HOME, not only a namespace, so the layout inside the launch
+  HOME is uniform and a seed destination can be a static relative path.
+  A launch-HOME layout note follows from the second: an `-E` HOME now keeps
+  claude's state under `.claude/` like a namespace does, where it used to put
+  `.claude.json` at the HOME root.
+- Two smaller behaviour deltas from making the merge generic: `json_merge` is a
+  plain jq deep merge with the seed winning, so `projectOnboardingSeenCount` is
+  normalised to 1 on every launch instead of being preserved (cosmetic -- the
+  field only gates a per-project first-run notice); and the old "jq missing AND
+  the project path needs escaping" refusal is gone, because the placeholder
+  substitution now JSON-escapes what it inserts, so a fresh file is safe to
+  write without jq whatever the worktree path holds.
+- `allowed-hosts` splits with a FALLBACK rather than a clean break (section 6
+  slot 6 left this to the operator): `allowed-hosts.<agent>` when it exists,
+  the unsuffixed file otherwise. `templates/allowed-hosts` is now
+  `templates/allowed-hosts.claude`.
+- Tests: `test/agents.bats` covers the per-repo-per-agent HOME, both
+  migrations, the un-adoptable unstamped dir, the deny floor and the hosts-file
+  selection; `precedence.bats` and `validation.bats` cover the two new axes.
+  Goldens were edited mechanically (`.csb/claudes` -> `.csb/agents`) rather
+  than regenerated, since the only shape change is that rename.
+
+Not done, and deferred to pass 2 with the agents themselves: the
+opencode/`filter_egress` loopback validation rule (there is no opencode row to
+validate), and per-agent `--latest`.
 
 Decided (operator, 2026-08-27):
 

@@ -182,7 +182,7 @@ setup_root() { export CSB_MAIN_ROOT="$REPO"; }
   write_profile p "seed_home=" "args="
   dump_config -p p
   assert_line "seed_home="
-  assert_line "claude_args="
+  assert_line "agent_args="
 }
 
 @test "an empty ns= retracts the whole HOME axis, like ephemeral=false" {

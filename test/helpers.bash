@@ -4,7 +4,7 @@
 # Every test runs the real bin/csb as a subprocess against an ISOLATED HOME and
 # XDG_CONFIG_HOME, via --dump-config (or --dump-sandbox for build-time
 # validations) so nothing launches and nothing touches the operator's
-# ~/.config/csb or ~/.csb/claudes.
+# ~/.config/csb or ~/.csb/agents.
 
 # `run --separate-stderr` (used by the snapshot helper) needs bats >= 1.5.
 bats_require_minimum_version 1.5.0
@@ -30,6 +30,10 @@ setup() {
   # network-reaching --latest, and no inherited main checkout root (config.bats
   # sets that per test; unset, csb derives it from the working directory).
   unset CSB_LATEST CSB_VERBOSE CLAUDE_CODE_OAUTH_TOKEN CSB_MAIN_ROOT
+  # bin/csb supplies this from `uname -s`; the config oracle runs csb-config
+  # directly, so set it here too and both paths resolve the same --seed-creds
+  # source.
+  export CSB_PLATFORM="$(uname -s)"
   # Pin bwrap (and, under --filter-egress, pasta/nft) to placeholders so
   # --dump-sandbox on Linux prints a stable path instead of running
   # `nix build .#bwrap`/`.#pasta`/`.#nft` (nix is not on PATH in the devShell,
@@ -74,7 +78,7 @@ write_config() {
 
 # dump_config ARGS... -- run `csb --dump-config ARGS`. --dump-config exits before
 # any repo lookup, so the current directory is irrelevant (no repo needed). The
-# flag goes FIRST so a test's own `-- ARGS` cannot swallow it into claude_args.
+# flag goes FIRST so a test's own `-- ARGS` cannot swallow it into agent_args.
 dump_config() {
   run "$CSB" --dump-config "$@"
 }
@@ -136,17 +140,17 @@ normalize_sandbox() {
   rtmp="$(realpath "$CSB_TMPDIR")"
 
   # Namespace dirs, located by the .csb-ns stamp csb writes. Both current forms
-  # (the per-repo default repo-<key> and the shared @NAME) sit flat directly
-  # under ~/.csb/claudes, so their parent IS the claudes root and only the ns
-  # dir itself is replaced with <NS>. The <NSKEY> parent replacement fires only
-  # for a legacy pre-0.3 nested <repo-key>/<ns> dir, if one is present.
+  # (the per-repo-per-agent default repo-<key>-<agent> and the shared @NAME) sit
+  # flat directly under ~/.csb/agents, so their parent IS the agents root and
+  # only the ns dir itself is replaced with <NS>. The <NSKEY> parent replacement
+  # fires only for a legacy pre-0.3 nested <repo-key>/<ns> dir, if one is present.
   local keydir
   while IFS= read -r stamp; do
     nsdir="$(dirname "$stamp")"
     keydir="$(dirname "$nsdir")"
     prog+="s#$(_sed_escape "$nsdir")#<NS>#g;"
-    [[ "$keydir" != "$rhome/.csb/claudes" ]] && prog+="s#$(_sed_escape "$keydir")#<NSKEY>#g;"
-  done < <(find "$rhome/.csb/claudes" -name .csb-ns -type f 2>/dev/null)
+    [[ "$keydir" != "$rhome/.csb/agents" ]] && prog+="s#$(_sed_escape "$keydir")#<NSKEY>#g;"
+  done < <(find "$rhome/.csb/agents" -name .csb-ns -type f 2>/dev/null)
 
   # The -E ephemeral HOME (random mktemp suffix under CSB_TMPDIR): stabilize the
   # suffix before CSB_TMPDIR itself is mapped to <TMP>.

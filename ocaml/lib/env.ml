@@ -16,6 +16,12 @@ type t = {
      has one implementation and this stays a function of its inputs. Absent
      outside a repository, where no section matches. *)
   main_root : string option;
+  (* CSB_PLATFORM: `uname -s`, supplied by bin/csb. Platform detection has one
+     implementation, on the side that already runs uname for the sandbox, and
+     resolution stays a function of its inputs -- csb-config execs nothing.
+     Only the --seed-creds source reads it: a keyring on macOS, a file
+     elsewhere. Absent, the file form is assumed. *)
+  platform : string;
 }
 
 let getenv_nonempty name =
@@ -36,10 +42,13 @@ let of_process () =
     tmpdir = getenv_nonempty "CSB_TMPDIR";
     system_tmpdir = getenv_nonempty "TMPDIR";
     main_root = getenv_nonempty "CSB_MAIN_ROOT";
+    platform = Option.value (getenv_nonempty "CSB_PLATFORM") ~default:"";
   }
 
+let is_darwin env = env.platform = "Darwin"
+
 let profiles_dir env = Filename.concat env.config_dir "profiles"
-let allowed_hosts_file env = Filename.concat env.config_dir "allowed-hosts"
+let allowed_hosts_file env name = Filename.concat env.config_dir name
 let config_file env = Filename.concat env.config_dir "config"
 let config_local_file env = config_file env ^ ".local"
 

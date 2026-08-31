@@ -67,7 +67,7 @@ load helpers
 
 # --- --no-sandbox is shell-only ----------------------------------------------
 
-@test "--no-sandbox without --shell dies (claude never runs unsandboxed)" {
+@test "--no-sandbox without --shell dies (an agent never runs unsandboxed)" {
   dump_config --here --no-sandbox
   assert_failure
   assert_output --partial "only allowed with -s/--shell"
@@ -126,10 +126,10 @@ load helpers
   assert_output --partial "--nix-target requires a NAME"
 }
 
-@test "--nix-target-claude without a NAME dies" {
-  dump_config --nix-target-claude
+@test "--nix-target-agent without a NAME dies" {
+  dump_config --nix-target-agent
   assert_failure
-  assert_output --partial "--nix-target-claude requires a NAME"
+  assert_output --partial "--nix-target-agent requires a NAME"
 }
 
 @test "an invalid --accent dies" {
@@ -510,4 +510,46 @@ none
   # The namespace still has no address and no default route, and the chain still
   # drops what does not leave over lo.
   assert_line "    type filter hook output priority 0; policy drop;"
+}
+
+# --- the agent axis ----------------------------------------------------------
+
+@test "an unknown --agent dies, naming the known ones" {
+  dump_config --agent nosuchagent
+  assert_failure
+  assert_output --partial "unknown agent 'nosuchagent'"
+  assert_output --partial "claude"
+}
+
+@test "an unknown profile agent= dies" {
+  write_profile p "agent=nosuchagent"
+  dump_config -p p
+  assert_failure
+  assert_output --partial "unknown agent 'nosuchagent'"
+}
+
+@test "--agent without a NAME dies" {
+  dump_config --agent
+  assert_failure
+  assert_output --partial "--agent requires a NAME"
+}
+
+@test "--token-env without a VAR dies" {
+  dump_config --token-env
+  assert_failure
+  assert_output --partial "--token-env requires a VAR"
+}
+
+@test "a --token-env that is not a variable name dies" {
+  dump_config --token-env 'not a var'
+  assert_failure
+  assert_output --partial "invalid env var name for --token-env"
+}
+
+@test "the unknown-key error names the new agent keys" {
+  write_profile p "nix_target_claude=rel"
+  dump_config -p p
+  assert_failure
+  assert_output --partial "unknown key 'nix_target_claude'"
+  assert_output --partial "nix_target_agent"
 }

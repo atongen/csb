@@ -1,14 +1,15 @@
-# csb -- claude sandbox
+# csb -- code sandbox
 
-`csb` runs [Claude Code](https://www.anthropic.com/claude-code) -- or a shell --
-in a **per-branch git worktree**, inside the **repo's own nix devShell**, behind
-three layers:
+`csb` runs a coding agent -- [Claude
+Code](https://www.anthropic.com/claude-code) today, selected by
+[`agent=`](#choosing-the-agent---agent) -- or a shell, in a **per-branch git
+worktree**, inside the **repo's own nix devShell**, behind three layers:
 
 1. **env scrub** -- `nix develop --ignore-environment` plus a small allowlist
    (extend with `-k/--keep` or a profile's `keep=`).
 2. **private HOME** -- `HOME` is redirected to a per-namespace dir under
-   `~/.csb/claudes` (one per repo by default, shared across its branches; or a
-   throwaway dir with `-E`) for the launched process only.
+   `~/.csb/agents` (one per repo and agent by default, shared across the repo's
+   branches; or a throwaway dir with `-E`) for the launched process only.
 3. **filesystem sandbox** (`sandbox-exec`/seatbelt on macOS, bubblewrap on
    Linux): **reads** are default-allow minus a deny-list (`~/.ssh`, `~/.aws`,
    the real `~/.claude`, ...), **writes** are default-deny plus an allow-list
@@ -25,7 +26,7 @@ three layers:
 >
 > Two reasons, both deliberate and both load-bearing:
 >
-> - **Network and host services stay open by default**, so claude (and the `-s`
+> - **Network and host services stay open by default**, so the agent (and the `-s`
 >   shell) can reach local db/redis/etc for testing -- anything readable is
 >   exfiltratable. [`--filter-egress`](#filtering-egress---filter-egress) narrows
 >   outbound traffic to an allowlist, but it is off unless you ask for it and it
@@ -40,7 +41,7 @@ three layers:
 **Decoupled by design:** the repo needs no csb-specific files. Its own
 `flake.nix` with `devShells.default` is preferred, not required -- csb falls
 back to a generic devShell otherwise (see [What a repo needs](#what-a-repo-needs)).
-The claude binary comes from *csb's own* flake; the repo never imports csb.
+The agent binary comes from *csb's own* flake; the repo never imports csb.
 
 > **Status.** Verified end-to-end on `aarch64-darwin` (seatbelt) and on NixOS
 > (bubblewrap). **Not published:** csb lives on a private remote, which is
@@ -62,7 +63,7 @@ The claude binary comes from *csb's own* flake; the repo never imports csb.
 make install                     # csb -> ~/bin (on PATH); csb-config -> ~/.csb/bin
 export CLAUDE_CODE_OAUTH_TOKEN=...      # from 'claude setup-token'; or use --seed-creds
 cd ~/src/your/repo               # a repo with a flake.nix (see "What a repo needs")
-csb feature/foo                  # worktree for feature/foo + claude in the devShell
+csb feature/foo                  # worktree for feature/foo + the agent in the devShell
 ```
 
 Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
@@ -87,7 +88,7 @@ install` warns when neither holds.
 
 Five environment variables tune csb:
 
-- **`CSB_SELF`** -- the flake ref csb pulls its claude binary (and, on Linux,
+- **`CSB_SELF`** -- the flake ref csb pulls its agent binary (and, on Linux,
   bubblewrap) from. Defaults to the private remote
   `git+ssh://git@git.grandrew.com/atongen/csb.git`, so a launch needs ssh access
   to it. For local development against a working tree, override per-invocation:
@@ -95,6 +96,7 @@ Five environment variables tune csb:
 - **`CSB_LATEST`** -- if set (non-empty), defaults `-L/--latest` on: re-lock the
   `claude-code` flake input to its upstream HEAD instead of the rev pinned in
   `flake.lock`. Trades reproducibility for always getting the newest claude.
+  Specific to the `claude-code` flake; other agents track csb's `nixpkgs` input.
   `-L` does the same for a single run.
 - **`CSB_LATEST_TTL`** -- seconds to reuse a cached upstream rev under
   `-L`/`CSB_LATEST` before re-checking (default `86400` = daily; `0` = check
@@ -111,44 +113,79 @@ Five environment variables tune csb:
 ## Use
 
 ```sh
-csb feature/foo                  # worktree for feature/foo (off HEAD) + claude in the devShell
-csb -y feature/foo               # allow-all (--dangerously-skip-permissions)
-csb feature/foo -- --model opus  # everything after -- is passed to claude
+csb feature/foo                  # worktree for feature/foo (off HEAD) + the agent in the devShell
+csb -y feature/foo               # allow-all (the agent's skip-every-prompt flag)
+csb feature/foo -- --model opus  # everything after -- is passed to the agent
 csb --here                       # run in the current dir, no worktree (per-repo namespace)
-csb -s feature/foo               # interactive shell instead of claude (exact same env)
+csb -s feature/foo               # interactive shell instead of the agent (exact same env)
 csb -s -E --here -- cat ~/.ssh/config   # run a command in the agent's env (this one fails: denied)
 csb -s --no-sandbox --real-home --here -k SSH_AUTH_SOCK   # deploy shell: same devShell
                                  # + env scrub, but full fs + real HOME (see Filesystem sandbox)
 csb -p work feature/foo          # profile: ns/token/keeps/env from ~/.config/csb/profiles/work
 csb -k AWS_PROFILE feature/foo   # also keep AWS_PROFILE across the env scrub (repeatable)
 csb -L feature/foo               # newest claude (re-lock claude-code to upstream HEAD this run)
-csb --ns work feature/foo        # shared, cross-repo HOME (default is per-repo)
+csb --agent claude feature/foo   # which agent runs (claude is the default)
+csb --ns work feature/foo        # shared, cross-repo HOME (default is per repo and agent)
 csb --ns @work feature/foo       # same thing -- the @ is optional (work == @work)
 csb -E feature/foo               # ephemeral: throwaway config/HOME, no namespace
 csb -E=work --here               # named ephemeral: reusable throwaway HOME (attach a shell)
 csb -n feature/foo               # just prepare/reuse the worktree, don't launch (prints its path)
 csb -d feature/foo               # remove the worktree (branch and per-repo HOME are kept)
-csb --list-ns                    # list csb namespace configs (per-repo + shared @)
+csb --list-ns                    # list csb namespace configs (per repo+agent, shared @)
 csb --reap                       # reclaim what dead sessions left (proxies, ephemeral HOMEs)
 csb                              # list csb worktrees
 ```
 
 `BRANCH` and `--here` are mutually exclusive: either csb provisions a worktree
 for `BRANCH`, or it runs in the current directory as-is. All combinations of
-{claude, `-s` shell} x {worktree, `--here`} land in the same restricted devShell.
+{agent, `-s` shell} x {worktree, `--here`} land in the same restricted devShell.
 tmux is yours to manage: run `csb` in one pane, edit / `git push` from another.
 
 `csb --help` prints the full flag reference. `make help` lists the build/install
 targets.
 
+## Choosing the agent (`--agent`)
+
+`agent=` (CLI `--agent NAME`, or the key in a config section or profile) selects
+which agent CLI a launch runs. `claude` is the default and, today, the only
+value.
+
+The agent is one axis with one answer, and it decides everything csb has to know
+about the tool it launches: the flake output the binary comes from, the variable
+that carries the credential (`token_env`), the flag `-y/--yolo` becomes, the
+quiet knobs injected as the lowest `setenv` layer, the files seeded into the
+launch HOME, the state dir inside it, the `--seed-creds` source, and which
+`allowed-hosts.<agent>` file the egress allowlist is read from. That table lives
+in one place, `ocaml/lib/agent.ml`; `bin/csb` receives its values as opaque
+strings and seed instructions and never branches on the agent itself.
+
+`--dump-config` reports the resolved answer and what it implied:
+
+```
+agent=claude
+agent_bin_attr=claude
+token_env=CLAUDE_CODE_OAUTH_TOKEN
+seed=json_merge:.claude/.claude.json
+cred_seed=keychain:.claude/.credentials.json
+```
+
+Two knobs are deliberately agent-specific rather than generic:
+
+- **`-L/--latest`** re-locks the `claude-code` flake input, so it means nothing
+  for any other agent -- their currency comes from bumping csb's own `nixpkgs`
+  input.
+- **the shared `@NAME` namespace** is not agent-suffixed; see
+  [Namespaces](#namespaces).
+
 ## Auth
 
-claude runs with a private HOME and the real `~/.claude` denied, so a host login
-is never visible. Two ways in:
+The agent runs with a private HOME and its real state dir denied, so a host
+login is never visible. Two ways in:
 
 - **`--seed-creds` / `seed_creds=true` (recommended)** -- csb copies your native
-  claude session credential (macOS keychain item / Linux
-  `~/.claude/.credentials.json`) into the launch config, host-side. The sandbox
+  session credential for the agent (for claude: the macOS keychain item, or
+  `~/.claude/.credentials.json` elsewhere) into the launch HOME, host-side. The
+  sandbox
   then presents your **live subscription session** -- same account, same model
   entitlements as native claude. The copy is skipped while the launch config
   already holds a credential that can still renew itself -- gated on the
@@ -159,9 +196,10 @@ is never visible. Two ways in:
   and native share one refresh-token family, so a refresh in either can log the
   other out -- expect that with several sessions running at once. Requires a
   native login for the wanted account on the host.
-- **Token** -- `claude setup-token` once, then `CLAUDE_CODE_OAUTH_TOKEN` (or,
-  better, `token_cmd=pass .../claude/token` in a profile, fetched host-side so it
-  never transits your interactive shell). A forwarded token wins over a seeded
+- **Token** -- `claude setup-token` once, then the agent's credential variable
+  (`CLAUDE_CODE_OAUTH_TOKEN`; `--token-env VAR` / `token_env=` names another) --
+  or, better, `token_cmd=pass .../claude/token` in a profile, fetched host-side
+  so it never transits your interactive shell. A forwarded token wins over a seeded
   session credential, and the launch removes any seeded credential left in the
   config so nothing stale can take over if the token is later unset. The token
   supersedes only the session credential, so other stored auth in that file
@@ -172,15 +210,15 @@ is never visible. Two ways in:
 ## Namespaces
 
 A namespace is just **which `HOME` the sandboxed process gets** -- and with it
-the agent's claude config (history/sessions/settings), caches, and anything else
+the agent's own state dir (history/sessions/settings), caches, and anything else
 that lives in `$HOME`. `-N`, `-E`, and `--real-home` are three mutually-exclusive
-choices for that HOME; the default is a per-repo redirected HOME. They differ in
-*persistence* and in whether that HOME is *writable* inside the sandbox:
+choices for that HOME; the default is a redirected HOME per repo and agent. They
+differ in *persistence* and in whether that HOME is *writable* inside the sandbox:
 
 | Choice | HOME | Persistent | Writable in sandbox | Seeded |
 |---|---|---|---|---|
-| **default** | `~/.csb/claudes/repo-<key>` (per repo) | yes | yes | yes |
-| **`-N NAME`** | `~/.csb/claudes/@NAME` (shared across repos) | yes | yes | yes |
+| **default** | `~/.csb/agents/repo-<key>-<agent>` (per repo and agent) | yes | yes | yes |
+| **`-N NAME`** | `~/.csb/agents/@NAME` (shared across repos *and* agents) | yes | yes | yes |
 | **`-E`** | a throwaway dir under tmp | no | yes | yes |
 | **`--real-home`** | your real `$HOME` | n/a | **no** (reads obey the deny-list) | no |
 
@@ -189,26 +227,32 @@ choices for that HOME; the default is a per-repo redirected HOME. They differ in
 the four are one axis it retracts whichever of the three a lower layer chose;
 there is no per-key negation, and naming two selectors at once is an error.
 
-**By default the namespace is the repo, not the branch.** One persistent HOME is
-shared by every branch and worktree of the repo, living flat at
-`~/.csb/claudes/repo-<key>`, where `<key>` is the basename of the physical
-main-checkout root plus a short path hash (`myapp-4f9a11b2`). The hash keeps two
-different repos that share a basename from ever sharing a HOME. Because the
-default is derived from the repo every run, `csb <branch>` is deterministic with
-no hidden state.
+**By default the namespace is the repo and the agent, not the branch.** One
+persistent HOME is shared by every branch and worktree of the repo, living flat
+at `~/.csb/agents/repo-<key>-<agent>`, where `<key>` is the basename of the
+physical main-checkout root plus a short path hash (`myapp-4f9a11b2`). The hash
+keeps two different repos that share a basename from ever sharing a HOME, and
+the trailing agent name keeps two agents from sharing one -- so retirement,
+seeding, `--reseed` and seeded credentials stay per-agent, and one agent's
+sessions are never readable by another. The suffix sits *after* the hash, so it
+cannot be confused with a repo basename that happens to end in an agent's name.
+Because the default is derived from the repo every run, `csb <branch>` is
+deterministic with no hidden state.
 
 | Invocation | Namespace | HOME |
 |---|---|---|
-| `csb feature/foo` | `repo-<key>` (this repo) | persistent `~/.csb/claudes/repo-<key>` |
-| `csb --here` | `repo-<key>` (this repo) | persistent, same dir |
-| `csb --ns work feature/foo` | `@work` (shared) | persistent `~/.csb/claudes/@work` |
-| `csb --ns @work feature/foo` | `@work` -- identical to the line above | persistent `~/.csb/claudes/@work` |
+| `csb feature/foo` | `repo-<key>-claude` (this repo, this agent) | persistent `~/.csb/agents/repo-<key>-claude` |
+| `csb --here` | `repo-<key>-claude` (this repo, this agent) | persistent, same dir |
+| `csb --ns work feature/foo` | `@work` (shared) | persistent `~/.csb/agents/@work` |
+| `csb --ns @work feature/foo` | `@work` -- identical to the line above | persistent `~/.csb/agents/@work` |
 | `csb -E feature/foo` | none | throwaway (not persisted) |
 
-`HOME` for the launched process is the namespace dir; its config lands at
-`<ns>/.claude` (coinciding with claude's default `$HOME/.claude`), so caches that
-normally live in `$HOME` (npm, bundler, ...) rebuild there and persist. The whole
-`~/.csb/claudes` tree is denied except the **active** namespace.
+`HOME` for the launched process is the namespace dir, and csb also points the
+agent's own state-dir variable (claude: `CLAUDE_CONFIG_DIR`) at `<ns>/.claude`,
+so the layout inside the launch HOME is the same whether it is a namespace or a
+throwaway. Caches that normally live in `$HOME` (npm, bundler, ...) rebuild
+there and persist. The whole `~/.csb/agents` tree is denied except the **active**
+namespace.
 
 > **Parallel sessions share one HOME.** Two `csb` sessions on different branches
 > of the same repo now share the per-repo HOME (config, history, `.claude.json`)
@@ -220,8 +264,10 @@ normally live in `$HOME` (npm, bundler, ...) rebuild there and persist. The whol
 - **`-N`, `--ns NAME`** -- a named HOME shared across **all** repos launched with
   it (the classic use: one `--ns @work` for every work repo). `NAME` and `@NAME`
   are equivalent -- the `@` is optional and always added, which also keeps user
-  names in their own space so none can collide with a `repo-<key>` default. `-d`
-  never auto-removes it (retire it manually: `rm -rf ~/.csb/claudes/@NAME`).
+  names in their own space so none can collide with a `repo-<key>` default. It is
+  deliberately **not** agent-suffixed: naming a namespace is already an explicit
+  sharing decision, and `--ns work-codex` is how you keep two agents apart. `-d`
+  never auto-removes it (retire it manually: `rm -rf ~/.csb/agents/@NAME`).
 - **`-E`, `--ephemeral`** -- throwaway config/HOME under `$TMPDIR`, no namespace.
   Mutually exclusive with `--ns`. A bare `-E` mints a random throwaway dir, so
   there is nothing a second invocation can reattach to; once its session ends,
@@ -232,12 +278,12 @@ normally live in `$HOME` (npm, bundler, ...) rebuild there and persist. The whol
   shell in another pane can attach to the exact same environment:
 
   ```sh
-  csb -E=work --here          # claude, in a reusable ephemeral HOME
+  csb -E=work --here          # the agent, in a reusable ephemeral HOME
   csb -s -E=work --here       # a shell in the identical env (other pane)
   ```
 
   It is still *ephemeral*, not a namespace: it lives in tmp (OS-reaped, gone on
-  reboot/tmp-clean), leaves no `~/.csb/claudes` entry, and is untracked by
+  reboot/tmp-clean), leaves no `~/.csb/agents` entry, and is untracked by
   `--list-ns`. Both panes must resolve the same tmp base for the paths to
   coincide -- set `CSB_TMPDIR` for a fixed base, or keep `$TMPDIR` stable across
   your shells. (For a shareable env that *persists*, use a `--ns NAME` instead.)
@@ -246,14 +292,31 @@ normally live in `$HOME` (npm, bundler, ...) rebuild there and persist. The whol
 `csb -d <branch>` removes only the worktree; the branch is kept, and so is the
 launch HOME -- the per-repo default is shared by every branch, and a `--ns`
 namespace is shared across repos, so neither is tied to the branch being
-deleted. Retire a namespace deliberately with `rm -rf ~/.csb/claudes/<name>`.
+deleted. Retire a namespace deliberately with `rm -rf ~/.csb/agents/<name>`.
 Only worktrees csb created under `.worktrees/` are ever torn down/removed -- a
 branch checked out in the main tree or a hand-made worktree is left alone.
 
-`csb --list-ns` lists the namespace configs under `~/.csb/claudes`: the per-repo
-default (`repo-<key>`), any others from sibling repos, and the shared `@` ones.
-None are ever auto-removed. Dirs left over from the pre-0.3 per-branch layout are
-flagged as legacy; remove them manually when convenient.
+`csb --list-ns` lists the namespace configs under `~/.csb/agents`: this repo's
+and agent's default (`repo-<key>-<agent>`), any others from sibling repos or
+agents, and the shared `@` ones. None are ever auto-removed. Dirs left over from
+the pre-0.3 per-branch layout are flagged as legacy; remove them manually when
+convenient.
+
+### Migrating off the pre-agent layout
+
+The launch HOMEs used to live at `~/.csb/claudes/repo-<key>`, from when claude
+was the only agent csb could run. The first launch after this change migrates
+them, in two lossless `mv`s within one filesystem:
+
+- the **root**, `~/.csb/claudes` -> `~/.csb/agents`, whole, with every `@NAME`
+  namespace riding along unchanged; and
+- this repo's **dir**, `repo-<key>` -> `repo-<key>-claude`.
+
+Both are one-shot and idempotent by construction -- the old path is gone
+afterwards -- and the migrated HOME is byte-identical, only addressed
+differently. A pre-agent dir is adopted only by claude, and only when its
+`.csb-ns` stamp says `kind=repo`; anything else is left where it is and reported
+by `--list-ns`.
 
 `csb --reap` reclaims what sessions that no longer exist left behind: orphaned
 `csb-proxy` processes (each is killed and its allowlist file removed) and random
@@ -267,17 +330,20 @@ running proxy has a live parent, and a random HOME carries its owner's pid in
 
 Four layers answer every knob. Lowest first:
 
-1. **built-in defaults**
+1. **the agent's own defaults**
 2. **`${XDG_CONFIG_HOME:-~/.config}/csb/config`**, then the gitignored
    **`config.local`** beside it -- the sections matching this repository
 3. **the profile** named by `-p NAME`, then its gitignored `NAME.local`
 4. **the command line**
 
-Layer 1 ships two environment defaults, `DISABLE_AUTOUPDATER=1` and
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`: claude is pinned by nix, so an
+Layer 1 is the resolved [agent](#choosing-the-agent---agent)'s quiet knobs. For
+claude that is `DISABLE_AUTOUPDATER=1` and
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`: the agent is pinned by nix, so an
 auto-update could only target a read-only store path, and the non-essential
 traffic is telemetry. Both are plain `setenv=` entries any layer above can
-override.
+override. Note the ordering consequence: which knobs layer 1 supplies depends on
+`agent=`, which the layers above it decide, so the agent axis is resolved first
+and its setenv applied underneath everything else.
 
 A scalar or boolean goes to the highest layer that sets it. Every list
 (`keep=`, `setenv=`, `deny_read=`, `allow_write=`, `allow_socket=`,
@@ -321,7 +387,7 @@ $ csb --here --dump-config | grep config_sections
 config_sections=config[*]|config[*work*]|config.local[*]
 ```
 
-Two keys on the same **axis** move together: a layer that names any of `ns=`,
+Keys on the same **axis** move together: a layer that names any of `ns=`,
 `ephemeral=`, `real_home=` (which HOME) replaces all three below it, and the
 same holds for the three `nix_target*` keys. On the command line that axis is
 one flag's worth of surface too: three positive selectors plus `--per-repo`. Per-repo config lives here and not
@@ -341,9 +407,11 @@ negating `--no-*` flags. Launch with `-p/--profile NAME`. Recognized keys
 (anything else is an error):
 
 ```
+agent=claude                              # as --agent: which agent CLI runs (default claude)
 ns=@work                                  # as --ns
 token_cmd=pass work/claude/token          # as --token-cmd; run host-side via bash -c;
-                                          # stdout -> CLAUDE_CODE_OAUTH_TOKEN (never echoed)
+                                          # stdout -> $token_env (never echoed)
+token_env=OPENROUTER_API_KEY              # as --token-env; defaults to the agent's own variable
 latest=true                               # as -L/--latest; beats CSB_LATEST, loses to explicit -L
 verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, loses to explicit -v
 yolo=true                                 # as -y/--yolo (allow-all)
@@ -352,7 +420,7 @@ pasteboard=true                           # as --pasteboard (macOS pbcopy/pbpast
 sandbox=false                             # as --no-sandbox (shell only; drops the fs lockdown)
 nix_target=release                        # as --nix-target: devShells.<system>.NAME
 nix_target_shell=dev                      # as --nix-target-shell; beats nix_target for -s runs
-nix_target_claude=ci                      # as --nix-target-claude; beats nix_target for claude runs
+nix_target_agent=ci                       # as --nix-target-agent; beats nix_target for agent runs
 real_home=true                            # as --real-home; excludes ns=/ephemeral= (HOME axis)
 here=true                                 # as --here; an explicit BRANCH wins (with a warning)
 ephemeral=true                            # as -E; excludes ns= in the same profile
@@ -362,7 +430,7 @@ seed_home=~/.config/csb/home              # as --seed-home; template copied into
 tmpdir=/fast/tmp                          # as --tmpdir; the launch TMPDIR, -E HOME base and a
                                           # write root. Must exist. Overrides CSB_TMPDIR.
 accent=magenta                            # as --accent; statusline tint (csb --help lists the colors)
-args=bash --rcfile ~/.config/my.bashrc    # the ARGS after --: command in -s mode, extra claude
+args=bash --rcfile ~/.config/my.bashrc    # the ARGS after --: command in -s mode, extra agent
                                           # args otherwise. Whitespace-split, no quoting; a leading
                                           # ~/ or ${HOME} expands to the HOST home.
 keep=COLORTERM DIRENV_LOG_FORMAT          # space-separated, appended to --keep
@@ -385,7 +453,7 @@ Note: bare `csb -p NAME` (no BRANCH) **launches** in the current dir --
 `--here` is implied, unless the CLI or the profile says otherwise; plain `csb`
 always lists. A failing or empty-output `token_cmd` aborts the launch before
 any worktree/namespace side effects. In `-s` shell mode `token_cmd=` is skipped
-and `seed_creds=` is ignored with a warning (a shell runs no claude).
+and `seed_creds=` is ignored with a warning (a shell runs no agent).
 
 **Host-specific overlay.** A profile `NAME` can have a sibling, gitignored
 `NAME.local` layered on top after it is read: same syntax, but its
@@ -414,12 +482,12 @@ For a shorthand, alias the profile: `alias csbw='csb -p work'`.
 
 ## Seeding the sandbox HOME
 
-Inside the sandbox, claude runs with a redirected `HOME` and the real `~/.claude`
-denied -- so your **user-level** files (`~/.claude/CLAUDE.md`, `settings.json`,
-`rules/`) are invisible. To carry them in, put copies in a template dir; csb
-seeds them into the launch HOME on **every** launch (so fresh namespaces get
-them on first use), **non-overwriting** (existing files, including ones claude
-wrote, are kept; `--reseed` forces overwrite).
+Inside the sandbox, the agent runs with a redirected `HOME` and its real state
+dir denied -- so your **user-level** files (for claude: `~/.claude/CLAUDE.md`,
+`settings.json`, `rules/`) are invisible. To carry them in, put copies in a
+template dir; csb seeds them into the launch HOME on **every** launch (so fresh
+namespaces get them on first use), **non-overwriting** (existing files, including
+ones the agent wrote, are kept; `--reseed` forces overwrite).
 
 ```
 ~/.config/csb/home/          # the default template dir
@@ -433,8 +501,9 @@ wrote, are kept; `--reseed` forces overwrite).
 Point at a different dir with `--seed-home DIR` or a profile's `seed_home=`. This
 is deliberately a **template you curate**, not a sweep of your real `$HOME` --
 only what you place here crosses in, so it never re-exposes what the deny-list
-protects. A template-provided `.claude.json` is merged with csb's onboarding
-seed, not clobbered.
+protects. The template is copied **before** the agent's own seed instructions,
+so a template-provided file the agent also seeds (claude's
+`.claude/.claude.json`) is merged rather than clobbered.
 
 A minimal starter lives at [`templates/home/`](templates/home) in this repo --
 copy it to `~/.config/csb/home` and edit:
@@ -472,12 +541,12 @@ branch is passed as `$1`. Define either or both:
 Unlike `.worktreeinclude`, this file runs **sandboxed**: csb sources it (cwd =
 worktree) and calls the requested function inside the repo's own devShell,
 behind the *same* deny-list containment and env scrub (`--ignore-environment` +
-`--keep`) the eventual claude/`-s` launch gets -- so it has no more host access
+`--keep`) the eventual agent/`-s` launch gets -- so it has no more host access
 than the agent's own sandboxed shell already would. It needs no git-tracking or
 commit -- gitignore it, or bring in a personal copy via `.worktreeinclude`, if
 it's specific to your machine. `up` failures abort the launch; `down` failures
 only warn (`--delete` still completes). Local (network-reachable) services like Postgres/Redis stay
-reachable from inside the sandbox exactly as they do for claude itself --
+reachable from inside the sandbox exactly as they do for the agent itself --
 [network stays open by design](#threat-model).
 
 Top-level code in the script runs at source time on both `up` and `down` --
@@ -502,7 +571,7 @@ down() {                                # teardown: drop it on --delete
 **`.worktreeenv`** (in the worktree, dotenv-style) -- `VAR=value` lines (blank
 and `#` lines skipped, names validated) injected into the scrubbed environment
 via the same `env` wrapper that redirects HOME, after `--ignore-environment`,
-inside the devShell, identically for claude and `-s`:
+inside the devShell, identically for the agent and `-s`:
 
 ```
 DATABASE_URL=postgres://localhost/myapp_dev
@@ -531,11 +600,15 @@ launch):
 secrets / keys   ~/.ssh  ~/.aws  ~/.gnupg  ~/.password-store  ~/.netrc
                  ~/.azure  ~/.oci  ~/.vault-token  ~/.granted
                  ~/.config/age/keys.txt  ~/.config/sops  ~/.sops
-claude           ~/.claude  ~/.claude.json{,.backup}
-                 ~/.csb/claudes  (the active namespace is re-allowed)
-cloud / infra    ~/.config/{gh,gcloud,doctl,fly,rclone,op,configstore,
-                 github-copilot}  ~/.config/containers/auth.json
-                 ~/.kube  ~/.docker  ~/.gemini  ~/.pulumi/credentials.json
+csb              ~/.csb/agents  (the active namespace is re-allowed)
+                 ~/.csb/claudes  (the pre-agent root, until it is migrated)
+agents' HOST     ~/.claude  ~/.claude.json{,.backup}  ~/.codex  ~/.gemini
+state            ~/.copilot  ~/.config/github-copilot  ~/.qwen  ~/.cursor
+                 ~/.local/share/opencode  ~/.aider  ~/.aider.conf.yml
+                 ~/.config/goose  ~/.local/share/goose  ~/.config/amp
+cloud / infra    ~/.config/{gh,gcloud,doctl,fly,rclone,op,configstore}
+                 ~/.config/containers/auth.json
+                 ~/.kube  ~/.docker  ~/.pulumi/credentials.json
                  ~/.terraformrc  ~/.terraform.d  ~/.databrickscfg{,.bak}
                  ~/.databricks  ~/.mc  ~/.minio  ~/.s3cfg  ~/.boto
 packaging creds  ~/.cargo/credentials{,.toml}  ~/.gem/credentials  ~/.pypirc
@@ -600,7 +673,7 @@ it. They compose; the common pairing is a shell that can actually deploy.
   process has full host filesystem access. Everything *else* is unchanged: the
   worktree, the repo's devShell, the env scrub (`--ignore-environment` +
   `--keep`), and the HOME policy. It is **shell only** -- csb refuses to run
-  claude unsandboxed (hard error) -- and with it `--paranoid` and the
+  an agent unsandboxed (hard error) -- and with it `--paranoid` and the
   deny/allow lists are inert (csb says so). Also via a profile's `sandbox=false`.
 - **`--real-home`** points the launched `HOME` at your *real* home instead of a
   redirected one. It is a third launch-HOME choice, mutually exclusive with
@@ -657,7 +730,7 @@ the active worktree stays readable.
 A re-allowed subtree usually sits *below* a denied root -- the worktree beneath
 the real HOME (when repos live under `$HOME`) or beneath a `paranoid_deny_read=`
 root (when the code tree lives outside `$HOME`, e.g. on a separate volume), and the
-namespace beneath the denied `~/.csb/claudes`. Reaching it means traversing the
+namespace beneath the denied `~/.csb/agents`. Reaching it means traversing the
 denied ancestor directories in between, which per-component path resolution does
 constantly: canonicalizing a path `lstat`s every component, and a directory glob
 `opendir`s each -- so a fully denied ancestor makes the operation fail with
@@ -755,10 +828,13 @@ csb mybranch --filter-egress             # hosts from the config layers
 ```
 
 Hosts union from `--allow-host` (repeatable), a config section's or profile's
-`allow_host=`, and `${XDG_CONFIG_HOME:-~/.config}/csb/allowed-hosts` -- one host
-per line, `#` comments; copy `templates/allowed-hosts` for a starting set
-covering Claude Code's own endpoints. A leading `*.` matches subdomains only, so
-list a bare parent separately when you want it too. `--filter-egress` with an
+`allow_host=`, and the user-global allowlist file under
+`${XDG_CONFIG_HOME:-~/.config}/csb/` -- one host per line, `#` comments. csb
+reads `allowed-hosts.<agent>` when that file exists and the unsuffixed
+`allowed-hosts` otherwise, so one shared list serves every agent until one needs
+its own. Copy `templates/allowed-hosts.claude` for a starting set covering Claude
+Code's own endpoints. A leading `*.` matches subdomains only, so list a bare
+parent separately when you want it too. `--filter-egress` with an
 empty allowlist is an error rather than a silent blackhole.
 
 `--allow-port PORT` (profile `allow_port=`) re-opens one **localhost** TCP port,
@@ -867,7 +943,7 @@ different closure -- a leaner `ci`, a `release` shell -- with `--nix-target NAME
 repo's own flake.
 
 The two launch modes can differ: `--nix-target-shell NAME` and
-`--nix-target-claude NAME` (profile `nix_target_shell=` / `nix_target_claude=`)
+`--nix-target-agent NAME` (profile `nix_target_shell=` / `nix_target_agent=`)
 each apply to one mode only and beat the shared `--nix-target` when that mode is
 the one running. `--no-nix-target` clears all three. Whichever target wins also
 applies to `.worktreesetup.sh`, which runs in the same devShell.
@@ -878,7 +954,7 @@ launch fails, because csb's generic fallback devShell only ever provides
 
 ```sh
 csb --nix-target ci feature/foo            # both modes in devShells.<system>.ci
-csb --nix-target-shell dev --nix-target-claude ci feature/foo
+csb --nix-target-shell dev --nix-target-agent ci feature/foo
 ```
 
 Each flag is repeatable; profile vars accumulate across `NAME` + `NAME.local`.
@@ -903,12 +979,19 @@ test suite (`docs/PLAN-005-tests.md`) drives.
   $ csb -p work --paranoid --dump-config
   mode=launch
   here=true
+  agent=claude
   paranoid=true
   namespace=@work
   token_cmd=present
-  claude_args=--model|opus
+  token_env=CLAUDE_CODE_OAUTH_TOKEN
+  seed=json_merge:.claude/.claude.json
+  agent_args=--model|opus
   ...
   ```
+
+  The `agent*`, `token_env`, `seed` and `cred_seed` lines are the resolved
+  [agent adapter](#choosing-the-agent---agent): what csb will build, which
+  variable carries the credential, and what it will seed where.
 
 - `--dump-sandbox` -- print the generated sandbox artifact: the seatbelt profile
   text on macOS, or the `bwrap` argv (one token per line) on Linux. It runs the
@@ -953,7 +1036,7 @@ does not defend against a hostile agent.
 Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
 
 - **Open network egress, by default.** Unrestricted outbound unless you ask for
-  otherwise. This is the price of claude reaching local services for real
+  otherwise. This is the price of the agent reaching local services for real
   testing. Neither seatbelt nor bwrap filters by hostname, so host-based control
   needs a proxy: csb ships one, opt in per launch or per profile with
   [`--filter-egress`](#filtering-egress---filter-egress). Left off, anything
@@ -972,7 +1055,7 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   and the repo's `flake.nix`/`shellHook`, run on the host, **unsandboxed** --
   nix itself is out of scope for containment. `.worktreesetup.sh` is not in
   this bucket: its `up`/`down` run *inside* the deny-list wrapper, in the same
-  devShell and with the same env scrub the eventual claude/`-s` launch gets
+  devShell and with the same env scrub the eventual agent/`-s` launch gets
   (see [Per-repo worktree files](#per-repo-worktree-files)), so a malicious or
   agent-modified copy has no more reach than the agent's own sandboxed shell.
   The host-side surface is **not** limited to these: the nix daemon socket and
@@ -997,7 +1080,7 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   [`--no-sandbox` and `--real-home`](#--no-sandbox-and---real-home-the-deploy-shell))
   runs with no filesystem containment at all -- it exists for operator-driven,
   trusted work (a deployment) where you *want* full host access. It is refused
-  for claude and confined to `-s/--shell` precisely because it drops the one
+  for an agent and confined to `-s/--shell` precisely because it drops the one
   boundary csb has; treat that shell as ordinary host access, not a sandbox.
 - `sandbox-exec` is formally deprecated (but stable -- nix's own darwin sandbox
   uses the same libsandbox). The mechanism is isolated in one helper
@@ -1112,7 +1195,7 @@ sandbox still runs, logging a note on launch. nix ignores untracked files, so a
 brand-new `flake.nix` counts as absent until you `git add` it -- csb falls back
 in that case too.
 
-The fallback aims to be genuinely comfortable for both claude and an
+The fallback aims to be genuinely comfortable for both the agent and an
 interactive `csb -s` shell -- a language-agnostic toolset with no project
 toolchain:
 
@@ -1125,7 +1208,7 @@ toolchain:
   `less` (the shellHook exports `BASH_COMPLETION` for a seeded rc to source)
 - **convenience:** `gzip`, `xz`, `zstd`, `unzip`, `delta`, `bat`
 
-**`~/bin` on PATH.** For both claude and the shell, if `$HOME/bin` exists (in
+**`~/bin` on PATH.** For both the agent and the shell, if `$HOME/bin` exists (in
 whichever HOME the launch uses -- real under `--real-home`, otherwise the
 namespace/ephemeral HOME) it is **prepended** to `PATH`, so your own scripts
 (e.g. deploy wrappers) take precedence -- ahead of the devShell toolchain. This
@@ -1144,7 +1227,7 @@ nix flake init -t "$CSB_SELF"
 defaults to the private remote -- see [Environment](#quickstart))
 
 csb dogfoods itself: its own `flake.nix` exposes a `devShells.default` (git +
-shellcheck), so `csb --here` runs claude on the csb repo like any other.
+shellcheck), so `csb --here` runs the agent on the csb repo like any other.
 
 ## Files
 
@@ -1153,10 +1236,10 @@ bin/csb                    the orchestrator (worktree + deny-list + launch)
 ocaml/                     csb-config (config resolution, --help, --dump-config)
                            and csb-proxy (the --filter-egress CONNECT proxy)
 LICENSE                    MIT
-flake.nix                  packages {csb, csb-tools, claude, bwrap/pasta/nft (linux)} + apps
+flake.nix                  packages {csb, csb-tools, one per agent, bwrap/pasta/nft (linux)} + apps
 templates/repo/            scaffold: a standalone dev-shell flake for a consuming repo
 templates/home/            starter seed-home skeleton (copy to ~/.config/csb/home)
-templates/allowed-hosts    starter egress allowlist (copy to ~/.config/csb/allowed-hosts)
+templates/allowed-hosts.*  starter per-agent egress allowlist (copy to ~/.config/csb/)
 Makefile                   install, lint, test, and build targets (make help)
 test/                      bats test suite (make test); see docs/PLAN-005-tests.md
 docs/PLAN-002.md           the implemented design (single mode, deny-list, profiles)
@@ -1165,6 +1248,7 @@ docs/PLAN-004.md           the pre-release audit: findings, fixes, scope decisio
 docs/PLAN-005-tests.md     the test-suite plan (dump seams + bats tiers)
 docs/PLAN-007-escape.md    the sandbox-escape investigation and what it closed
 docs/PLAN-009-proxy.md     egress filtering, and the OCaml config layer
+docs/PLAN-010-agents.md    the agent axis, and the plan for agents beyond claude
 docs/TODO.md               current state and next steps
 ```
 

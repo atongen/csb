@@ -12,8 +12,10 @@
 type t = {
   home : Types.home_sel Layer.t;
   nix : Types.nix_targets Layer.t;
+  agent : Types.agent Layer.t;
   shell : bool option;
   token_cmd : string Layer.t;
+  token_env : string Layer.t;
   latest : bool option;
   verbose : bool option;
   yolo : bool option;
@@ -41,7 +43,8 @@ type t = {
 
 let empty =
   {
-    home = Layer.Unset; nix = Layer.Unset; shell = None; token_cmd = Layer.Unset;
+    home = Layer.Unset; nix = Layer.Unset; agent = Layer.Unset; shell = None;
+    token_cmd = Layer.Unset; token_env = Layer.Unset;
     latest = None; verbose = None; yolo = None; paranoid = None;
     pasteboard = None; sandbox = None; here = None; seed_creds = None;
     seed_home = Layer.Unset; tmpdir = Layer.Unset; accent = Layer.Unset;
@@ -62,32 +65,20 @@ type draft = {
   raw_real_home : bool option;
   raw_nix : string Layer.t;
   raw_nix_shell : string Layer.t;
-  raw_nix_claude : string Layer.t;
+  raw_nix_agent : string Layer.t;
 }
 
 let blank =
   {
     layer = empty; raw_ns = Layer.Unset; raw_ephemeral = None;
     raw_real_home = None; raw_nix = Layer.Unset; raw_nix_shell = Layer.Unset;
-    raw_nix_claude = Layer.Unset;
-  }
-
-(* Layer 1. Two variables that cost nothing and remove noise a tight egress
-   allowlist otherwise produces: claude is pinned by nix, so an auto-update can
-   only target a read-only store path, and the non-essential traffic is
-   telemetry. Overridable like any other layer's setenv. *)
-let builtin =
-  {
-    empty with
-    setenv =
-      [ ("DISABLE_AUTOUPDATER", "1");
-        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1") ];
+    raw_nix_agent = Layer.Unset;
   }
 
 let known_keys =
-  "ns, token_cmd, latest, verbose, yolo, paranoid, pasteboard, sandbox, \
-   real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
-   nix_target_claude, seed_creds, seed_home, tmpdir, accent, args, keep, setenv, \
+  "agent, ns, token_cmd, token_env, latest, verbose, yolo, paranoid, pasteboard, \
+   sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
+   nix_target_agent, seed_creds, seed_home, tmpdir, accent, args, keep, setenv, \
    deny_read, allow_write, allow_socket, filter_egress, allow_loopback, \
    allow_host, allow_port, paranoid_deny_read, paranoid_allow_read"
 
@@ -114,9 +105,21 @@ let apply env ~where d key value =
   | "ephemeral" -> { d with raw_ephemeral = b () }
   | "nix_target" -> { d with raw_nix = target () }
   | "nix_target_shell" -> { d with raw_nix_shell = target () }
-  | "nix_target_claude" -> { d with raw_nix_claude = target () }
+  | "nix_target_agent" -> { d with raw_nix_agent = target () }
+  | "agent" ->
+      keep_layer
+        { p with
+          agent =
+            (if value = "" then Layer.Cleared
+             else Layer.Set (Agent.of_string ~where:(where ^ ": agent") value)) }
   | "shell" -> keep_layer { p with shell = b () }
   | "token_cmd" -> keep_layer { p with token_cmd = scalar value }
+  | "token_env" ->
+      keep_layer
+        { p with
+          token_env =
+            (if value = "" then Layer.Cleared
+             else Layer.Set (Validate.keep_var ~msg:(where ^ ": invalid token_env name") value)) }
   | "latest" -> keep_layer { p with latest = b () }
   | "verbose" -> keep_layer { p with verbose = b () }
   | "yolo" -> keep_layer { p with yolo = b () }
@@ -208,13 +211,13 @@ let seal ~label d =
   let nix =
     if
       Layer.named d.raw_nix || Layer.named d.raw_nix_shell
-      || Layer.named d.raw_nix_claude
+      || Layer.named d.raw_nix_agent
     then
       Layer.Set
         {
           Types.shared = Layer.value d.raw_nix;
           for_shell = Layer.value d.raw_nix_shell;
-          for_claude = Layer.value d.raw_nix_claude;
+          for_agent = Layer.value d.raw_nix_agent;
         }
     else Layer.Unset
   in
@@ -252,8 +255,10 @@ let overlay ~base ~over =
   {
     home = Layer.over over.home base.home;
     nix = Layer.over over.nix base.nix;
+    agent = Layer.over over.agent base.agent;
     shell = s over.shell base.shell;
     token_cmd = Layer.over over.token_cmd base.token_cmd;
+    token_env = Layer.over over.token_env base.token_env;
     latest = s over.latest base.latest;
     verbose = s over.verbose base.verbose;
     yolo = s over.yolo base.yolo;

@@ -49,7 +49,7 @@ CSB_CONFIG := $(OCAML_DIR)/_build/default/bin/csb_config_cli.exe
 CSB_PROXY  := $(OCAML_DIR)/_build/default/bin/csb_proxy_cli.exe
 # Egress allowlist csb-proxy serves; override to test a different set:
 #   make proxy-run PROXY_ALLOW=/tmp/my-hosts
-PROXY_ALLOW ?= templates/allowed-hosts
+PROXY_ALLOW ?= templates/allowed-hosts.claude
 # Decision log csb-proxy also writes (stderr keeps streaming either way). A path
 # the SANDBOX can read, so a denied fetch is self-diagnosable rather than an
 # opaque transport error -- see docs/PLAN-009-proxy.md s7 item 4.
@@ -171,7 +171,7 @@ test-proxy: ocaml-build ## Egress-proxy tests (real proxy + curl; not in `make t
 # dump-sandbox tag marks the rest: those need the profile generator, which
 # lives in bin/csb.
 OCAML_ORACLE := --filter-tags '!dump-sandbox' test/precedence.bats test/lists.bats \
-                test/validation.bats test/config.bats
+                test/validation.bats test/config.bats test/agents.bats
 
 ocaml-test: ocaml-build ## Config-layer oracle: the bats config tests against csb-config
 	@if command -v bats >/dev/null 2>&1; then \

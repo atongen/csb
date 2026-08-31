@@ -1,6 +1,11 @@
 # Starter egress allowlist: the hosts Claude Code needs. Copy it to
-# ${XDG_CONFIG_HOME:-~/.config}/csb/allowed-hosts, where csb reads it under
-# --filter-egress. It is also what `make proxy-run` serves by default.
+# ${XDG_CONFIG_HOME:-~/.config}/csb/allowed-hosts.claude, where csb reads it
+# under --filter-egress for agent=claude. It is also what `make proxy-run`
+# serves by default.
+#
+# csb prefers allowed-hosts.<agent> and falls back to a plain allowed-hosts, so
+# an unsuffixed file stays the shared list for every agent that has none of its
+# own -- copy this to that name instead if one list is all you want.
 #
 # Derived from Anthropic's documented network requirements, not guessed:
 # https://code.claude.com/docs/en/network-config

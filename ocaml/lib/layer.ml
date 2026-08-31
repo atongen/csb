@@ -14,3 +14,7 @@ type 'a t =
 let over hi lo = match hi with Unset -> lo | Cleared | Set _ -> hi
 let value = function Set v -> Some v | Unset | Cleared -> None
 let named = function Unset -> false | Cleared | Set _ -> true
+
+(* Validate or parse a given value without disturbing the other two states, so a
+   flag's validator reads as one step rather than as a three-arm match. *)
+let map f = function Unset -> Unset | Cleared -> Cleared | Set v -> Set (f v)

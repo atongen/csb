@@ -15,7 +15,17 @@ let mode_name = function
 
 let is_here = function Here -> true | List_worktrees | Branch _ -> false
 let branch_name = function Branch b -> b | Here | List_worktrees -> ""
-let is_shell = function Shell -> true | Claude -> false
+let is_shell = function Shell -> true | Agent -> false
+
+let seed_verb_name = function
+  | Copy -> "copy"
+  | Keychain -> "keychain"
+  | File -> "file"
+  | Json_merge -> "json_merge"
+
+(* Seed instructions report their SHAPE, verb and destination: the content is
+   multi-line template data, so a line-oriented dump can only mislead about it. *)
+let seed_shapes xs = List.map (fun s -> seed_verb_name s.verb ^ ":" ^ s.dest) xs
 
 let namespace_name = function
   | Shared n -> n
@@ -39,11 +49,13 @@ let to_lines c =
     ("no_launch", string_of_bool c.no_launch);
     ("here", string_of_bool (is_here c.target));
     ("shell", string_of_bool (is_shell c.runner));
+    ("agent", Agent.to_string c.agent);
+    ("agent_bin_attr", Agent.bin_attr c.agent);
     ("paranoid", string_of_bool c.paranoid);
     ("pasteboard", string_of_bool c.pasteboard);
     ("nix_target", opt c.nix_targets.shared);
     ("nix_target_shell", opt c.nix_targets.for_shell);
-    ("nix_target_claude", opt c.nix_targets.for_claude);
+    ("nix_target_agent", opt c.nix_targets.for_agent);
     ("nix_target_effective", effective_nix_target c);
     ("sandbox", string_of_bool c.sandbox);
     ("real_home", string_of_bool (is_real_home c.home));
@@ -62,7 +74,10 @@ let to_lines c =
     ("cfg_tmpdir", opt c.cfg_tmpdir);
     ("tmp_base", c.tmp_base);
     ("token_cmd", (match c.token_cmd with Some _ -> "present" | None -> "absent"));
-    ("claude_args", joined c.claude_args);
+    ("token_env", c.token_env);
+    ("seed", joined (seed_shapes c.seed));
+    ("cred_seed", joined (seed_shapes c.cred_seed));
+    ("agent_args", joined c.agent_args);
     ("keep", joined c.keep);
     ("setenv", joined (List.map fst c.setenv));
     ("deny_read", joined c.deny_read);

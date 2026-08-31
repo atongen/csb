@@ -37,7 +37,7 @@
 <REPO>/.git/config.worktree
 <REPO>/.git/config.worktree
 --tmpfs
-<HOME>/.csb/claudes
+<HOME>/.csb/agents
 --bind
 <NS>
 <NS>

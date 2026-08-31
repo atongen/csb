@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 #
-# csb (claude sandbox) -- run Claude Code (or a shell) in a per-branch git
+# csb (code sandbox) -- run a coding agent (or a shell) in a per-branch git
 # worktree, inside the repo's own nix devShell, behind an env scrub, a private
 # HOME, and a filesystem sandbox: deny-list reads + a write allow-list (seatbelt
 # on macOS, bubblewrap on Linux). Network and host services stay open by design.
 #
+# Which agent runs is one config key, and everything specific to it -- the flake
+# output, the credential variable, the yolo flag, the seed instructions, the
+# egress allowlist file -- arrives from csb-config as opaque values this script
+# splices or executes. It never branches on the agent itself.
+#
 # Usage: csb --help    Design, threat model, and config: README.md and docs/.
 #
-# Env: CSB_SELF   flake ref csb pulls the claude binary from (default: the
+# Env: CSB_SELF   flake ref csb pulls the agent binary from (default: the
 #                 private remote; override with CSB_SELF=path:/path/to/csb).
 #      CSB_LATEST non-empty defaults -L/--latest on.
 #      CSB_LATEST_TTL seconds to reuse a cached upstream claude-code rev under
@@ -33,7 +38,7 @@ set -euo pipefail
 
 PROG=$(basename "$0")
 
-# csb supplies the claude binary from its own flake (so repos stay decoupled).
+# csb supplies the agent binary from its own flake (so repos stay decoupled).
 # Default: the private remote. For local dev against a working tree,
 # override: CSB_SELF=path:/path/to/csb csb ...
 CSB_SELF="${CSB_SELF:-git+ssh://git@git.grandrew.com/atongen/csb.git}"
@@ -45,13 +50,17 @@ case "$CSB_SELF" in
   path:/*) CSB_SELF="path:$(cd "${CSB_SELF#path:}" 2>/dev/null && pwd -P || printf '%s' "${CSB_SELF#path:}")" ;;
 esac
 
-CSB_NS_ROOT="$HOME/.csb/claudes"
+# The launch HOMEs: one per repo AND agent, plus the shared @NAME ones.
+# CSB_NS_ROOT_LEGACY is where they lived while csb ran claude and nothing else;
+# migrate_ns_root moves the whole root across once (PLAN-010 s6a).
+CSB_NS_ROOT="$HOME/.csb/agents"
+CSB_NS_ROOT_LEGACY="$HOME/.csb/claudes"
 # Where `make install` puts csb's native helpers. Deliberately NOT the bin dir
 # holding the csb script: that dir is meant to hold portable content and is
 # commonly under version control, which a per-platform binary must not enter.
 # Outside every sandbox write root, which matters -- csb-config decides policy
 # and runs unsandboxed, so a writable one would be a persistence vector of the
-# same class as .git/hooks. The launch HOMEs under claudes/ are write roots;
+# same class as .git/hooks. The launch HOMEs under agents/ are write roots;
 # this sibling is not.
 CSB_TOOLS_DIR="$HOME/.csb/bin"
 CSB_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/csb"
@@ -296,7 +305,7 @@ run_worktreesetup() {
   # dynamically. No namespace HOME here -- up/down run before the namespace is
   # resolved and need none of its state; the write-allow roots are just the
   # worktree, its git dir, and tmp.
-  local worktree="$wt_path" ns_dir="" claude_home="" cfg_tmpdir=""
+  local worktree="$wt_path" ns_dir="" agent_home="" cfg_tmpdir=""
   build_deny_wrapper
 
   # shellcheck disable=SC2016  # single-quoted: expands inside the bash -c below, not here
@@ -330,22 +339,21 @@ fi
 
   if (( rc != 0 )); then
     if [[ "$action" == "up" ]]; then
-      die ".worktreesetup.sh up failed (exit $rc); not launching claude.
+      die ".worktreesetup.sh up failed (exit $rc); not launching the agent.
   fix the script (or the worktree) and re-run $PROG"
     fi
     echo "$PROG: warning: .worktreesetup.sh down failed (exit $rc); continuing with delete" >&2
   fi
 }
 
-# claude auths via a forwarded token: HOME is redirected away from any
-# logged-in ~/.claude (which the deny-list blocks anyway), so a host login is
-# never visible. Warn if nothing is exported to forward.
+# The agent auths via a forwarded token in $token_env: HOME is redirected away
+# from any logged-in host state dir (which the deny-list blocks anyway), so a
+# host login is never visible. Warn if nothing is exported to forward.
 warn_if_no_token() {
-  if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-    echo "$PROG: warning: CLAUDE_CODE_OAUTH_TOKEN is not set;" >&2
-    echo "  claude runs with a private HOME, so your host login isn't visible." >&2
-    echo "  Generate a token once with 'claude setup-token' and export it —" >&2
-    echo "  or set token_cmd in a profile (-p)." >&2
+  if [[ -z "${!token_env:-}" ]]; then
+    echo "$PROG: warning: $token_env is not set;" >&2
+    echo "  the agent runs with a private HOME, so your host login isn't visible." >&2
+    echo "  $token_hint — or set token_cmd in a profile (-p)." >&2
   fi
 }
 
@@ -361,45 +369,120 @@ export_git_identity() {
   if [[ -n "$git_email" ]]; then export GIT_AUTHOR_EMAIL="$git_email" GIT_COMMITTER_EMAIL="$git_email"; fi
 }
 
-# Seed an onboarding-complete + folder-trusted .claude.json so interactive claude
-# starts from CLAUDE_CODE_OAUTH_TOKEN without a login/trust prompt. Host-side,
-# into the namespace/throwaway config (never the real ~/.claude.json). Idempotent:
-# a jq merge preserves existing state; a fresh file is written directly (no jq).
-#   $1 = .claude.json to seed; $2 = project (cwd) key to trust
-seed_claude_config() {
-  local cfg="$1" proj="$2" base tmp
-  mkdir -p "$(dirname "$cfg")"
-  if command -v jq >/dev/null 2>&1; then
-    base='{}'; [[ -s "$cfg" ]] && base="$(cat "$cfg")"
-    tmp="$(mktemp)"
-    printf '%s' "$base" | jq --arg p "$proj" \
-      '.hasCompletedOnboarding = true
-       | .projects[$p].hasTrustDialogAccepted = true
-       | .projects[$p].projectOnboardingSeenCount = ((.projects[$p].projectOnboardingSeenCount) // 1)' \
-      > "$tmp" && mv "$tmp" "$cfg"
-  elif [[ "$proj" == *'"'* || "$proj" == *\\* ]]; then
-    echo "$PROG: warning: jq not found and the project path needs JSON escaping;" >&2
-    echo "  not seeding $cfg — claude may prompt for login/trust. Install jq." >&2
-  elif [[ ! -s "$cfg" ]]; then
-    # No jq, but a fresh/empty file needs no merge — write the minimal seed
-    # (proj is guarded above against JSON-significant characters).
-    cat > "$cfg" <<EOF
-{
-  "hasCompletedOnboarding": true,
-  "projects": {
-    "$proj": { "hasTrustDialogAccepted": true, "projectOnboardingSeenCount": 1 }
-  }
+# --- seeding the launch HOME: the generic verbs -------------------------------
+#
+# csb-config decides WHAT a launch seeds, per agent (docs/PLAN-010-agents.md
+# s6b); this executes it. Four verbs cover every agent's onboarding and
+# credential seeding, so this script never learns which agent it is launching:
+#
+#   copy       <host path> -> HOME/<dest>   (0600)
+#   keychain   <service>   -> HOME/<dest>   (macOS `security -w`, 0600)
+#   file       <content>   -> HOME/<dest>   (write-if-absent; --reseed overwrites)
+#   json_merge <content>   -> HOME/<dest>   (jq deep merge, the content winning)
+#
+# Everything lands in the redirected/throwaway HOME, never in the real one.
+
+# Escape $1 for use inside a JSON string literal. The three whitespace controls
+# are covered as well as the two structural characters, so any byte a path can
+# actually hold survives (NUL cannot appear in one, and no other control
+# character reaches a filesystem path in practice).
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
 }
-EOF
-  else
-    echo "$PROG: warning: jq not found; can't merge the onboarding seed into the existing" >&2
-    echo "  $cfg — claude may prompt for login/trust. Install jq." >&2
+
+# Echo $1 with the launch's placeholders resolved. Only a launch knows either
+# value: the worktree is resolved after config resolution (and reuse can hand
+# back an already-registered path), and an -E HOME is mktemp'd. $2 = "json"
+# escapes the substituted values, so a path holding a quote or a backslash
+# cannot break the document it lands in.
+# The replacements are QUOTED inside the substitution: an unquoted one is
+# backslash-processed, which would undo json_escape's own doubling.
+seed_expand() {
+  local s="$1" wt="$worktree" home="$agent_home"
+  if [[ "${2:-}" == "json" ]]; then
+    wt="$(json_escape "$wt")"
+    home="$(json_escape "$home")"
   fi
+  # shellcheck disable=SC2016  # replacing the LITERAL strings, as .worktreeenv does
+  s="${s//'${CSB_WORKTREE}'/"$wt"}"
+  # shellcheck disable=SC2016
+  s="${s//'${CSB_HOME}'/"$home"}"
+  printf '%s' "$s"
+}
+
+# Apply one seed instruction: $1 verb, $2 arg, $3 dest (relative to the launch
+# HOME). Secrets pass through the copy/keychain arms and are never echoed.
+seed_apply() {
+  local verb="$1" arg="$2" dest="$3" path="$agent_home/$3" content base tmp blob
+  mkdir -p "$(dirname "$path")"
+  case "$verb" in
+    copy)
+      [[ -f "$arg" ]] \
+        || die "seed_creds: $arg not found (log in with the host agent first)"
+      (umask 077; cp "$arg" "$path")
+      chmod 600 "$path"
+      ;;
+    keychain)
+      blob=$(security find-generic-password -a "$USER" -w -s "$arg" 2>/dev/null) \
+        || die "seed_creds: no '$arg' keychain item (log in with the host agent first)"
+      if command -v jq >/dev/null 2>&1 && ! jq -e . >/dev/null 2>&1 <<<"$blob"; then
+        die "seed_creds: unexpected '$arg' keychain blob shape (expected JSON)"
+      fi
+      (umask 077; printf '%s\n' "$blob" > "$path")
+      ;;
+    file)
+      if [[ -e "$path" && "$reseed" != "true" ]]; then
+        vecho "$PROG: kept existing HOME/$dest"
+        return 0
+      fi
+      seed_expand "$arg" > "$path"
+      ;;
+    json_merge)
+      # Idempotent by construction: the merge preserves whatever the file already
+      # holds, and a fresh file needs no merge at all -- which is the one case
+      # that still works without jq.
+      content="$(seed_expand "$arg" json)"
+      if command -v jq >/dev/null 2>&1; then
+        base='{}'; [[ -s "$path" ]] && base="$(cat "$path")"
+        tmp="$(mktemp)"
+        if printf '%s\n%s\n' "$base" "$content" | jq -s '.[0] * .[1]' > "$tmp"; then
+          cat "$tmp" > "$path"
+        else
+          echo "$PROG: warning: could not merge the seed into HOME/$dest;" >&2
+          echo "  the agent may prompt for login or trust" >&2
+        fi
+        rm -f "$tmp"
+      elif [[ ! -s "$path" ]]; then
+        printf '%s\n' "$content" > "$path"
+      else
+        echo "$PROG: warning: jq not found; can't merge the seed into the existing" >&2
+        echo "  HOME/$dest — the agent may prompt for login or trust. Install jq." >&2
+        return 0
+      fi
+      ;;
+    *) die "internal: unknown seed verb '$verb'" ;;
+  esac
+  vecho "$PROG: seeded HOME/$dest ($verb)"
+}
+
+# The onboarding seed: every launch with a redirected HOME, in emit order.
+run_seed() {
+  local i
+  for (( i = 0; i < ${#seed_verbs[@]}; i++ )); do
+    seed_apply "${seed_verbs[i]}" "${seed_args[i]}" "${seed_dests[i]}"
+  done
 }
 
 # Seed the launch HOME from a template dir (profile seed_home=, else
-# ~/.config/csb/home) so in-sandbox claude sees user-level files (CLAUDE.md,
-# settings.json, rules/) otherwise hidden by the deny-list + HOME redirection.
+# ~/.config/csb/home) so the in-sandbox agent sees user-level files (its
+# instructions file, settings, rules/) otherwise hidden by the deny-list + HOME
+# redirection.
 # Copies the template's contents non-overwriting (--reseed overwrites), every
 # launch. Only what you place in the template crosses in -- never a real-HOME
 # sweep, so it can't re-expose what the deny-list protects.
@@ -439,64 +522,88 @@ seed_home_template() {
   fi
 }
 
-# Resolve the effective claude namespace, i.e. which HOME the launched process
-# gets. Sets the global ns_dir (empty = ephemeral) and exports
-# CSB_CLAUDE_CONFIG_DIR. The three overrides and the default are mutually
-# exclusive HOME choices:
+# The launch HOMEs moved from ~/.csb/claudes to ~/.csb/agents when csb stopped
+# being claude-only (docs/PLAN-010-agents.md s6a). One `mv` of the whole root:
+# every entry rides along, @NAME namespaces included, byte-identical and only
+# addressed differently. Idempotent by construction -- the legacy path is gone
+# after the first call.
+migrate_ns_root() {
+  [[ -d "$CSB_NS_ROOT" ]] && return 0
+  [[ -d "$CSB_NS_ROOT_LEGACY" ]] || return 0
+  mkdir -p "$(dirname "$CSB_NS_ROOT")"
+  mv "$CSB_NS_ROOT_LEGACY" "$CSB_NS_ROOT" \
+    || die "could not move the launch HOMEs from $CSB_NS_ROOT_LEGACY to $CSB_NS_ROOT"
+  echo "$PROG: moved the launch HOMEs: $CSB_NS_ROOT_LEGACY -> $CSB_NS_ROOT" >&2
+}
+
+# Resolve the effective namespace, i.e. which HOME the launched process gets.
+# Sets the global ns_dir (empty = ephemeral or --real-home). The three overrides
+# and the default are mutually exclusive HOME choices:
 #   --real-home    -> the operator's REAL HOME (no redirect, no dir)
 #   -E/--ephemeral -> throwaway config/HOME under tmp (no namespace)
-#   -N NAME        -> shared, cross-repo HOME at ~/.csb/claudes/@NAME
+#   -N NAME        -> shared, cross-repo HOME at ~/.csb/agents/@NAME
 #                     (the leading @ is optional: NAME and @NAME are the same)
-#   default        -> one persistent HOME per REPO at ~/.csb/claudes/repo-<key>,
-#                     shared across all the repo's branches/worktrees
+#   default        -> one persistent HOME per REPO AND AGENT at
+#                     ~/.csb/agents/repo-<key>-<agent>, shared across all the
+#                     repo's branches/worktrees
 # There is no sticky state: the default is derived from the repo every run, so
 # `csb BRANCH` is deterministic without remembering anything.
 setup_namespace() {
-  local ns
+  local ns legacy
   ns_dir=""
 
   if [[ "$real_home" == "true" ]]; then
     # No redirection: HOME stays the operator's real HOME (kept through the env
-    # scrub). No namespace dir, no CLAUDE_CONFIG_DIR override, and (below) no
-    # seeding -- csb must never write into the real ~/.claude.
-    export CSB_CLAUDE_CONFIG_DIR=""
+    # scrub). No namespace dir, no config-dir override, and (below) no seeding --
+    # csb must never write into the agent's real state dir.
     vecho "$PROG: HOME: real ($HOME)  (no namespace, no redirection)"
     return
   fi
 
   if [[ "$ephemeral" == "true" ]]; then
     csb_ephemeral="true"
-    export CSB_CLAUDE_CONFIG_DIR=""
     vecho "$PROG: namespace: ephemeral  (throwaway config)"
     return
   fi
 
-  # HOME redirects to <ns>, so the config dir is <ns>/.claude (coincides with
-  # claude's default $HOME/.claude).
+  migrate_ns_root
+
   if [[ -n "$namespace" ]]; then
     # -N NAME and -N @NAME both name the SAME shared, cross-repo namespace: one
-    # dir at ~/.csb/claudes/@NAME, never auto-removed. The auto-@ prefix keeps
+    # dir at ~/.csb/agents/@NAME, never auto-removed. The auto-@ prefix keeps
     # user names in their own flat space, so none can alias a repo-<key> dir.
+    # Deliberately NOT agent-suffixed: naming a namespace is already an explicit
+    # sharing decision, and `-N work-codex` is how you keep two agents apart.
     ns="@${namespace#@}"
     ns_dir="$CSB_NS_ROOT/$ns"
-    mkdir -p "$ns_dir/.claude"
-    echo "kind=shared" > "$ns_dir/.csb-ns"
-    export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
+    mkdir -p "$ns_dir/$agent_config_dir"
+    printf 'kind=shared\n' > "$ns_dir/.csb-ns"
     csb_ns="$ns"
     vecho "$PROG: namespace: $ns  (persistent, shared across repos: $ns_dir)"
     return
   fi
 
-  # Default: one persistent HOME per repo (repo-<basename>-<pathhash>), shared
-  # by every branch and worktree of the repo. Not tied to any one branch, so it
-  # is never auto-pruned or removed by -d.
-  ns="repo-$ns_repo_key"
+  # Default: one persistent HOME per repo (repo-<basename>-<pathhash>) AND per
+  # agent, shared by every branch and worktree of the repo. Not tied to any one
+  # branch, so it is never auto-pruned or removed by -d. The agent suffix sits
+  # after the hex hash, so it cannot be confused with a repo basename that ends
+  # in an agent's name -- and it keeps retirement, seeding, --reseed and seeded
+  # credentials per-agent, so one agent's sessions are never readable by another.
+  ns="repo-$ns_repo_key-$agent"
   ns_dir="$CSB_NS_ROOT/$ns"
-  mkdir -p "$ns_dir/.claude"
-  echo "kind=repo" > "$ns_dir/.csb-ns"
-  export CSB_CLAUDE_CONFIG_DIR="$ns_dir/.claude"
+  # A pre-agent dir for this repo belongs to the agent csb was before it had an
+  # axis, so that agent adopts it rather than stranding it: one lossless `mv`
+  # within the root, and the migrated HOME is byte-identical.
+  legacy="$CSB_NS_ROOT/repo-$ns_repo_key"
+  if [[ "$ns_migrate" == "true" && ! -d "$ns_dir" && -d "$legacy" ]] \
+     && grep -qx 'kind=repo' "$legacy/.csb-ns" 2>/dev/null; then
+    mv "$legacy" "$ns_dir" || die "could not move $legacy to $ns_dir"
+    echo "$PROG: moved the launch HOME: repo-$ns_repo_key -> $ns" >&2
+  fi
+  mkdir -p "$ns_dir/$agent_config_dir"
+  printf 'kind=repo\nagent=%s\n' "$agent" > "$ns_dir/.csb-ns"
   csb_ns="$ns"
-  vecho "$PROG: namespace: $ns  (persistent, per-repo: $ns_dir)"
+  vecho "$PROG: namespace: $ns  (persistent, per repo and agent: $ns_dir)"
 }
 
 # --- deny-list / write policy -----------------------------------------------------
@@ -554,6 +661,9 @@ build_deny_paths() {
     "$HOME/.password-store"
     "$HOME/.claude"
     "$HOME/.claude.json"
+    "$HOME/.csb/agents"
+    # The pre-agent launch-HOME root. Listed too: a host that has not launched
+    # since the rename still has it, and build_deny_paths skips what is absent.
     "$HOME/.csb/claudes"
     "$HOME/.netrc"
     "$HOME/.git-credentials"
@@ -590,8 +700,21 @@ build_deny_paths() {
     "$HOME/.config/rclone"
     "$HOME/.config/op"
     "$HOME/.config/configstore"
+    # Other agents' HOST state: credentials sitting on the real HOME that no
+    # sandboxed agent has business reading -- including the one csb is launching,
+    # whose own state lives inside the redirected HOME and is untouched by these.
     "$HOME/.config/github-copilot"
+    "$HOME/.copilot"
     "$HOME/.gemini"
+    "$HOME/.codex"
+    "$HOME/.local/share/opencode"
+    "$HOME/.qwen"
+    "$HOME/.aider"
+    "$HOME/.aider.conf.yml"
+    "$HOME/.config/goose"
+    "$HOME/.local/share/goose"
+    "$HOME/.config/amp"
+    "$HOME/.cursor"
     "$HOME/.mc"
     "$HOME/.minio"
     "$HOME/.s3cfg"
@@ -674,7 +797,7 @@ build_deny_paths() {
 # the per-user temp dir are writable but SHARED with the host, so a socket there
 # may be a host service. Write policy cannot make that distinction; socket policy
 # must.
-# Consumes the globals worktree, claude_home, cfg_tmpdir.
+# Consumes the globals worktree, agent_home, cfg_tmpdir.
 build_write_roots() {
   write_roots=(); own_roots=()
   local -a cand=("$worktree") own=("$worktree")
@@ -686,8 +809,8 @@ build_write_roots() {
   # The ephemeral HOME is a write root; the REAL HOME under --real-home is NOT
   # (writes stay default-deny -- the shell reaches the fs via --no-sandbox, not
   # by widening the write policy).
-  [[ -n "$claude_home" && -z "$ns_dir" && "$real_home" != "true" ]] \
-    && { cand+=("$claude_home"); own+=("$claude_home"); }
+  [[ -n "$agent_home" && -z "$ns_dir" && "$real_home" != "true" ]] \
+    && { cand+=("$agent_home"); own+=("$agent_home"); }
   [[ -n "$cfg_tmpdir" ]] && cand+=("$cfg_tmpdir")
   cand+=("/tmp")
   if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -908,7 +1031,7 @@ start_egress_proxy() {
   # The decision log goes in the launch HOME so the SANDBOX can read it: a denied
   # CONNECT reaches the agent as an opaque transport error, and this file is the
   # only way it can tell policy from packet loss.
-  proxy_log="${claude_home:-$(tmp_base)}/csb-proxy.log"
+  proxy_log="${agent_home:-$(tmp_base)}/csb-proxy.log"
   fifo="$(mktemp -u "$(tmp_base)/csb-proxyport.XXXXXX")"
   mkfifo "$fifo"
   # Decisions arrive on the proxy's stderr; appending it to the log keeps one
@@ -1309,7 +1432,7 @@ build_deny_wrapper() {
         echo "(deny mach-priv-task-port)"
         echo "(deny iokit-open)"
         # READ policy: deny-list (later rules win; the active namespace is
-        # re-allowed under the denied ~/.csb/claudes parent).
+        # re-allowed under the denied ~/.csb/agents parent).
         for p in "${deny_dirs[@]+"${deny_dirs[@]}"}"; do
           printf '(deny file* (subpath "%s"))\n' "$p"
         done
@@ -1339,7 +1462,7 @@ build_deny_wrapper() {
           # earlier file-read* deny in seatbelt (the namespace file* allow below).
           [[ -n "$ns_real" ]] && printf '(allow file-read* (subpath "%s"))\n' "$ns_real"
         fi
-        # The active namespace is re-allowed under the denied ~/.csb/claudes
+        # The active namespace is re-allowed under the denied ~/.csb/agents
         # parent in BOTH modes, so restore ancestor traversal unconditionally.
         if [[ -n "$ns_real" ]]; then
           printf '(allow file* (subpath "%s"))\n' "$ns_real"
@@ -1431,7 +1554,7 @@ build_deny_wrapper() {
         [[ -e "$p" ]] || touch "$p"
         deny_wrapper+=(--ro-bind "$p" "$p")
       done
-      # READ policy: mount ordering matters — the ~/.csb/claudes parent is
+      # READ policy: mount ordering matters — the ~/.csb/agents parent is
       # tmpfs'd here, then the active namespace is bound back in (rw) last.
       for p in "${deny_dirs[@]+"${deny_dirs[@]}"}"; do
         deny_wrapper+=(--tmpfs "$p")
@@ -1560,78 +1683,78 @@ build_deny_wrapper() {
 # old machine-wide config (~/.config/csb/{config,deny,allow-write}) is no longer
 # read.
 
-# True when the launch config holds a session credential that can still renew
-# itself: its REFRESH token outlives a small skew. Missing jq, an unreadable
-# file or a malformed expiry read as false, so the caller re-seeds.
+# --- the --seed-creds credential ----------------------------------------------
+#
+# Three values from the adapter drive all of this, so none of it names an agent:
+# cred_check is the seeded credential file (relative to the launch HOME) whose
+# state matters between launches, and the two jq expressions say how to read and
+# how to retract it. Any of them empty disables the corresponding step.
+
+# True when the launch HOME holds a session credential that can still renew
+# itself: cred_usable_expr yields the REFRESH token's expiry in epoch
+# milliseconds, and it outlives a small skew. No expression, missing jq, an
+# unreadable file or a malformed expiry read as false, so the caller re-seeds.
 credential_is_usable() {
-  local f="$1" exp now skew_ms=300000
+  local f exp now skew_ms=300000
+  [[ -n "$cred_check" && -n "$cred_usable_expr" ]] || return 1
+  f="$agent_home/$cred_check"
   command -v jq >/dev/null 2>&1 || return 1
   [[ -s "$f" ]] || return 1
-  exp=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // empty' "$f" 2>/dev/null) || return 1
+  exp=$(jq -r "$cred_usable_expr" "$f" 2>/dev/null) || return 1
   [[ "$exp" =~ ^[0-9]+$ ]] || return 1
   now=$(( $(date +%s) * 1000 ))
   (( exp > now + skew_ms ))
 }
 
-# Drop a seeded session credential from the launch config. A forwarded
-# CLAUDE_CODE_OAUTH_TOKEN wins over it, so leaving the file behind strands a
-# live secret nothing reads, and one that would take over if the token were
-# ever unset. The token supersedes only the session credential, so any other
-# stored auth in the file (MCP connector grants) is kept and the file is removed
-# only when the session credential was all it held.
+# Drop a seeded session credential from the launch HOME. A forwarded token in
+# $token_env wins over it, so leaving the file behind strands a live secret
+# nothing reads, and one that would take over if the token were ever unset. The
+# token supersedes only the session credential, so any other stored auth in the
+# file (MCP connector grants) is kept and the file is removed only when the
+# session credential was all it held.
 clear_seeded_credentials() {
-  local f="$1/.credentials.json" tmp
+  local f tmp
+  [[ -n "$cred_check" ]] || return 0
+  f="$agent_home/$cred_check"
   [[ -f "$f" ]] || return 0
   tmp="$(mktemp)"
-  if command -v jq >/dev/null 2>&1 \
-     && jq -e 'del(.claudeAiOauth) | select(length > 0)' "$f" >"$tmp" 2>/dev/null; then
+  if [[ -n "$cred_clear_expr" ]] && command -v jq >/dev/null 2>&1 \
+     && jq -e "$cred_clear_expr | select(length > 0)" "$f" >"$tmp" 2>/dev/null; then
     cat "$tmp" >"$f"
     vecho "$PROG: dropped the seeded session credential; kept other stored auth"
   else
     rm -f "$f"
-    vecho "$PROG: removed the seeded session credential (CLAUDE_CODE_OAUTH_TOKEN takes precedence)"
+    vecho "$PROG: removed the seeded session credential ($token_env takes precedence)"
   fi
   rm -f "$tmp"
 }
 
-# Seed the launch config with the HOST's native claude session credential (macOS
-# keychain / linux ~/.claude/.credentials.json) so the sandbox presents the same
-# live subscription session as native claude. Host-side; the secret is never
-# echoed. A launch whose credential can still renew itself re-uses it untouched,
-# because claude rotates the refresh token in place and the host copy is then
-# the stale one. Sandbox and native share one refresh-token family, so
-# occasional mutual re-login prompts are possible.
+# Seed the launch HOME with the HOST's native session credential for this agent,
+# so the sandbox presents the same live subscription session as the host install.
+# Host-side; the secret is never echoed. A launch whose credential can still
+# renew itself re-uses it untouched, because the agent rotates the refresh token
+# in place and the host copy is then the stale one. Sandbox and host share one
+# refresh-token family, so occasional mutual re-login prompts are possible.
 seed_credentials() {
-  local dir="$1" blob src
-  mkdir -p "$dir"
-  if credential_is_usable "$dir/.credentials.json"; then
+  local i
+  if credential_is_usable; then
     vecho "$PROG: existing session credential can still renew itself; not re-seeding"
     return 0
   fi
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    blob=$(security find-generic-password -a "$USER" -w -s "Claude Code-credentials" 2>/dev/null) \
-      || die "seed_creds: no 'Claude Code-credentials' keychain item (log in with native claude first)"
-    [[ "$blob" == *claudeAiOauth* ]] \
-      || die "seed_creds: unexpected keychain blob shape (expected claudeAiOauth JSON)"
-    (umask 077; printf '%s\n' "$blob" > "$dir/.credentials.json")
-  else
-    src="$HOME/.claude/.credentials.json"
-    [[ -f "$src" ]] || die "seed_creds: $src not found (log in with native claude first)"
-    (umask 077; cp "$src" "$dir/.credentials.json")
-    chmod 600 "$dir/.credentials.json"
-  fi
-  vecho "$PROG: seeded host session credentials into the launch config"
+  for (( i = 0; i < ${#cred_verbs[@]}; i++ )); do
+    seed_apply "${cred_verbs[i]}" "${cred_args[i]}" "${cred_dests[i]}"
+  done
 }
 
-# Run the profile's token_cmd host-side; stdout becomes CLAUDE_CODE_OAUTH_TOKEN
-# (never echoed). Failure or empty output aborts the launch — before any
+# Run the configured token_cmd host-side; stdout becomes $token_env (never
+# echoed). Failure or empty output aborts the launch — before any
 # worktree/namespace side effects.
 run_token_cmd() {
   [[ -n "$token_cmd" ]] || return 0
   local tok
   tok=$(bash -c "$token_cmd") || die "profile token_cmd failed: $token_cmd"
   [[ -n "$tok" ]] || die "profile token_cmd produced no output: $token_cmd"
-  export CLAUDE_CODE_OAUTH_TOKEN="$tok"
+  export "$token_env=$tok"
 }
 
 # --- config resolution ------------------------------------------------------------
@@ -1667,7 +1790,11 @@ csb_config_bin() {
 # unknown key is loud on its own, but a VANISHED one would not be: `paranoid` or
 # `filter_egress` going missing would weaken the sandbox while looking like an
 # ordinary default. Lists are absent when empty, so only scalars can be required.
-csb_config_scalars=(dump mode no_launch here shell paranoid pasteboard
+csb_config_scalars=(dump mode no_launch here shell agent agent_bin_attr
+                    agent_bin_name agent_config_dir agent_config_env token_env
+                    token_hint
+                    cred_check cred_usable_expr cred_clear_expr ns_migrate
+                    paranoid pasteboard
                     nix_target_effective sandbox real_home yolo latest verbose
                     namespace branch ephemeral ephemeral_name profile seed_creds
                     seed_home reseed accent cfg_tmpdir tmp_base token_cmd filter_egress
@@ -1675,12 +1802,17 @@ csb_config_scalars=(dump mode no_launch here shell paranoid pasteboard
 
 # Run csb-config over this invocation's argv and read the resolution back into
 # the globals below. The wire format is NUL-terminated KEY=VALUE records, a list
-# key repeating once per element: NUL is the one byte a path, a claude argument
-# or a setenv value cannot hold, so no value can split itself into two. The
-# child's output is parsed, never eval'd.
+# key repeating once per element: NUL is the one byte a path, an agent argument,
+# a setenv value or a seed instruction's file content cannot hold, so no value
+# can split itself into two. The child's output is parsed, never eval'd.
+#
+# A seed instruction is three fields, and rides as three PARALLEL list keys --
+# verb, arg, dest, interleaved per instruction -- so no field needs a separator
+# it might itself contain. The length check below is what keeps them aligned.
 resolve_config() {
-  local bin emit rc=0 rec k v unknown="" seen=" "
+  local bin emit platform rc=0 rec k v unknown="" seen=" "
   bin="$(csb_config_bin)"
+  platform="$(uname -s)"
   # The file carries token_cmd, so it is created private and unlinked as soon as
   # it is read. The one temp path that cannot use tmp_base: this call is what
   # resolves cfg_tmpdir, so the value does not exist yet.
@@ -1690,8 +1822,11 @@ resolve_config() {
   # config sections are selected by: git stays on this side of the seam, so
   # there is one derivation of it. An inherited value is honoured verbatim, an
   # inherited EMPTY one included -- that is how the tests select sections
-  # without a repository.
-  ( export CSB_EMIT_TO="$emit" CSB_MAIN_ROOT="${CSB_MAIN_ROOT-$(main_checkout_root)}"
+  # without a repository. CSB_PLATFORM travels the same way and for the same
+  # reason: this script already runs uname for the sandbox, and the --seed-creds
+  # source differs by platform (a keyring on macOS, a file elsewhere).
+  ( export CSB_EMIT_TO="$emit" CSB_MAIN_ROOT="${CSB_MAIN_ROOT-$(main_checkout_root)}" \
+           CSB_PLATFORM="$platform"
     exec -a "$PROG" "$bin" "$@" ) || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     rm -f "$emit"
@@ -1711,6 +1846,17 @@ resolve_config() {
       no_launch)            no_launch="$v" ;;
       here)                 here="$v" ;;
       shell)                shell="$v" ;;
+      agent)                agent="$v" ;;
+      agent_bin_attr)       agent_bin_attr="$v" ;;
+      agent_bin_name)       agent_bin_name="$v" ;;
+      agent_config_dir)     agent_config_dir="$v" ;;
+      agent_config_env)     agent_config_env="$v" ;;
+      token_env)            token_env="$v" ;;
+      token_hint)           token_hint="$v" ;;
+      cred_check)           cred_check="$v" ;;
+      cred_usable_expr)     cred_usable_expr="$v" ;;
+      cred_clear_expr)      cred_clear_expr="$v" ;;
+      ns_migrate)           ns_migrate="$v" ;;
       paranoid)             paranoid="$v" ;;
       pasteboard)           pasteboard="$v" ;;
       nix_target_effective) nix_target_effective="$v" ;;
@@ -1733,7 +1879,13 @@ resolve_config() {
       token_cmd)            token_cmd="$v" ;;
       filter_egress)        filter_egress="$v" ;;
       allow_loopback)       allow_loopback="$v" ;;
-      claude_args)          claude_args+=("$v") ;;
+      agent_args)           agent_args+=("$v") ;;
+      seed_verb)            seed_verbs+=("$v") ;;
+      seed_arg)             seed_args+=("$v") ;;
+      seed_dest)            seed_dests+=("$v") ;;
+      cred_verb)            cred_verbs+=("$v") ;;
+      cred_arg)             cred_args+=("$v") ;;
+      cred_dest)            cred_dests+=("$v") ;;
       keep)                 extra_keep+=("$v") ;;
       setenv)               profile_setenv+=("$v") ;;
       deny_read)            deny_read_paths+=("$v") ;;
@@ -1751,6 +1903,12 @@ resolve_config() {
   for k in "${csb_config_scalars[@]}"; do
     [[ "$seen" == *" $k "* ]] || die "csb-config emitted no '$k' (mismatched versions?)"
   done
+  # The parallel seed records must stay aligned: a run whose three arrays differ
+  # in length would seed the wrong content to the wrong destination.
+  [[ ${#seed_verbs[@]} -eq ${#seed_args[@]} && ${#seed_verbs[@]} -eq ${#seed_dests[@]} ]] \
+    || die "csb-config emitted misaligned seed records (mismatched versions?)"
+  [[ ${#cred_verbs[@]} -eq ${#cred_args[@]} && ${#cred_verbs[@]} -eq ${#cred_dests[@]} ]] \
+    || die "csb-config emitted misaligned cred records (mismatched versions?)"
 }
 
 # Every knob csb-config resolves. The scalars carry csb-config's own defaults so
@@ -1761,6 +1919,20 @@ mode="launch"
 no_launch="false"
 here="false"
 shell="false"
+# The agent adapter, resolved by csb-config. Everything below is opaque here:
+# this script splices or executes the values and never inspects which agent
+# they describe (docs/PLAN-010-agents.md s6b).
+agent="claude"
+agent_bin_attr="claude"   # the flake output the binary is built from
+agent_bin_name="claude"   # the executable's name under that output's bin/
+agent_config_dir=".claude"              # state dir inside the launch HOME
+agent_config_env="CLAUDE_CONFIG_DIR"    # variable pointing the agent at it
+token_env="CLAUDE_CODE_OAUTH_TOKEN"     # token_cmd's target, kept by the scrub
+token_hint=""             # how to obtain one, for the no-token warning
+cred_check=""             # --seed-creds file whose state matters between launches
+cred_usable_expr=""       # jq: its refresh-token expiry, in epoch milliseconds
+cred_clear_expr=""        # jq: drop the session credential, keep other auth
+ns_migrate="false"        # whether an unsuffixed repo-<key> HOME is this agent's
 paranoid="false"
 pasteboard="false"
 nix_target_effective="default"  # devShells.<system>.NAME for THIS launch mode
@@ -1783,7 +1955,10 @@ cfg_tmp_base="/tmp"  # replaced by csb-config's resolved answer
 token_cmd=""
 filter_egress="false"
 allow_loopback="false"
-claude_args=()
+agent_args=()
+# The seed instructions, as three parallel arrays each: verb, arg, dest.
+seed_verbs=(); seed_args=(); seed_dests=()
+cred_verbs=(); cred_args=(); cred_dests=()
 extra_keep=()
 profile_setenv=()
 deny_read_paths=()
@@ -1803,7 +1978,7 @@ proxy_stamp=""       # ownership record the janitor reaps this proxy by
 proxy_log=""         # decision log, inside the launch HOME so the agent can read it
 nft_rules_file=""    # Linux: temp file the pasta-netns nft ruleset is loaded from
 ns_dir=""
-claude_home=""       # set once the namespace/ephemeral HOME is resolved; empty
+agent_home=""        # set once the namespace/ephemeral HOME is resolved; empty
                      # default lets run_worktreesetup call build_deny_wrapper
                      # earlier (under set -u) with no namespace HOME involved
 csb_ns=""            # resolved namespace name (empty for ephemeral)
@@ -1825,7 +2000,7 @@ nix_quiet=(); [[ "$verbose" == "true" ]] || nix_quiet=(--quiet)
 # __NIXOS_SET_ENVIRONMENT_DONE: on NixOS, an interactive bash (SYS_BASHRC =
 # /etc/bashrc) re-sources /etc/set-environment when the guard var is missing,
 # clobbering the devShell PATH. Keeping it is a no-op elsewhere.
-keep_vars=(HOME USER TERM LANG LC_ALL CLAUDE_CODE_OAUTH_TOKEN
+keep_vars=(HOME USER TERM LANG LC_ALL "$token_env"
            GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
            __NIXOS_SET_ENVIRONMENT_DONE)
 keep_vars+=("${extra_keep[@]+"${extra_keep[@]}"}")
@@ -1836,7 +2011,7 @@ for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 # token_cmd failure must abort a clean launch, not a half-prepared one).
 # Skipped for delete/list/prepare-only invocations, which launch nothing (the
 # branch/--here term keeps a listing run out of the password store); the -s
-# shell skips token_cmd too (it runs no claude — no reason to touch it).
+# shell skips token_cmd too (it runs no agent — no reason to touch it).
 if [[ "$mode" == "launch" && "$no_launch" != "true" && "$shell" != "true" \
       && -z "$dump" && ( -n "$branch" || "$here" == "true" ) ]]; then
   run_token_cmd
@@ -1879,7 +2054,9 @@ main_root=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 
 if [[ "$mode" == "list_ns" ]]; then
   [[ -z "$branch" ]] || die "--list-ns takes no BRANCH argument"
-  this_repo="repo-$ns_repo_key"
+  migrate_ns_root
+  this_repo="repo-$ns_repo_key-$agent"
+  pre_agent="repo-$ns_repo_key"
   echo "csb namespaces under $CSB_NS_ROOT:"
   count=0; legacy=0
   if [[ -d "$CSB_NS_ROOT" ]]; then
@@ -1889,8 +2066,9 @@ if [[ "$mode" == "list_ns" ]]; then
       ns=$(basename "$d")
       count=$((count + 1))
       case "$ns" in
-        "$this_repo") printf '  %-34s per-repo default (this repo)\n' "$ns" ;;
-        repo-*)       printf '  %-34s per-repo default (another repo)\n' "$ns" ;;
+        "$this_repo") printf '  %-34s per-repo default (this repo, agent %s)\n' "$ns" "$agent" ;;
+        "$pre_agent") printf '  %-34s per-repo, PRE-AGENT layout (this repo; adopted on the next launch)\n' "$ns" ;;
+        repo-*)       printf '  %-34s per-repo default (another repo or agent)\n' "$ns" ;;
         @*)           printf '  %-34s shared across repos\n' "$ns" ;;
         *)            printf '  %-34s LEGACY pre-0.3 per-branch layout (remove manually)\n' "$ns"
                       legacy=$((legacy + 1)) ;;
@@ -1972,9 +2150,9 @@ if [[ "$mode" == "delete" ]]; then
     git -C "$repo_root" worktree prune
   fi
 
-  # -d removes only the worktree. The launch HOME is now per-repo (shared by all
-  # the repo's branches) or a shared @-namespace -- neither is tied to a single
-  # branch, so deleting a worktree never removes a config. Retire a namespace
+  # -d removes only the worktree. The launch HOME is now per repo and agent
+  # (shared by all the repo's branches) or a shared @-namespace -- neither is
+  # tied to a single branch, so deleting a worktree never removes a config. Retire a namespace
   # deliberately with `rm -rf <dir>`; point there if one was named explicitly.
   if [[ "$ephemeral" != "true" && -n "$namespace" ]]; then
     ns_name="@${namespace#@}"
@@ -1997,12 +2175,12 @@ else
   run_worktreesetup up "$worktree" "$branch"
 fi
 # --no-launch is purely a worktree-prep step (the namespace only matters at
-# launch), so exit before setup_namespace — no stray ~/.csb/claudes dir.
+# launch), so exit before setup_namespace — no stray ~/.csb/agents dir.
 if [[ "$no_launch" == "true" ]]; then
   if [[ "$here" == "true" ]]; then
     echo "$PROG: --no-launch: nothing to prepare for --here" >&2
   else
-    echo "$PROG: prepared worktree (not launching claude)" >&2
+    echo "$PROG: prepared worktree (not launching the agent)" >&2
   fi
   echo "$worktree"
   exit 0
@@ -2047,81 +2225,80 @@ fi
 # `nix develop` must keep the real HOME so nix can read ~/.config/nix, its eval
 # cache, and the ssh keys / tokens needed to fetch CSB_SELF and the repo's
 # flake inputs (all nix runs host-side, unsandboxed — the trust model).
-#  - persistent namespace -> HOME=<ns>, CLAUDE_CONFIG_DIR=<ns>/.claude (set
-#    explicitly so .claude.json lands there too).
+#  - persistent namespace -> HOME=<ns>
 #  - -E/--ephemeral        -> a throwaway HOME under $TMPDIR (the janitor reaps
 #    a random one once its session is gone, the OS the named kind; deliberately
 #    not under any denied path, so it needs no re-allow).
+# Either way the agent's own state-dir variable is set too, so the layout inside
+# the launch HOME is the same whichever kind it is -- which is also what lets the
+# seed instructions name their destinations statically.
 env_overrides=()
 if [[ "$real_home" == "true" ]]; then
-  # --real-home: no HOME / CLAUDE_CONFIG_DIR override -- the env scrub keeps the
-  # real HOME (it's in keep_vars). claude_home names it only for the launch
-  # messages and the ~/bin PATH prepend; it is never seeded or write-allowed.
-  claude_home="$HOME"
-  claude_json="$HOME/.claude.json"
-  vecho "$PROG: real HOME: $claude_home (not redirected, not seeded)"
-elif [[ -n "${CSB_CLAUDE_CONFIG_DIR:-}" ]]; then
-  claude_home="$(dirname "$CSB_CLAUDE_CONFIG_DIR")"
-  env_overrides=("HOME=$claude_home" "CLAUDE_CONFIG_DIR=$CSB_CLAUDE_CONFIG_DIR")
-  claude_json="$CSB_CLAUDE_CONFIG_DIR/.claude.json"
-elif [[ -n "$ephemeral_name" ]]; then
-  # Named ephemeral: a DETERMINISTIC throwaway HOME under the same tmp base the
-  # random one uses (already a write root, undenied), so a sibling `csb -s
-  # -E=NAME` in another pane lands in the exact same env. Not a namespace: no
-  # ~/.csb/claudes entry, no provenance stamp, untracked by --list-ns; the OS
-  # reaps it from tmp. Both panes must resolve the same base (set tmpdir= in
-  # config, or keep $TMPDIR stable) for the paths to coincide.
-  claude_home="$(tmp_base)/csb-home-$ephemeral_name"
-  (umask 077; mkdir -p "$claude_home")
-  env_overrides=("HOME=$claude_home")
-  claude_json="$claude_home/.claude.json"
-  vecho "$PROG: named ephemeral HOME (reusable): $claude_home"
+  # --real-home: no HOME or state-dir override -- the env scrub keeps the real
+  # HOME (it's in keep_vars). agent_home names it only for the launch messages
+  # and the ~/bin PATH prepend; it is never seeded or write-allowed.
+  agent_home="$HOME"
+  vecho "$PROG: real HOME: $agent_home (not redirected, not seeded)"
 else
-  claude_home="$(mktemp -d "$(tmp_base)/csb-home.XXXXXX")"
-  env_overrides=("HOME=$claude_home")
-  claude_json="$claude_home/.claude.json"
-  # The owner stamp reap_dead_homes reads: this HOME is nobody else's, and it
-  # dies with pid $$ (preserved by the launch exec).
-  printf '%s\n' "$$" >"$claude_home/.csb-owner"
-  vecho "$PROG: ephemeral HOME: $claude_home"
+  if [[ -n "$ns_dir" ]]; then
+    agent_home="$ns_dir"
+  elif [[ -n "$ephemeral_name" ]]; then
+    # Named ephemeral: a DETERMINISTIC throwaway HOME under the same tmp base the
+    # random one uses (already a write root, undenied), so a sibling `csb -s
+    # -E=NAME` in another pane lands in the exact same env. Not a namespace: no
+    # ~/.csb/agents entry, no provenance stamp, untracked by --list-ns; the OS
+    # reaps it from tmp. Both panes must resolve the same base (set tmpdir= in
+    # config, or keep $TMPDIR stable) for the paths to coincide.
+    agent_home="$(tmp_base)/csb-home-$ephemeral_name"
+    (umask 077; mkdir -p "$agent_home")
+    vecho "$PROG: named ephemeral HOME (reusable): $agent_home"
+  else
+    agent_home="$(mktemp -d "$(tmp_base)/csb-home.XXXXXX")"
+    # The owner stamp reap_dead_homes reads: this HOME is nobody else's, and it
+    # dies with pid $$ (preserved by the launch exec).
+    printf '%s\n' "$$" >"$agent_home/.csb-owner"
+    vecho "$PROG: ephemeral HOME: $agent_home"
+  fi
+  env_overrides=("HOME=$agent_home")
+  [[ -z "$agent_config_env" ]] \
+    || env_overrides+=("$agent_config_env=$agent_home/$agent_config_dir")
 fi
 # Seed user-level files into the launch HOME from the template dir, BEFORE the
-# onboarding seed below so a template-provided .claude.json is merged (via jq),
-# not overwritten. Skipped under --dump-sandbox (it resolves and prints only).
-# Never seed the real HOME (--real-home): the template copy and the onboarding
-# .claude.json merge are only for a redirected/throwaway HOME.
+# agent's own seed instructions, so a template-provided file the agent also
+# seeds is merged rather than overwritten. Skipped under --dump-sandbox (it
+# resolves and prints only). Never seed the real HOME (--real-home).
 if [[ -z "$dump" && "$real_home" != "true" ]]; then
-  seed_home_template "$claude_home"
-  seed_claude_config "$claude_json" "$worktree"
+  seed_home_template "$agent_home"
+  run_seed
 fi
 if [[ -n "$cfg_tmpdir" ]]; then
   env_overrides+=("TMPDIR=$cfg_tmpdir")
 fi
-# Host-session credential seeding (see the helper). The -s shell runs no
-# claude, so it gets no credential dance at all (and no token warning); the
-# seeded session makes the token warning moot otherwise. Skipped under
-# --dump-sandbox (never touches the keychain / seeded credentials).
+# Host-session credential seeding (see the helper). The -s shell runs no agent,
+# so it gets no credential dance at all (and no token warning); the seeded
+# session makes the token warning moot otherwise. Skipped under --dump-sandbox
+# (never touches the keychain / seeded credentials).
 if [[ -n "$dump" ]]; then
   :
 elif [[ "$shell" == "true" ]]; then
   if [[ "$seed_creds" == "true" ]]; then
-    echo "$PROG: warning: --seed-creds has no effect with --shell (no claude runs; skipping)" >&2
+    echo "$PROG: warning: --seed-creds has no effect with --shell (no agent runs; skipping)" >&2
   fi
 elif [[ "$real_home" == "true" ]]; then
-  # Real HOME: the host's own ~/.claude session is already visible (nothing is
-  # redirected or denied there), so neither seed nor token warning applies --
+  # Real HOME: the host's own session for this agent is already visible (nothing
+  # is redirected or denied there), so neither seed nor token warning applies --
   # and --seed-creds must neither overwrite nor remove the real credential store.
   if [[ "$seed_creds" == "true" ]]; then
-    echo "$PROG: warning: --seed-creds has no effect with --real-home (your real ~/.claude session is used as-is)" >&2
+    echo "$PROG: warning: --seed-creds has no effect with --real-home (your real host session is used as-is)" >&2
   fi
-elif [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+elif [[ -n "${!token_env:-}" ]]; then
   if [[ "$seed_creds" == "true" ]]; then
-    echo "$PROG: warning: CLAUDE_CODE_OAUTH_TOKEN is set and takes precedence over the" >&2
+    echo "$PROG: warning: $token_env is set and takes precedence over the" >&2
     echo "  seeded session credential (unset it, or drop token_cmd=, to use --seed-creds)" >&2
   fi
-  clear_seeded_credentials "${CSB_CLAUDE_CONFIG_DIR:-$claude_home/.claude}"
+  clear_seeded_credentials
 elif [[ "$seed_creds" == "true" ]]; then
-  seed_credentials "${CSB_CLAUDE_CONFIG_DIR:-$claude_home/.claude}"
+  seed_credentials
 else
   warn_if_no_token
 fi
@@ -2129,19 +2306,20 @@ fi
 # Repo/branch-scoped env overrides: dotenv-style VAR=value lines from
 # <worktree>/.worktreeenv (blank and # lines skipped). Injected through the
 # same `env` wrapper as HOME — after the --ignore-environment scrub, inside
-# the devShell, identically for claude and --shell. Repo-controlled like
+# the devShell, identically for the agent and --shell. Repo-controlled like
 # .worktreesetup.sh, whose `up` typically generates it per-branch. A literal
 # ${HOME} in a value expands to the launch's EFFECTIVE home (the namespace
 # dir when redirected, the real one otherwise) — generators run on the host
 # before the namespace is resolved, so they can't know this path themselves.
 if [[ -f "$worktree/.worktreeenv" ]]; then
   wte_count=0
-  wte_home="${claude_home:-$HOME}"
+  wte_home="${agent_home:-$HOME}"
   while IFS= read -r wte_line; do
     [[ -z "$wte_line" || "$wte_line" == \#* ]] && continue
     if [[ "$wte_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      # shellcheck disable=SC2016  # replacing the LITERAL string ${HOME}
-      env_overrides+=("${wte_line//'${HOME}'/$wte_home}")
+      # shellcheck disable=SC2016  # replacing the LITERAL string ${HOME};
+      # the replacement is quoted so a backslash in it is not reprocessed
+      env_overrides+=("${wte_line//'${HOME}'/"$wte_home"}")
       wte_count=$((wte_count + 1))
     else
       echo "$PROG: warning: ignoring malformed .worktreeenv line: $wte_line" >&2
@@ -2162,11 +2340,13 @@ fi
 env_overrides+=("${profile_setenv[@]+"${profile_setenv[@]}"}")
 
 # csb's own launch state, for the sandboxed process to surface (a statusline
-# script, a prompt): these csb concepts have no representation in claude's env
-# or status JSON. Authoritative, so appended last (they win a name collision).
+# script, a prompt): these csb concepts have no representation in the agent's
+# env or status output. Authoritative, so appended last (they win a name
+# collision).
 csb_mode="worktree"; [[ "$here" == "true" ]] && csb_mode="here"
 env_overrides+=(
   "CSB_PROFILE=$profile_name"
+  "CSB_AGENT=$agent"
   "CSB_NS=$csb_ns"
   "CSB_EPHEMERAL=$csb_ephemeral"
   "CSB_MODE=$csb_mode"
@@ -2230,7 +2410,7 @@ if [[ "$dump" == "sandbox" ]]; then
 fi
 
 vecho "$PROG: launching in the devShell at $worktree"
-vecho "$PROG:   scrubbed env, HOME=$claude_home, fs deny-list on; network OPEN"
+vecho "$PROG:   scrubbed env, HOME=$agent_home, fs deny-list on; network OPEN"
 
 # Scrub the environment, re-admit only an allowlist (+ --keep VARs). See
 # keep_vars/keep_args above (computed early so run_worktreesetup's sandboxed
@@ -2238,7 +2418,7 @@ vecho "$PROG:   scrubbed env, HOME=$claude_home, fs deny-list on; network OPEN"
 
 # PATH shaping at launch, in a shim that execs the real command on (nix owns
 # PATH and `env` can't edit it in place). Two edits, both at shim RUNTIME so
-# they see the effective HOME (real or redirected), for claude and the shell
+# they see the effective HOME (real or redirected), for the agent and the shell
 # alike:
 #   - PREPEND $HOME/bin when it exists, so the operator's own scripts (deploy
 #     wrappers under --real-home; anything seeded into a namespace HOME) take
@@ -2254,17 +2434,19 @@ path_shim=(bash -c '
   exec "$@"' csb-path-shim)
 
 # --shell: same worktree/devShell/scrub/HOME/deny-list, but exec an interactive
-# bash (or the args after --) instead of claude. No claude build needed.
+# bash (or the args after --) instead of the agent. No agent build needed.
 if [[ "$shell" == "true" ]]; then
   cmd=(bash)
-  [[ ${#claude_args[@]} -gt 0 ]] && cmd=("${claude_args[@]}")
-  vecho "$PROG: shell in the devShell at $worktree (claude's env, no claude)"
+  [[ ${#agent_args[@]} -gt 0 ]] && cmd=("${agent_args[@]}")
+  vecho "$PROG: shell in the devShell at $worktree (the agent's env, no agent)"
   exec nix develop "$devshell_ref" "${nix_quiet[@]+"${nix_quiet[@]}"}" --ignore-environment "${keep_args[@]}" \
     --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
       "${deny_wrapper[@]+"${deny_wrapper[@]}"}" "${path_shim[@]}" "${cmd[@]}"
 fi
 
-claude_bin="$(nix build "${CSB_SELF}#claude" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/claude"
+# The agent's binary, from csb's own flake: one output per agent, named by the
+# adapter, so consuming repos stay decoupled from every agent csb can launch.
+agent_bin="$(nix build "$CSB_SELF#$agent_bin_attr" "${nix_latest_args[@]+"${nix_latest_args[@]}"}" "${nix_quiet[@]+"${nix_quiet[@]}"}" --no-link --print-out-paths)/bin/$agent_bin_name"
 exec nix develop "$devshell_ref" "${nix_quiet[@]+"${nix_quiet[@]}"}" --ignore-environment "${keep_args[@]}" \
   --command env "${env_overrides[@]+"${env_overrides[@]}"}" \
-    "${deny_wrapper[@]+"${deny_wrapper[@]}"}" "${path_shim[@]}" "$claude_bin" "${claude_args[@]+"${claude_args[@]}"}"
+    "${deny_wrapper[@]+"${deny_wrapper[@]}"}" "${path_shim[@]}" "$agent_bin" "${agent_args[@]+"${agent_args[@]}"}"

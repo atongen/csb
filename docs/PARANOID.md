@@ -11,7 +11,7 @@ never affected.
 
 `--paranoid` inserts, ahead of the namespace re-allow (bin/csb Darwin branch):
 
-    (deny file* (subpath ".../.csb/claudes"))   # deny-list floor (both modes)
+    (deny file* (subpath ".../.csb/agents"))   # deny-list floor (both modes)
     (deny file-read* (subpath "<real-home>"))   # paranoid adds this
     (allow file-read* (subpath "<write-root>")) # paranoid re-allows write roots
     ...

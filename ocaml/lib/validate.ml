@@ -40,7 +40,7 @@ let nix_target ~where v =
   then v
   else Err.die "%s: invalid nix target '%s' (use letters, digits, . _ -)" where v
 
-(* A namespace becomes a directory ~/.csb/claudes/@NAME; the leading @ is
+(* A namespace becomes a directory ~/.csb/agents/@NAME; the leading @ is
    optional here (it is added at resolve time). *)
 let namespace v =
   let body = if starts_with ~prefix:"@" v then String.sub v 1 (String.length v - 1) else v in

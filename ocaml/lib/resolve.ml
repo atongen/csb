@@ -32,11 +32,20 @@ let expand_word env w =
   Env.expand_tilde env (Buffer.contents buf)
 
 let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections ~tmpdir
-    ~hosts_file =
+    ~read_hosts =
   let pf sel = sel layers in
   let plist sel = sel layers in
 
   let shell = bool_layer ~cli:cli.shell ~profile:(pf (fun p -> p.shell)) ~default:false in
+
+  (* Which agent runs. One axis, one field, claude when no layer answers -- and
+     the key every adapter lookup below is made through, so nothing else in csb
+     needs to know the answer. It is resolved early because the egress
+     allowlist file and the built-in setenv layer are both keyed by it. *)
+  let agent =
+    Option.value (Layer.value (Layer.over cli.agent (pf (fun p -> p.agent))))
+      ~default:Types.Claude
+  in
 
   (* The launch HOME: one axis, one field, every layer answering the same way.
      Per_repo is what Cleared and Unset both resolve to -- the difference between
@@ -102,6 +111,11 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
 
   let seed_home = Layer.value (Layer.over cli.seed_home (pf (fun p -> p.seed_home))) in
   let token_cmd = Layer.value (Layer.over cli.token_cmd (pf (fun p -> p.token_cmd))) in
+  let token_env =
+    Option.value
+      (Layer.value (Layer.over cli.token_env (pf (fun p -> p.token_env))))
+      ~default:(Agent.token_env agent)
+  in
   (* CSB_TMPDIR is the floor, as it is for latest and verbose: a layer that names
      tmpdir answers instead of it, and --no-tmpdir hands the question back. *)
   let cfg_tmpdir =
@@ -127,13 +141,14 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
   let paranoid_deny_read = cli.paranoid_deny_read @ plist (fun p -> p.paranoid_deny_read) in
   let paranoid_allow_read = cli.paranoid_allow_read @ plist (fun p -> p.paranoid_allow_read) in
 
-  (* Running claude with no sandbox defeats the whole tool. The condition is the
-     "will actually launch claude" guard. *)
+  (* Running an agent with no sandbox defeats the whole tool. The condition is
+     the "will actually launch the agent" guard. *)
   if (not sandbox) && (not shell) && cli.mode = Types.Launch && (not cli.no_launch)
      && (cli.branch <> None || here)
   then
     Err.die
-      "--no-sandbox is only allowed with -s/--shell -- claude never runs unsandboxed.\n\
+      "--no-sandbox is only allowed with -s/--shell -- an agent never runs \
+       unsandboxed.\n\
       \  add -s for an unsandboxed shell, or drop --no-sandbox.";
 
   if not sandbox then (
@@ -152,20 +167,20 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
   (match ephemeral_name with Some n -> ignore (Validate.ephemeral_name n) | None -> ());
   (match accent with Some a -> ignore (Validate.accent a) | None -> ());
 
-  let claude_args =
-    match cli.claude_args with
+  let agent_args =
+    match cli.agent_args with
     | Some args -> args
     | None -> (
         match Layer.value (pf (fun p -> p.args)) with
         | None -> []
         | Some s -> List.map (expand_word env) (Profile.split_ws s))
   in
-  let claude_args =
-    if not yolo then claude_args
+  let agent_args =
+    if not yolo then agent_args
     else if shell then (
       Err.warn "warning: -y/--yolo has no effect with --shell (ignored)";
-      claude_args)
-    else "--dangerously-skip-permissions" :: claude_args
+      agent_args)
+    else Agent.yolo_flag agent :: agent_args
   in
 
   {
@@ -175,7 +190,8 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     target =
       (if here then Types.Here
        else match cli.branch with Some b -> Types.Branch b | None -> Types.List_worktrees);
-    runner = (if shell then Types.Shell else Types.Claude);
+    runner = (if shell then Types.Shell else Types.Agent);
+    agent;
     home;
     paranoid;
     pasteboard;
@@ -188,21 +204,29 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     nix_targets;
     profile = cli.profile;
     token_cmd;
+    token_env;
     seed_home;
     accent;
     cfg_tmpdir;
     tmp_base;
-    claude_args;
+    agent_args;
     keep = cli.keep @ plist (fun p -> p.keep);
-    setenv = Profile.dedupe_setenv (plist (fun p -> p.setenv) @ cli.setenv);
+    (* The agent's quiet knobs are the lowest setenv layer: they cannot live in
+       a static built-in layer any more, because which ones they are is exactly
+       what the layers above decide. *)
+    setenv =
+      Profile.dedupe_setenv
+        (Agent.setenv agent @ plist (fun p -> p.setenv) @ cli.setenv);
     deny_read;
     allow_write;
     allow_socket;
     filter_egress;
     allow_loopback;
-    allow_hosts = cli.allow_hosts @ plist (fun p -> p.allow_hosts) @ hosts_file;
+    allow_hosts = cli.allow_hosts @ plist (fun p -> p.allow_hosts) @ read_hosts agent;
     allow_ports = cli.allow_ports @ plist (fun p -> p.allow_ports);
     paranoid_deny_read;
     paranoid_allow_read;
+    seed = Agent.seed agent;
+    cred_seed = Agent.cred_seed ~env ~darwin:(Env.is_darwin env) agent;
     config_sections;
   }

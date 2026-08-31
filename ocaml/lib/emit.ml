@@ -18,6 +18,19 @@ let dump_name = function
   | Dump_config -> "config"
   | Dump_sandbox -> "sandbox"
 
+(* A seed instruction is three fields, so it rides as three PARALLEL list keys
+   in one interleaved run: verb, then arg, then dest, per instruction. That
+   needs no escape for a field separator -- the arg holds file content, which
+   can contain any byte but NUL -- and bin/csb reads the three back into three
+   arrays whose lengths it checks. *)
+let seed_records prefix xs =
+  List.concat_map
+    (fun s ->
+      [ (prefix ^ "_verb", Dump.seed_verb_name s.verb);
+        (prefix ^ "_arg", s.arg);
+        (prefix ^ "_dest", s.dest) ])
+    xs
+
 let records c =
   let b v = [ string_of_bool v ] in
   let s v = [ v ] in
@@ -30,6 +43,17 @@ let records c =
       ("no_launch", b c.no_launch);
       ("here", b (Dump.is_here c.target));
       ("shell", b (Dump.is_shell c.runner));
+      ("agent", s (Agent.to_string c.agent));
+      ("agent_bin_attr", s (Agent.bin_attr c.agent));
+      ("agent_bin_name", s (Agent.bin_name c.agent));
+      ("agent_config_dir", s (Agent.config_dir c.agent));
+      ("agent_config_env", s (Agent.config_env c.agent));
+      ("token_env", s c.token_env);
+      ("token_hint", s (Agent.token_hint c.agent));
+      ("cred_check", s (Agent.cred_check c.agent));
+      ("cred_usable_expr", s (Agent.cred_usable_expr c.agent));
+      ("cred_clear_expr", s (Agent.cred_clear_expr c.agent));
+      ("ns_migrate", b (Agent.ns_migrate c.agent));
       ("paranoid", b c.paranoid);
       ("pasteboard", b c.pasteboard);
       ("nix_target_effective", s (effective_nix_target c));
@@ -52,7 +76,7 @@ let records c =
       ("token_cmd", s (Dump.opt c.token_cmd));
       ("filter_egress", b c.filter_egress);
       ("allow_loopback", b c.allow_loopback);
-      ("claude_args", c.claude_args);
+      ("agent_args", c.agent_args);
       ("keep", c.keep);
       ("setenv", setenv_words);
       ("deny_read", c.deny_read);
@@ -63,6 +87,8 @@ let records c =
       ("paranoid_deny_read", c.paranoid_deny_read);
       ("paranoid_allow_read", c.paranoid_allow_read);
     ]
+  @ seed_records "seed" c.seed
+  @ seed_records "cred" c.cred_seed
 
 (* The file carries token_cmd, so it is created private and the caller unlinks
    it once read. *)

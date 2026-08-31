@@ -114,7 +114,7 @@ Notes and caveats:
   `XDG_CONFIG_HOME` at it, plus a `fake_repo` helper that `git init`s a temp
   repo, makes one commit, and checks out a branch (so `--here` works). All csb
   runs use this isolated HOME, so nothing touches the real `~/.config/csb` or
-  `~/.csb/claudes`.
+  `~/.csb/agents`.
 - Assertions use `bats-assert`/`bats-support` (in nixpkgs) for readable
   `assert_output`, `assert_line`, `assert_failure`.
 - Every case runs `csb ... --dump-config` (or `--dump-sandbox` for build-time
@@ -179,7 +179,7 @@ stable placeholders before comparison, or every run diffs:
 - realpath'd `$HOME` -> `<HOME>`
 - the throwaway repo path -> `<REPO>`
 - `$TMPDIR` and the macOS `/var/folders/...` per-user dir -> `<TMP>`
-- the namespace dir under `~/.csb/claudes/...` -> `<NS>`
+- the namespace dir under `~/.csb/agents/...` -> `<NS>`
 - the nix-store `bwrap` path (Linux) -> `<BWRAP>` (pinned via `CSB_BWRAP_BIN`)
 
 The normalizer is a small `sed` pass in `test/helpers.bash`, fed the concrete

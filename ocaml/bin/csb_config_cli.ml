@@ -37,15 +37,13 @@ let run env cli emit ~answered =
     | None -> Profile.empty
     | Some name -> Profile.load env ~name
   in
-  let layers =
-    Profile.overlay
-      ~base:(Profile.overlay ~base:Profile.builtin ~over:config.Config_file.layer)
-      ~over:profile
-  in
-  let hosts_file = Hosts_file.read env in
+  (* Two file layers, config below the profile. The built-in layer that used to
+     sit under them is now the agent adapter's setenv, applied in Resolve --
+     which agent's knobs those are is exactly what these layers decide. *)
+  let layers = Profile.overlay ~base:config.Config_file.layer ~over:profile in
   let cfg =
     Resolve.resolve ~env ~cli ~layers ~config_sections:config.Config_file.matched ~tmpdir
-      ~hosts_file
+      ~read_hosts:(Hosts_file.read env)
   in
   match (cfg.Types.dump, emit) with
   | Types.Dump_config, _ | _, None ->
@@ -63,7 +61,7 @@ let plain_help_when_piped opts =
   if Unix.isatty Unix.stdout then opts
   else List.map (function "-h" | "--help" -> "--help=plain" | a -> a) opts
 
-let doc = "Run Claude Code, or a shell, in a sandboxed per-branch git worktree"
+let doc = "Run a coding agent, or a shell, in a sandboxed per-branch git worktree"
 
 let man =
   [
@@ -81,16 +79,17 @@ let man =
     `P "$(mname)";
     `S Manpage.s_description;
     `P
-      "The first form provisions a git worktree for $(i,BRANCH) and launches \
-       claude in it; --here launches in the current checkout instead. -n \
+      "The first form provisions a git worktree for $(i,BRANCH) and launches the \
+       agent in it; --here launches in the current checkout instead. -n \
        prepares a worktree without launching, -d removes one, --list-ns lists \
        the namespace configs, and a bare $(mname) lists the worktrees.";
     `P
-      "Claude, or the -s shell, runs inside the repo's own nix devShell with a \
-       scrubbed environment, a private HOME (per-repo by default), a read \
-       deny-list (~/.ssh, ~/.aws, the real ~/.claude and more -- extend it with \
-       --deny-read), and a write allow-list (the worktree, the git dir, the \
-       launch HOME and the temp dir -- extend it with --allow-write).";
+      "The agent, or the -s shell, runs inside the repo's own nix devShell with a \
+       scrubbed environment, a private HOME (per repo and agent by default), a \
+       read deny-list (~/.ssh, ~/.aws, every agent's own host state dir and more \
+       -- extend it with --deny-read), and a write allow-list (the worktree, the \
+       git dir, the launch HOME and the temp dir -- extend it with \
+       --allow-write).";
     `P
       "Network egress stays open by default, so local services over TCP stay \
        reachable; --filter-egress narrows it to an allowlist. Host IPC does not \
@@ -108,8 +107,9 @@ let man =
        in whether that HOME is WRITABLE there.";
     `P
       "Naming none of them gives the fourth answer, and the default: the \
-       per-repo HOME ~/.csb/claudes/repo-<key>, persistent and writable, shared \
-       by all the repo's branches and worktrees. --per-repo names that fourth \
+       per-repo-per-agent HOME ~/.csb/agents/repo-<key>-<agent>, persistent and \
+       writable, shared by all the repo's branches and worktrees but never by \
+       two agents. --per-repo names that fourth \
        answer explicitly, which is how a run declines an ns=, ephemeral= or \
        real_home= set by a config section or a profile. Because the four are one \
        axis, --per-repo retracts whichever of the three a lower layer chose; \
@@ -144,10 +144,10 @@ let man =
     `P
       "-p NAME reads ~/.config/csb/profiles/NAME, then the optional gitignored \
        NAME.local overlay, in the same grammar without the section headers. \
-       Every layer takes the same keys: ns, token_cmd, latest, verbose, yolo, \
-       paranoid, pasteboard, sandbox, real_home, here, ephemeral, shell, \
-       nix_target, nix_target_shell, nix_target_claude, seed_creds, seed_home, \
-       tmpdir, accent, args, keep, setenv, deny_read, allow_write, \
+       Every layer takes the same keys: agent, ns, token_cmd, token_env, latest, \
+       verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, \
+       shell, nix_target, nix_target_shell, nix_target_agent, seed_creds, \
+       seed_home, tmpdir, accent, args, keep, setenv, deny_read, allow_write, \
        allow_socket, filter_egress, allow_loopback, allow_host, allow_port, \
        paranoid_deny_read, paranoid_allow_read.";
     `P
@@ -163,7 +163,7 @@ let man =
     `S Manpage.s_environment;
     `I
       ( "CSB_SELF",
-        "The flake ref csb pulls the claude binary from. Default: the private \
+        "The flake ref csb pulls the agent binary from. Default: the private \
          remote. Override with a path: ref for local development." );
     `I ("CSB_LATEST", "Non-empty defaults -L/--latest on.");
     `I
@@ -177,6 +177,10 @@ let man =
       ( "CSB_MAIN_ROOT",
         "Select the config sections for this main checkout root instead of the \
          one csb derives from git. Empty selects none." );
+    `I
+      ( "CSB_PLATFORM",
+        "`uname -s`, supplied by csb. Only the --seed-creds source reads it: a \
+         keyring on Darwin, a file elsewhere." );
     `I ("CSB_CONFIG_BIN", "Use this csb-config binary verbatim instead of searching for one.");
     `I ("CSB_PROXY_BIN", "Use this csb-proxy binary verbatim instead of resolving it from CSB_SELF.");
     `I ("CSB_BWRAP_BIN", "Linux: use this bubblewrap binary verbatim instead of building it via nix.");
@@ -186,9 +190,15 @@ let man =
         "The per-repo configuration, in [SELECTOR] sections, plus its optional \
          gitignored config.local overlay." );
     `I ("~/.config/csb/profiles/NAME", "A named profile, plus its optional NAME.local overlay.");
-    `I ("~/.config/csb/allowed-hosts", "The user-global egress allowlist, add-only, one host or *.suffix per line.");
+    `I
+      ( "~/.config/csb/allowed-hosts",
+        "The user-global egress allowlist, add-only, one host or *.suffix per \
+         line. A sibling allowed-hosts.<agent> replaces it for that agent." );
     `I ("~/.config/csb/home", "The default template --seed-home copies into a fresh launch HOME.");
-    `I ("~/.csb/claudes", "The persistent launch HOMEs: repo-<key> per repo, @NAME per namespace.");
+    `I
+      ( "~/.csb/agents",
+        "The persistent launch HOMEs: repo-<key>-<agent> per repo and agent, \
+         @NAME per shared namespace." );
   ]
 
 let () =

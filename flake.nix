@@ -1,5 +1,5 @@
 {
-  description = "csb — Claude Code in per-branch git worktrees: repo devShell + env scrub + deny-list sandbox";
+  description = "csb (code sandbox) — a coding agent in per-branch git worktrees: repo devShell + env scrub + deny-list sandbox";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -37,9 +37,9 @@
             text = builtins.readFile ./bin/csb;
           };
 
-          # The claude binary csb launches inside the repo's own devShell
-          # (`nix develop <repo> --command ... claude`) — supplied from csb's
-          # flake so consuming repos stay decoupled from csb.
+          # One output per agent csb can launch, named by the agent adapter's
+          # bin_attr (ocaml/lib/agent.ml) — supplied from csb's flake so
+          # consuming repos stay decoupled from every agent csb supports.
           claude = pkgs.claude-code;
 
           # The OCaml helpers under ocaml/: csb-proxy (egress allowlist proxy,
@@ -79,7 +79,7 @@
           nft = pkgs.nftables;
         });
 
-      # csb dogfoods itself: `csb <branch>` (or --here) runs claude in this
+      # csb dogfoods itself: `csb <branch>` (or --here) runs the agent in this
       # devShell to edit/lint the script. Standalone, like the repo template.
       devShells = forAllSystems (system:
         let pkgs = nixpkgs.legacyPackages.${system}; in
@@ -158,7 +158,7 @@
       # defaults to the private remote; see bin/csb).
       templates.default = {
         path = ./templates/repo;
-        description = "Repo flake: a standalone devShell that csb runs claude in";
+        description = "Repo flake: a standalone devShell that csb runs an agent in";
       };
       templates.repo = self.templates.default;
     };
