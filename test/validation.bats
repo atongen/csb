@@ -168,6 +168,46 @@ load helpers
 }
 
 # bats test_tags=dump-sandbox
+@test "a deny_read containing the worktree is refused" {
+  # The default read policy is a blacklist, so nothing re-allows the worktree
+  # afterwards and the sandbox would come up unable to read its own repo.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --deny-read "$(dirname "$repo")"
+  assert_failure
+  assert_output --partial "which the sandbox must be able to read"
+  assert_output --partial "paranoid_deny_read"
+}
+
+# bats test_tags=dump-sandbox
+@test "a deny_read containing the worktree is refused under --paranoid too" {
+  # Paranoid re-allows the write roots on top, so this one would survive -- but
+  # one config that works in only one mode is the trap the guard exists to stop.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --paranoid --deny-read "$(dirname "$repo")"
+  assert_failure
+  assert_output --partial "which the sandbox must be able to read"
+}
+
+# bats test_tags=dump-sandbox
+@test "a deny_read INSIDE the worktree is allowed" {
+  # One-directional check: fencing a secrets dir in the repo is the feature.
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$repo/secrets"
+  dump_sandbox "$repo" --deny-read "$repo/secrets"
+  assert_success
+  assert_output --partial "/secrets"
+}
+
+# bats test_tags=dump-sandbox
+@test "paranoid_deny_read containing the worktree stays allowed" {
+  # The paranoid read policy re-allows the worktree after the deny, which is
+  # exactly why the paranoid-only form is the one that works for a broad tree.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --paranoid --paranoid-deny-read "$(dirname "$repo")"
+  assert_success
+}
+
+# bats test_tags=dump-sandbox
 @test "a linked worktree's own .git file is write-denied" {
   # It sits inside the writable worktree and names the gitdir csb resolves the
   # main checkout from -- and with it the namespace HOME and the config sections

@@ -1077,10 +1077,32 @@ nft_ruleset() {
   echo "}"
 }
 
+# Refuse a deny_read that CONTAINS a root csb created (worktree, git common dir,
+# ephemeral HOME). The default read policy is a blacklist, so no later rule
+# re-allows the root and the sandbox comes up unable to read its own worktree;
+# --paranoid re-allows the write roots on top, which is why the paranoid-only
+# form is the one that works for a broad tree. The test is deliberately
+# one-directional: a deny_read INSIDE a root (a secrets dir in the worktree) is
+# the feature working, not an error.
+refuse_deny_over_own_roots() {
+  local p rp r
+  for p in "${deny_read_paths[@]+"${deny_read_paths[@]}"}"; do
+    [[ -e "$p" ]] || continue
+    rp=$(realpath "$p")
+    for r in "${own_roots[@]+"${own_roots[@]}"}"; do
+      if [[ "$r" == "$rp" || "$r" == "$rp"/* ]]; then
+        die "deny_read '$rp' contains '$r', which the sandbox must be able to read
+  (use paranoid_deny_read= / --paranoid-deny-read to fence a tree that holds the worktree)"
+      fi
+    done
+  done
+}
+
 build_deny_wrapper() {
   deny_wrapper=()
   build_deny_paths
   build_write_roots
+  refuse_deny_over_own_roots
   local -a ipc_brokers=() socket_subpaths=() socket_literals=()
   build_ipc_brokers
   # A write root may not re-open a broker path csb closes (PLAN-007 D9), and
@@ -1538,14 +1560,54 @@ build_deny_wrapper() {
 # old machine-wide config (~/.config/csb/{config,deny,allow-write}) is no longer
 # read.
 
+# True when the launch config holds a session credential that can still renew
+# itself: its REFRESH token outlives a small skew. Missing jq, an unreadable
+# file or a malformed expiry read as false, so the caller re-seeds.
+credential_is_usable() {
+  local f="$1" exp now skew_ms=300000
+  command -v jq >/dev/null 2>&1 || return 1
+  [[ -s "$f" ]] || return 1
+  exp=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // empty' "$f" 2>/dev/null) || return 1
+  [[ "$exp" =~ ^[0-9]+$ ]] || return 1
+  now=$(( $(date +%s) * 1000 ))
+  (( exp > now + skew_ms ))
+}
+
+# Drop a seeded session credential from the launch config. A forwarded
+# CLAUDE_CODE_OAUTH_TOKEN wins over it, so leaving the file behind strands a
+# live secret nothing reads, and one that would take over if the token were
+# ever unset. The token supersedes only the session credential, so any other
+# stored auth in the file (MCP connector grants) is kept and the file is removed
+# only when the session credential was all it held.
+clear_seeded_credentials() {
+  local f="$1/.credentials.json" tmp
+  [[ -f "$f" ]] || return 0
+  tmp="$(mktemp)"
+  if command -v jq >/dev/null 2>&1 \
+     && jq -e 'del(.claudeAiOauth) | select(length > 0)' "$f" >"$tmp" 2>/dev/null; then
+    cat "$tmp" >"$f"
+    vecho "$PROG: dropped the seeded session credential; kept other stored auth"
+  else
+    rm -f "$f"
+    vecho "$PROG: removed the seeded session credential (CLAUDE_CODE_OAUTH_TOKEN takes precedence)"
+  fi
+  rm -f "$tmp"
+}
+
 # Seed the launch config with the HOST's native claude session credential (macOS
 # keychain / linux ~/.claude/.credentials.json) so the sandbox presents the same
-# live subscription session as native claude. Host-side, every launch; the
-# secret is never echoed. Sandbox and native share one refresh-token family, so
+# live subscription session as native claude. Host-side; the secret is never
+# echoed. A launch whose credential can still renew itself re-uses it untouched,
+# because claude rotates the refresh token in place and the host copy is then
+# the stale one. Sandbox and native share one refresh-token family, so
 # occasional mutual re-login prompts are possible.
 seed_credentials() {
   local dir="$1" blob src
   mkdir -p "$dir"
+  if credential_is_usable "$dir/.credentials.json"; then
+    vecho "$PROG: existing session credential can still renew itself; not re-seeding"
+    return 0
+  fi
   if [[ "$(uname -s)" == "Darwin" ]]; then
     blob=$(security find-generic-password -a "$USER" -w -s "Claude Code-credentials" 2>/dev/null) \
       || die "seed_creds: no 'Claude Code-credentials' keychain item (log in with native claude first)"
@@ -2048,14 +2110,17 @@ elif [[ "$shell" == "true" ]]; then
 elif [[ "$real_home" == "true" ]]; then
   # Real HOME: the host's own ~/.claude session is already visible (nothing is
   # redirected or denied there), so neither seed nor token warning applies --
-  # and --seed-creds must not overwrite the real credential store.
-  [[ "$seed_creds" == "true" ]] \
-    && echo "$PROG: warning: --seed-creds has no effect with --real-home (your real ~/.claude session is used as-is)" >&2
-elif [[ "$seed_creds" == "true" ]]; then
-  if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+  # and --seed-creds must neither overwrite nor remove the real credential store.
+  if [[ "$seed_creds" == "true" ]]; then
+    echo "$PROG: warning: --seed-creds has no effect with --real-home (your real ~/.claude session is used as-is)" >&2
+  fi
+elif [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+  if [[ "$seed_creds" == "true" ]]; then
     echo "$PROG: warning: CLAUDE_CODE_OAUTH_TOKEN is set and takes precedence over the" >&2
     echo "  seeded session credential (unset it, or drop token_cmd=, to use --seed-creds)" >&2
   fi
+  clear_seeded_credentials "${CSB_CLAUDE_CONFIG_DIR:-$claude_home/.claude}"
+elif [[ "$seed_creds" == "true" ]]; then
   seed_credentials "${CSB_CLAUDE_CONFIG_DIR:-$claude_home/.claude}"
 else
   warn_if_no_token

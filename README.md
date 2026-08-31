@@ -148,16 +148,26 @@ is never visible. Two ways in:
 
 - **`--seed-creds` / `seed_creds=true` (recommended)** -- csb copies your native
   claude session credential (macOS keychain item / Linux
-  `~/.claude/.credentials.json`) into the launch config, host-side, on every
-  launch. The sandbox then presents your **live subscription session** -- same
-  account, same model entitlements as native claude. Caveat: sandbox and native
-  share one refresh-token family, so occasional mutual re-login prompts are
-  possible. Requires a native login for the wanted account on the host.
+  `~/.claude/.credentials.json`) into the launch config, host-side. The sandbox
+  then presents your **live subscription session** -- same account, same model
+  entitlements as native claude. The copy is skipped while the launch config
+  already holds a credential that can still renew itself -- gated on the
+  **refresh** token's expiry, not the access token's, because claude renews the
+  access token in place and rotates the refresh token when it does. After the
+  first rotation the sandbox's copy is the current one and the host's is stale,
+  so re-seeding would replace a working session with a dead one. Caveat: sandbox
+  and native share one refresh-token family, so a refresh in either can log the
+  other out -- expect that with several sessions running at once. Requires a
+  native login for the wanted account on the host.
 - **Token** -- `claude setup-token` once, then `CLAUDE_CODE_OAUTH_TOKEN` (or,
   better, `token_cmd=pass .../claude/token` in a profile, fetched host-side so it
-  never transits your interactive shell). Caveat: long-lived tokens carry the
-  entitlements from **mint time** -- they can lag newly released model tiers
-  until regenerated.
+  never transits your interactive shell). A forwarded token wins over a seeded
+  session credential, and the launch removes any seeded credential left in the
+  config so nothing stale can take over if the token is later unset. The token
+  supersedes only the session credential, so other stored auth in that file
+  (MCP connector grants) is preserved. Caveat:
+  long-lived tokens carry the entitlements from **mint time** -- they can lag
+  newly released model tiers until regenerated (unverified; see docs/TODO.md).
 
 ## Namespaces
 
@@ -337,7 +347,7 @@ token_cmd=pass work/claude/token          # as --token-cmd; run host-side via ba
 latest=true                               # as -L/--latest; beats CSB_LATEST, loses to explicit -L
 verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, loses to explicit -v
 yolo=true                                 # as -y/--yolo (allow-all)
-paranoid=true                             # as --paranoid (whitelist reads; see below)
+paranoid=true                             # as --paranoid (whitelist reads under HOME; see below)
 pasteboard=true                           # as --pasteboard (macOS pbcopy/pbpaste)
 sandbox=false                             # as --no-sandbox (shell only; drops the fs lockdown)
 nix_target=release                        # as --nix-target: devShells.<system>.NAME
@@ -613,12 +623,18 @@ All four combinations are valid. `--sandbox --real-home` (the default sandbox,
 real HOME) is the interesting middle: your own home is readable, but the
 credential deny-list still fences `~/.ssh`, `~/.aws`, `~/.claude`, etc.
 
-### `--paranoid`: whitelist reads
+### `--paranoid`: whitelist reads under HOME
 
-The default read policy is a blacklist. `--paranoid` flips it to a whitelist: the
-**real HOME** is read-denied wholesale, and only the write-allow roots (worktree,
-git dir, namespace HOME, tmp) are re-allowed for reading. Paths outside HOME
-(`/nix`, `/etc`, `/usr`, ...) stay readable so the devShell works.
+The default read policy is a blacklist. `--paranoid` flips it to a whitelist
+**within the real HOME**: HOME is read-denied wholesale, and only the write-allow
+roots (worktree, git dir, namespace HOME, tmp) are re-allowed for reading.
+
+It is not a filesystem-wide whitelist. Everything outside HOME stays readable in
+both modes -- `/nix` and `/etc` so the devShell works, but equally `/usr`,
+`/opt`, `/Library` and `/Applications`, so a system-wide toolchain such as a
+homebrew prefix remains readable and executable by absolute path. Fence those
+with `deny_read=` (applies in both modes) or `paranoid_deny_read=` (paranoid
+only).
 
 Because the launched `HOME` is redirected to the namespace dir, tool caches and
 config land under that re-allowed dir and keep working -- so `--paranoid` is
@@ -907,6 +923,17 @@ test suite (`docs/PLAN-005-tests.md`) drives.
 
   On Linux, `--dump-sandbox` resolves the `bwrap` binary; set `CSB_BWRAP_BIN` to
   a path to use it verbatim instead of building it via nix (hermetic dumps/tests).
+
+  **Running either dump from INSIDE a sandbox under-reports.** Both build the
+  policy against paths as the *current* process sees them, and the builder skips
+  a path it cannot `stat`. So a dump run inside a sandbox emits no rule for
+  exactly the paths that sandbox already denies -- `--deny-read /opt/homebrew`
+  prints nothing once `/opt/homebrew` is denied -- and `$HOME`-relative entries
+  resolve against the namespace HOME rather than the real one, so the floor and
+  the namespace rules come out a different shape than on the host. The dumps stay
+  the right tool for flag/precedence questions; when the question is whether a
+  specific path is reachable, probe it directly (`ls -d PATH`) or run the dump on
+  the host.
 
 ## Threat model
 

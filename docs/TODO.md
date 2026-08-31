@@ -1,5 +1,40 @@
 # TODO
 
+- [X] debug the logout expirations (tied to session stop/start with credential seeding) and reduced model options set
+    * renenable claude instrumentation and telemetry?
+    * use oauth token instead of credential seeding? At one point I thought that using the oauth token was what lead to the reduces model options set - need to confirm, I could have been mistaken
+    * platform differences? (macos vs [headless?] linux [nixos])
+    * are these objectives in conflict?
+    * honestly, the workflow with credential seeding is obnoxious, it would be great to remove it. Do we give up more powerful models here?
+- [X] block access to homebrew on macos - ie. do not allow execution of `brew` within the sandbox. Confirm paranoid mode cannot even read from /opt/homebrew or /usr/local, etc.
+      ANSWERED (2026-08-31). It needs config, not code -- and the paranoid
+      assumption above is FALSE.
+    * `--paranoid` does NOT fence it. Its read deny is scoped to the real HOME,
+      so `/opt` and `/usr` stay readable in BOTH modes and
+      `/opt/homebrew/bin/brew --prefix` runs fine under it. The README section
+      is now "`--paranoid`: whitelist reads under HOME" so the lede stops
+      implying a filesystem-wide whitelist.
+    * `deny_read=/opt/homebrew` is the whole fix: it emits `(deny file* (subpath
+      "/opt/homebrew"))` -- `file*`, so it stops exec as well as read, in both
+      modes. Add `/usr/local` (the Intel prefix) and `/home/linuxbrew` for
+      portability.
+    * NOT a hardening gap. Writes to the prefix are already denied -- the
+      profile is `(deny file-write*)` plus a five-entry allow-list (worktree,
+      `/private/tmp`, `/dev`, namespace, `.git` minus hooks/config) -- so `brew
+      install` cannot mutate it. That closes the interesting case, since the
+      prefix is user-writable (`atongen:admin`) and a planted binary would run
+      on the HOST later; same family as the `.worktreesetup.sh` / `flake.nix`
+      host-exec residual in PLAN-004. `brew` is not on PATH either (nix owns
+      PATH; the shim adds only `$HOME/bin` and `/usr/bin`, bin/csb:2230-2231).
+      What remains is exec by ABSOLUTE path, so the goal here is a hermetic
+      toolchain, not containment.
+    * deliberately NOT in the built-in floor: that floor is a credential
+      blacklist, and a toolchain path muddies what it means -- it would also
+      break anyone whose devShell does not cover what they had been getting
+      ambiently. Operator config plus a README recipe is the right shape.
+    * bound: hygiene, not containment. An agent can still fetch a static binary
+      into the writable worktree and run it -- the README's existing position on
+      the blacklist generally.
 - [X] customize devshell argument based on either shell mode or claude mode via config.
       DONE (2026-07-25): `--nix-target NAME` (profile `nix_target=`) selects
       `devShells.<system>.NAME`; `--nix-target-shell` / `--nix-target-claude`
