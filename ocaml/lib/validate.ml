@@ -61,6 +61,14 @@ let ephemeral_name v =
   in
   if ok then v else Err.die "invalid ephemeral name '%s' (use letters, digits, . _ -)" v
 
+(* The NAME in a [group NAME] header. Only ever an assoc key, but held to a
+   plain word so a stray comma or bracket reads as a mistake rather than as part
+   of the name. A use= names a group by string equality, so a name it could
+   never match is refused where it is written. *)
+let group_name ~where v =
+  if v <> "" && for_all (fun c -> is_alnum c || c = '.' || c = '_' || c = '-') v then v
+  else Err.die "%s: invalid group name '%s' (use letters, digits, . _ -)" where v
+
 let accent_names =
   [ "black"; "red"; "green"; "yellow"; "blue"; "magenta"; "cyan"; "white";
     "gray"; "grey"; "bright-red"; "bright-green"; "bright-yellow";

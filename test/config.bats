@@ -83,6 +83,145 @@ setup_root() { export CSB_MAIN_ROOT="$REPO"; }
   assert_line "config_sections=config[*]|config[$REPO]|config.local[*work*]"
 }
 
+# --- alternation and exclusion -----------------------------------------------
+
+@test "a comma-separated header applies if any one term matches" {
+  write_config config "[/src/other, */myrepo, *nomatch*]" "paranoid=true"
+
+  export CSB_MAIN_ROOT="$REPO"
+  dump_config
+  assert_line "paranoid=true"
+
+  export CSB_MAIN_ROOT="/src/other"
+  dump_config
+  assert_line "paranoid=true"
+
+  export CSB_MAIN_ROOT="/src/work/elsewhere"
+  dump_config
+  assert_line "paranoid=false"
+}
+
+@test "a header applies once however many of its terms match" {
+  setup_root
+  write_config config "[*work*, */myrepo]" "deny_read=/once"
+  dump_config
+  assert_line "deny_read=/once"
+  assert_line "config_sections=config[*work*, */myrepo]"
+}
+
+@test "each term of a header expands ~/ on its own" {
+  export CSB_MAIN_ROOT="$HOME/src/thing"
+  write_config config "[/nope, ~/src/*]" "paranoid=true"
+  dump_config
+  assert_line "paranoid=true"
+}
+
+@test "an exclusion withholds a matching section from one repo" {
+  write_config config "[*work*, !*/myrepo]" "paranoid=true"
+
+  export CSB_MAIN_ROOT="$REPO"
+  dump_config
+  assert_line "paranoid=false"
+  assert_line "config_sections="
+
+  export CSB_MAIN_ROOT="/src/work/other"
+  dump_config
+  assert_line "paranoid=true"
+}
+
+@test "an exclusion is the only way to withhold a list grant, which never retracts" {
+  write_config config \
+    "[*, !*/myrepo]" "allow_host=broad.example.com" \
+    "[*]" "allow_host=everywhere.example.com"
+
+  export CSB_MAIN_ROOT="$REPO"
+  dump_config
+  assert_line "allow_host=everywhere.example.com"
+
+  export CSB_MAIN_ROOT="/src/work/other"
+  dump_config
+  assert_line "allow_host=broad.example.com|everywhere.example.com"
+}
+
+@test "one exclusion suppresses a header however many terms matched" {
+  setup_root
+  write_config config "[*work*, */myrepo, !/src/*/myrepo]" "paranoid=true"
+  dump_config
+  assert_line "paranoid=false"
+}
+
+# --- groups ------------------------------------------------------------------
+
+@test "a group definition matches no repository on its own" {
+  setup_root
+  write_config config "[group work]" "paranoid=true"
+  dump_config
+  assert_success
+  assert_line "paranoid=false"
+  assert_line "config_sections="
+}
+
+@test "a used group contributes its lines to the section that names it" {
+  setup_root
+  write_config config \
+    "[group work]" "paranoid=true" "allow_host=api.internal.corp" \
+    "[$REPO]" "use = work"
+  dump_config
+  assert_line "paranoid=true"
+  assert_line "allow_host=api.internal.corp"
+}
+
+@test "two sections can use the same group, and lists union both times" {
+  setup_root
+  write_config config \
+    "[group db]" "allow_port=5432" \
+    "[*work*]" "use=db" \
+    "[*/myrepo]" "use=db"
+  dump_config
+  assert_line "allow_port=5432|5432"
+}
+
+@test "a group applies where it is used, so document order still decides a scalar" {
+  setup_root
+  write_config config \
+    "[group g]" "nix_target=fromgroup" \
+    "[*]" "nix_target=before" "use=g"
+  dump_config
+  assert_line "nix_target=fromgroup"
+
+  write_config config \
+    "[group g]" "nix_target=fromgroup" \
+    "[*]" "use=g" "nix_target=after"
+  dump_config
+  assert_line "nix_target=after"
+}
+
+@test "a group defined in config is usable from config.local" {
+  setup_root
+  write_config config "[group work]" "accent=magenta"
+  write_config config.local "[*]" "use=work"
+  dump_config
+  assert_line "accent=magenta"
+}
+
+@test "a used group is reported where it applied, labelled by the file defining it" {
+  setup_root
+  write_config config "[group work]" "paranoid=true"
+  write_config config.local "[*]" "verbose=true" "use=work"
+  dump_config
+  assert_line "config_sections=config.local[*]|config[group work]"
+}
+
+@test "a group in a section that does not match contributes nothing" {
+  export CSB_MAIN_ROOT="/src/work/other"
+  write_config config \
+    "[group work]" "paranoid=true" \
+    "[$REPO]" "use=work"
+  dump_config
+  assert_success
+  assert_line "paranoid=false"
+}
+
 # --- ordering ----------------------------------------------------------------
 
 @test "the last matching section to set a scalar wins, not the most specific" {
@@ -360,6 +499,96 @@ setup_root() { export CSB_MAIN_ROOT="$REPO"; }
   dump_config
   assert_failure
   assert_output --partial "[] selects nothing"
+}
+
+@test "a header of only exclusions is refused" {
+  setup_root
+  write_config config "[!*/scratch]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "only excludes (add a positive term"
+}
+
+@test "an empty term in a header is refused" {
+  setup_root
+  write_config config "[*work*, , */myrepo]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "empty term in [*work*, , */myrepo]"
+}
+
+@test "a bare ! with no pattern is refused" {
+  setup_root
+  write_config config "[*, !]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "'!' with no pattern"
+}
+
+@test "a use= naming no group is fatal, forward reference included" {
+  setup_root
+  write_config config "[*]" "use=work" "[group work]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "no [group work] defined above this line"
+}
+
+@test "an undefined group is fatal even in a section that does not match" {
+  export CSB_MAIN_ROOT="/src/work/other"
+  write_config config "[$REPO]" "use=typo"
+  dump_config
+  assert_failure
+  assert_output --partial "no [group typo] defined above this line"
+}
+
+@test "a bad key in a group nobody uses is still fatal" {
+  setup_root
+  write_config config "[group work]" "paranoidd=true"
+  dump_config
+  assert_failure
+  assert_output --partial "unknown key 'paranoidd'"
+}
+
+@test "a duplicate group definition is refused" {
+  setup_root
+  write_config config "[group work]" "paranoid=true" "[group work]" "yolo=true"
+  dump_config
+  assert_failure
+  assert_output --partial "group 'work' is already defined"
+}
+
+@test "a group cannot use another group" {
+  setup_root
+  write_config config \
+    "[group base]" "paranoid=true" \
+    "[group work]" "use=base"
+  dump_config
+  assert_failure
+  assert_output --partial "[group work]: use= cannot name another group"
+}
+
+@test "[group] with no name is refused" {
+  setup_root
+  write_config config "[group]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "[group] needs a name"
+}
+
+@test "an invalid group name is refused" {
+  setup_root
+  write_config config "[group two words]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "invalid group name 'two words'"
+}
+
+@test "a use= with no group name is refused" {
+  setup_root
+  write_config config "[*]" "use="
+  dump_config
+  assert_failure
+  assert_output --partial "use= needs a group name"
 }
 
 @test "one section naming two HOME selectors is refused" {

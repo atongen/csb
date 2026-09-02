@@ -155,16 +155,20 @@ let apply env ~where d key value =
       keep_layer { p with paranoid_allow_read = p.paranoid_allow_read @ [ path () ] }
   | _ -> Err.die "%s: unknown key '%s' (%s)" where key known_keys
 
-(* A KEY=VALUE line, applied to p. Surrounding whitespace is not part of either
-   half, so `paranoid = true` and `paranoid=true` are the same line; a value
-   that needs a leading or trailing space is the price. *)
-let apply_line env ~where p line =
+(* Surrounding whitespace is not part of either half, so `paranoid = true` and
+   `paranoid=true` are the same line; a value that needs a leading or trailing
+   space is the price. Split and application are separate steps because the
+   config file dispatches on the key before this module sees it. *)
+let split_kv ~where line =
   match String.index_opt line '=' with
   | None -> Err.die "%s: expected KEY=VALUE: '%s'" where line
   | Some i ->
-      let key = String.trim (String.sub line 0 i) in
-      let value = String.trim (String.sub line (i + 1) (String.length line - i - 1)) in
-      apply env ~where p key value
+      ( String.trim (String.sub line 0 i),
+        String.trim (String.sub line (i + 1) (String.length line - i - 1)) )
+
+let apply_line env ~where p line =
+  let key, value = split_kv ~where line in
+  apply env ~where p key value
 
 let is_blank line = line = "" || line.[0] = '#'
 

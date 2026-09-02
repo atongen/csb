@@ -352,14 +352,15 @@ A scalar or boolean goes to the highest layer that sets it. Every list
 `allow_port=6379` give the sandbox both.
 
 The config files take the same `KEY=VALUE` grammar and the same keys as a
-profile (listed below), grouped under `[SELECTOR]` section headers:
+profile (listed below), plus [`use =`](#groups), grouped under `[SELECTOR]`
+section headers:
 
 ```ini
 # ~/.config/csb/config          (shared, commit it to your dotfiles)
 [*]
 paranoid = true
 
-[*work*]
+[*work*, !*work/legacy]
 allow_host = api.internal.corp
 
 [/Volumes/src/work/api]
@@ -372,19 +373,74 @@ nix_target = ci                 # wins: the last matching section to set it
 
 A selector is matched against the repository's **physical main checkout root**,
 so a linked worktree selects its repository's sections rather than its own path.
-`*` matches any characters **including `/`**, and nothing else is special --
-which is all three shapes at once: `[*]` is every repo, `[*work*]` and `[*/csb]`
-are patterns, and a selector with no `*` is one exact path (`~/` expands).
+A header is a **comma-separated list of terms**, and the section applies when
+**some term matches and no exclusion does**. Within a term, `*` matches any
+characters **including `/`**, and nothing else is special -- which is all three
+shapes at once: `[*]` is every repo, `[*work*]` and `[*/csb]` are patterns, and
+a term with no `*` is one exact path (`~/` expands, per term).
+
+A term prefixed with `!` **excludes**: `[*, !*/scratch]` is every repo but that
+one. This is the only way to withhold a broad section from one repo, since a
+list value (`allow_host=`, `deny_read=`, ...) unions at every layer and has no
+retraction anywhere. A header of exclusions alone is an error -- write the
+positive term you mean, `[*, !...]` for all-but.
 
 **Every matching section applies, in document order** -- `config` in full, then
 `config.local`, top to bottom. The last one to set a scalar wins; lists union
 regardless of order. Order is *not* by specificity, so a machine-local `[*]`
 overrides a shared exact-path section rather than losing to it. A selector that
-matches nothing is silent, so `--dump-config` reports the ones that did:
+matches nothing is silent, so `--dump-config` reports the ones that did, each
+header verbatim:
 
 ```
 $ csb --here --dump-config | grep config_sections
-config_sections=config[*]|config[*work*]|config.local[*]
+config_sections=config[*]|config[*work*, !*work/legacy]|config.local[*]
+```
+
+### Groups
+
+A selector can only collect repos that share a path shape. When the grouping you
+want is a concept instead -- "needs postgres", "talks to the corp API" -- name a
+bundle with a `[group NAME]` header and pull it in with `use = NAME`:
+
+```ini
+[group corp]
+allow_host = api.internal.corp
+allow_host = git.internal.corp
+paranoid = true
+
+[group pg]
+allow_port = 5432
+
+[*work*]
+use = corp
+use = pg
+
+[/Volumes/src/oss/analytics]
+use = pg
+nix_target = release
+```
+
+A `[group NAME]` section **matches no repository** on its own; it does nothing
+until a section uses it. `use = NAME` **splices the group's lines in at that
+point**, so precedence is exactly what writing them inline would give -- a
+scalar the group sets beats one set above the `use`, and loses to one set below
+it. Lists union each time the group is used.
+
+The group must be **defined above** the line that uses it (`config` is read
+before `config.local`, so a group defined in the shared file is usable from the
+machine-local one). Groups do not nest: `use =` inside a `[group]` is an error.
+A group's lines are validated even if nothing uses them, and `use =` naming an
+undefined group is fatal even in a section that did not match -- the same rule
+as everywhere else here, so a typo cannot lie dormant until the day the repo it
+belongs to is the one launching.
+
+`use =` is a config-file key only; it is not a profile key. A used group appears
+in `--dump-config` where it applied, labelled by the file that defined it:
+
+```
+$ csb --here --dump-config | grep config_sections
+config_sections=config[*work*]|config[group corp]|config[group pg]
 ```
 
 Keys on the same **axis** move together: a layer that names any of `ns=`,
