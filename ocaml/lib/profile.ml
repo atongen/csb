@@ -32,6 +32,8 @@ type t = {
   allow_loopback : bool option;
   keep : string list;
   setenv : (string * string) list;
+  setenv_cmd : (string * string) list;
+  seed_merge : (string * string) list;
   deny_read : string list;
   allow_write : string list;
   allow_socket : string list;
@@ -49,7 +51,8 @@ let empty =
     pasteboard = None; sandbox = None; here = None; seed_creds = None;
     seed_home = Layer.Unset; tmpdir = Layer.Unset; accent = Layer.Unset;
     args = Layer.Unset;
-    filter_egress = None; allow_loopback = None; keep = []; setenv = []; deny_read = [];
+    filter_egress = None; allow_loopback = None; keep = []; setenv = [];
+    setenv_cmd = []; seed_merge = []; deny_read = [];
     allow_write = []; allow_socket = []; allow_hosts = []; allow_ports = [];
     paranoid_deny_read = []; paranoid_allow_read = [];
   }
@@ -78,9 +81,10 @@ let blank =
 let known_keys =
   "agent, ns, token_cmd, token_env, latest, verbose, yolo, paranoid, pasteboard, \
    sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
-   nix_target_agent, seed_creds, seed_home, tmpdir, accent, args, keep, setenv, \
-   deny_read, allow_write, allow_socket, filter_egress, allow_loopback, \
-   allow_host, allow_port, paranoid_deny_read, paranoid_allow_read"
+   nix_target_agent, seed_creds, seed_home, seed_merge, tmpdir, accent, args, \
+   keep, setenv, setenv_cmd, deny_read, allow_write, allow_socket, \
+   filter_egress, allow_loopback, allow_host, allow_port, paranoid_deny_read, \
+   paranoid_allow_read"
 
 (* An empty value RETRACTS the key, so no layer below answers either: a repo
    default in ~/.config/csb/config is cancelled by `token_cmd=` in the profile
@@ -134,6 +138,10 @@ let apply env ~where d key value =
   | "args" -> keep_layer { p with args = scalar value }
   | "keep" -> keep_layer { p with keep = p.keep @ split_ws value }
   | "setenv" -> keep_layer { p with setenv = p.setenv @ [ Validate.setenv ~where value ] }
+  | "setenv_cmd" ->
+      keep_layer { p with setenv_cmd = p.setenv_cmd @ [ Validate.setenv_cmd ~where value ] }
+  | "seed_merge" ->
+      keep_layer { p with seed_merge = p.seed_merge @ [ Validate.seed_merge env ~where value ] }
   | "deny_read" -> keep_layer { p with deny_read = p.deny_read @ [ path () ] }
   | "allow_write" -> keep_layer { p with allow_write = p.allow_write @ [ path () ] }
   | "allow_socket" -> keep_layer { p with allow_socket = p.allow_socket @ [ path () ] }
@@ -230,14 +238,25 @@ let seal ~label d =
     nix;
     keep = List.map (Validate.keep_var ~msg:(label ^ ": invalid keep var name")) p.keep }
 
+let file env ~name = Filename.concat (Env.profiles_dir env) name
+let has_file env ~name = Sys.file_exists (file env ~name)
+
 (* Read NAME, then the optional gitignored NAME.local overlay. *)
 let load env ~name =
-  let base = Filename.concat (Env.profiles_dir env) name in
+  let base = file env ~name in
   let overlay = base ^ ".local" in
   if not (Sys.file_exists base) then Err.die "profile not found: %s" base;
   let d = parse_file env blank base in
   let d = if Sys.file_exists overlay then parse_file env d overlay else d in
   seal ~label:("profile " ^ name) d
+
+(* Seal an already-split body as one layer: a [profile NAME] block in the config
+   file, whose lines were collected there instead of read from profiles/NAME.
+   The two sources produce the same kind of layer and are stacked the same way,
+   so nothing downstream needs to know which one a -p resolved to. *)
+let of_body env ~label body =
+  seal ~label
+    (List.fold_left (fun d (where, key, value) -> apply env ~where d key value) blank body)
 
 (* One VAR per name, keeping the last -- and so the highest layer -- to set it.
    The launch exports these in order and a later `env` argument wins, which a
@@ -279,6 +298,8 @@ let overlay ~base ~over =
     allow_loopback = s over.allow_loopback base.allow_loopback;
     keep = base.keep @ over.keep;
     setenv = dedupe_setenv (base.setenv @ over.setenv);
+    setenv_cmd = dedupe_setenv (base.setenv_cmd @ over.setenv_cmd);
+    seed_merge = base.seed_merge @ over.seed_merge;
     deny_read = base.deny_read @ over.deny_read;
     allow_write = base.allow_write @ over.allow_write;
     allow_socket = base.allow_socket @ over.allow_socket;

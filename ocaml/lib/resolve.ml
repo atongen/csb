@@ -31,6 +31,33 @@ let expand_word env w =
   done;
   Env.expand_tilde env (Buffer.contents buf)
 
+(* A seed_merge= source, read host-side at resolution time so a launch carries
+   the content rather than a path the sandbox would have to reach. NUL is what
+   separates the records bin/csb reads back, so a file holding one could split
+   itself into two instructions. *)
+let read_seed_source ~where path =
+  if not (Sys.file_exists path) then Err.die "%s: source not found: %s" where path;
+  if Sys.is_directory path then Err.die "%s: source is a directory: %s" where path;
+  let content = String.concat "\n" (Lines.of_file path) in
+  if content = "" then Err.die "%s: source is empty: %s" where path;
+  if String.contains content '\000' then
+    Err.die "%s: source contains a NUL byte: %s" where path;
+  content
+
+(* One name may be answered by setenv, setenv_cmd or token_env, never by two:
+   all three land in the same `env` invocation, where the last argument silently
+   wins. Refusing is what keeps that from being a rule anyone has to know. *)
+let refuse_env_collisions ~setenv ~setenv_cmd ~token_env ~token_cmd =
+  List.iter
+    (fun (var, _) ->
+      if List.mem_assoc var setenv then
+        Err.die "setenv and setenv_cmd both name %s (a variable has one source)" var;
+      if var = token_env && token_cmd <> None then
+        Err.die
+          "setenv_cmd and token_cmd both name %s (use one; --token-env names another variable)"
+          var)
+    setenv_cmd
+
 let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections ~tmpdir
     ~read_hosts =
   let pf sel = sel layers in
@@ -101,12 +128,17 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
         else v
     | _ -> cli.here = Some true
   in
-  (* Bare `csb -p NAME` launches --here: a profile is a launch config, and plain
-     `csb` still lists. *)
+  (* A launch that names no BRANCH is a launch HERE. csb is a launcher, so the
+     absence of a target is an answer rather than a question -- and --here works
+     from any checkout, a linked worktree included, which is what makes one rule
+     enough: there is no "cd to the main checkout and spell the branch" case left
+     for it to have to handle. `-l/--list` is the listing, and --here=false (from
+     --no-here or a profile) still declines, which Resolve then refuses below
+     rather than reinterpreting. *)
   let here =
     here
-    || (cli.profile <> None && cli.mode = Types.Launch && cli.branch = None
-        && (not here_cli) && p_here <> Some false)
+    || (cli.mode = Types.Launch && cli.branch = None && (not here_cli)
+        && p_here <> Some false)
   in
 
   let seed_home = Layer.value (Layer.over cli.seed_home (pf (fun p -> p.seed_home))) in
@@ -135,6 +167,9 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
   in
   let accent = Layer.value (Layer.over cli.accent (pf (fun p -> p.accent))) in
 
+  (* CLI first here, and LAST for setenv_cmd/seed_merge below. A path list is a
+     set of rules whose order the sandbox builder does not read; those two are
+     applied in sequence, so the higher layer has to be the later one to win. *)
   let deny_read = cli.deny_read @ plist (fun p -> p.deny_read) in
   let allow_write = cli.allow_write @ plist (fun p -> p.allow_write) in
   let allow_socket = cli.allow_socket @ plist (fun p -> p.allow_socket) in
@@ -183,13 +218,54 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     else Agent.yolo_flag agent :: agent_args
   in
 
+  let setenv =
+    Profile.dedupe_setenv (Agent.setenv agent @ plist (fun p -> p.setenv) @ cli.setenv)
+  in
+  (* CLI last for the same reason setenv puts it last: dedupe keeps the final
+     mention of a name, which is the highest layer to have made one. *)
+  let setenv_cmd =
+    Profile.dedupe_setenv (plist (fun p -> p.setenv_cmd) @ cli.setenv_cmd)
+  in
+  refuse_env_collisions ~setenv ~setenv_cmd ~token_env ~token_cmd;
+
+  (* seed_merge= reads its sources here, so a missing or unreadable one fails
+     before the launch has provisioned anything. The instructions go AFTER the
+     adapter's, which is what makes an operator key win the deep merge. *)
+  let seed_merge = plist (fun p -> p.seed_merge) @ cli.seed_merge in
+  (* --real-home is never seeded -- csb does not write the operator's own HOME --
+     so a seed_merge there would resolve, read its source, and then do nothing.
+     Say so rather than leaving the operator to notice the merge never landed. *)
+  if seed_merge <> [] && home = Types.Real_home then (
+    Err.warn "warning: --real-home is never seeded, so seed_merge= has no effect";
+    Err.note "  (the real HOME already holds the agent's own config)");
+  let seed =
+    Agent.seed agent
+    @ List.map
+        (fun (dest, src) ->
+          { Types.verb = Types.Json_merge;
+            arg = read_seed_source ~where:"seed_merge" src;
+            dest })
+        seed_merge
+  in
+
+  let target =
+    if here then Types.Here
+    else match cli.branch with Some b -> Types.Branch b | None -> Types.List_worktrees
+  in
+  (* The one launch with no target: here was turned OFF explicitly, and no BRANCH
+     was named. Nothing to run, and nothing to guess -- say which flag answers
+     it rather than falling back to a listing the operator did not ask for. *)
+  if cli.mode = Types.Launch && target = Types.List_worktrees then
+    Err.die
+      "nothing to launch: no BRANCH, and here is off.\n\
+      \  name a BRANCH, drop --no-here / here=false, or use -l/--list to list \
+       the worktrees.";
+
   {
     Types.mode = cli.mode;
     dump = cli.dump;
     no_launch = cli.no_launch;
-    target =
-      (if here then Types.Here
-       else match cli.branch with Some b -> Types.Branch b | None -> Types.List_worktrees);
+    target;
     runner = (if shell then Types.Shell else Types.Agent);
     agent;
     home;
@@ -202,7 +278,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     reseed = cli.reseed;
     seed_creds;
     nix_targets;
-    profile = cli.profile;
+    profiles = cli.profiles;
     token_cmd;
     token_env;
     seed_home;
@@ -214,9 +290,8 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     (* The agent's quiet knobs are the lowest setenv layer: they cannot live in
        a static built-in layer any more, because which ones they are is exactly
        what the layers above decide. *)
-    setenv =
-      Profile.dedupe_setenv
-        (Agent.setenv agent @ plist (fun p -> p.setenv) @ cli.setenv);
+    setenv;
+    setenv_cmd;
     deny_read;
     allow_write;
     allow_socket;
@@ -226,7 +301,8 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     allow_ports = cli.allow_ports @ plist (fun p -> p.allow_ports);
     paranoid_deny_read;
     paranoid_allow_read;
-    seed = Agent.seed agent;
+    seed;
     cred_seed = Agent.cred_seed ~env ~darwin:(Env.is_darwin env) agent;
+    seed_merge;
     config_sections;
   }

@@ -1221,11 +1221,62 @@ refuse_deny_over_own_roots() {
   done
 }
 
+# Refuse an operator-named write root that is a git repository ROOT. The
+# hooks/config write-denies below cover the LAUNCH repo only, so any OTHER repo
+# handed to allow_write keeps a writable .git/hooks -- and a hook planted there
+# runs on the HOST, as the operator, at that repo's next git command. Naming a
+# SUBDIRECTORY is the supported shape: .git stays outside the write root, so the
+# allow-list never reaches it. The launch repo's own checkout is exempt, its
+# hooks being denied already. Bound: the named root itself, not a repo nested
+# somewhere beneath it -- hygiene against the likely mistake, not containment.
+# Consumes the globals worktree and allow_write_paths.
+refuse_git_write_roots() {
+  local gc wt p rp
+  gc=$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  [[ -n "$gc" && -e "$gc" ]] && gc=$(realpath "$gc")
+  wt=$(realpath "$worktree")
+  for p in "${allow_write_paths[@]+"${allow_write_paths[@]}"}"; do
+    [[ -n "$p" && -e "$p" ]] || continue
+    rp=$(realpath "$p")
+    [[ "$rp" == "$wt" ]] && continue
+    [[ -e "$rp/.git" ]] || continue
+    [[ -n "$gc" && "$(realpath "$rp/.git")" == "$gc" ]] && continue
+    die "allow_write '$rp' is a git repository root: .git/hooks under it stays writable,
+  and a hook planted there runs on the HOST at that repo's next git command
+  (name a SUBDIRECTORY instead -- .git then sits outside the write root)"
+  done
+  return 0
+}
+
+# Refuse a path named by BOTH allow_write and paranoid_allow_read. A write root
+# is already read-re-allowed under --paranoid, so the pair buys nothing on macOS
+# -- while on Linux the read-only bind is emitted AFTER the writable one and
+# silently takes the write away. Checked in BOTH modes, and on both platforms, so
+# a profile shared across hosts fails identically rather than diverging into a
+# path that is writable on one and not the other.
+# Consumes the globals allow_write_paths and paranoid_allow_read_paths.
+refuse_write_allow_read_overlap() {
+  local w rw p rp
+  for w in "${allow_write_paths[@]+"${allow_write_paths[@]}"}"; do
+    rw=$(canon_path "$w")
+    for p in "${paranoid_allow_read_paths[@]+"${paranoid_allow_read_paths[@]}"}"; do
+      rp=$(canon_path "$p")
+      if paths_overlap "$rw" "$rp" || paths_overlap "$w" "$p"; then
+        die "paranoid_allow_read '$p' overlaps allow_write '$w' (a write root is already
+  readable under --paranoid; drop whichever of the two you did not mean)"
+      fi
+    done
+  done
+  return 0
+}
+
 build_deny_wrapper() {
   deny_wrapper=()
   build_deny_paths
   build_write_roots
   refuse_deny_over_own_roots
+  refuse_git_write_roots
+  refuse_write_allow_read_overlap
   local -a ipc_brokers=() socket_subpaths=() socket_literals=()
   build_ipc_brokers
   # A write root may not re-open a broker path csb closes (PLAN-007 D9), and
@@ -1453,7 +1504,8 @@ build_deny_wrapper() {
             emit_ancestor_metadata "$p" 'file-read*'
           done
           # paranoid_allow_read: re-expose these read-only (no matching write-root
-          # allow), disjoint from every deny by the overlap check above.
+          # allow), disjoint from every deny and from every write root by the two
+          # overlap checks above.
           for p in "${paranoid_allow_roots[@]+"${paranoid_allow_roots[@]}"}"; do
             printf '(allow file-read* (subpath "%s"))\n' "$p"
             emit_ancestor_metadata "$p" 'file-read*'
@@ -1537,8 +1589,10 @@ build_deny_wrapper() {
       for p in "${write_roots[@]+"${write_roots[@]}"}"; do
         deny_wrapper+=(--bind "$p" "$p")
       done
-      # paranoid_allow_read: re-expose these read-only over the tmpfs'd HOME
-      # (no write, unlike the rw binds above); disjoint from every deny.
+      # paranoid_allow_read: re-expose these read-only over the tmpfs'd HOME (no
+      # write, unlike the rw binds above). These land AFTER the write binds, so a
+      # path in both lists would come out read-only here and writable on macOS;
+      # refuse_write_allow_read_overlap is what keeps the two from ever meeting.
       for p in "${paranoid_allow_roots[@]+"${paranoid_allow_roots[@]}"}"; do
         deny_wrapper+=(--ro-bind "$p" "$p")
       done
@@ -1757,6 +1811,24 @@ run_token_cmd() {
   export "$token_env=$tok"
 }
 
+# Run each setenv_cmd host-side, collecting VAR=value into resolved_setenv_cmd
+# for the post-scrub `env` wrapper. token_cmd generalized, and gated the same
+# way: failure or empty output aborts before any side effect. The command is
+# echoed in a failure (it is the configuration); the value never is, not even
+# in a verbose line. csb-config has already refused a VAR that setenv or
+# token_env also names, so nothing here decides a precedence.
+run_setenv_cmds() {
+  resolved_setenv_cmd=()
+  local entry var cmd out
+  for entry in "${profile_setenv_cmd[@]+"${profile_setenv_cmd[@]}"}"; do
+    var="${entry%%=*}"; cmd="${entry#*=}"
+    out=$(bash -c "$cmd") || die "setenv_cmd for $var failed: $cmd"
+    [[ -n "$out" ]] || die "setenv_cmd for $var produced no output: $cmd"
+    resolved_setenv_cmd+=("$var=$out")
+    vecho "$PROG: setenv_cmd resolved $var"
+  done
+}
+
 # --- config resolution ------------------------------------------------------------
 #
 # csb-config owns the flag grammar, the profiles, their validation, --help and
@@ -1796,7 +1868,7 @@ csb_config_scalars=(dump mode no_launch here shell agent agent_bin_attr
                     cred_check cred_usable_expr cred_clear_expr ns_migrate
                     paranoid pasteboard
                     nix_target_effective sandbox real_home yolo latest verbose
-                    namespace branch ephemeral ephemeral_name profile seed_creds
+                    namespace branch ephemeral ephemeral_name seed_creds
                     seed_home reseed accent cfg_tmpdir tmp_base token_cmd filter_egress
                     allow_loopback)
 
@@ -1869,7 +1941,7 @@ resolve_config() {
       branch)               branch="$v" ;;
       ephemeral)            ephemeral="$v" ;;
       ephemeral_name)       ephemeral_name="$v" ;;
-      profile)              profile_name="$v" ;;
+      profile)              profile_names+=("$v") ;;
       seed_creds)           seed_creds="$v" ;;
       seed_home)            seed_home="$v" ;;
       reseed)               reseed="$v" ;;
@@ -1888,6 +1960,7 @@ resolve_config() {
       cred_dest)            cred_dests+=("$v") ;;
       keep)                 extra_keep+=("$v") ;;
       setenv)               profile_setenv+=("$v") ;;
+      setenv_cmd)           profile_setenv_cmd+=("$v") ;;
       deny_read)            deny_read_paths+=("$v") ;;
       allow_write)          allow_write_paths+=("$v") ;;
       allow_socket)         allow_socket_paths+=("$v") ;;
@@ -1945,7 +2018,6 @@ namespace=""
 branch=""
 ephemeral="false"
 ephemeral_name=""
-profile_name=""
 seed_creds="false"
 seed_home=""
 reseed="false"
@@ -1960,7 +2032,12 @@ agent_args=()
 seed_verbs=(); seed_args=(); seed_dests=()
 cred_verbs=(); cred_args=(); cred_dests=()
 extra_keep=()
+profile_names=()
 profile_setenv=()
+# setenv_cmd as configured (VAR=command), then as resolved (VAR=value) once
+# run_setenv_cmds has run the commands host-side.
+profile_setenv_cmd=()
+resolved_setenv_cmd=()
 deny_read_paths=()
 allow_write_paths=()
 allow_socket_paths=()
@@ -2012,9 +2089,14 @@ for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 # Skipped for delete/list/prepare-only invocations, which launch nothing (the
 # branch/--here term keeps a listing run out of the password store); the -s
 # shell skips token_cmd too (it runs no agent — no reason to touch it).
-if [[ "$mode" == "launch" && "$no_launch" != "true" && "$shell" != "true" \
+#
+# setenv_cmd runs under the same guard MINUS the shell exclusion: it carries
+# whatever the launched process needs, and a test suite reaching a service in -s
+# needs its variable exactly as the agent would.
+if [[ "$mode" == "launch" && "$no_launch" != "true" \
       && -z "$dump" && ( -n "$branch" || "$here" == "true" ) ]]; then
-  run_token_cmd
+  [[ "$shell" == "true" ]] || run_token_cmd
+  run_setenv_cmds
 fi
 
 # --- reap mode --------------------------------------------------------------------
@@ -2084,9 +2166,9 @@ if [[ "$mode" == "list_ns" ]]; then
   exit 0
 fi
 
-# --- list mode (no branch, launch, not --here) ------------------------------------
+# --- worktree list mode (-l/--list) -----------------------------------------------
 
-if [[ "$mode" == "launch" && -z "$branch" && "$here" != "true" ]]; then
+if [[ "$mode" == "list_wt" ]]; then
   echo "csb worktrees under $main_root/.worktrees:"
   # `|| true` keeps pipefail from tripping when there are no matching worktrees
   # (awk exits 0 either way) or `git worktree list` fails outside a repo.
@@ -2165,9 +2247,14 @@ fi
 # --- launch mode ------------------------------------------------------------------
 
 if [[ "$here" == "true" ]]; then
-  # No worktree: run in the current directory (quick/lightweight ops). cwd is
-  # the live checkout, so it's less isolated than a worktree.
-  worktree="$PWD"
+  # No worktree provisioning: run in the checkout already being stood in (which
+  # may itself be a linked worktree), so it is less isolated than a fresh one.
+  # The ROOT of that checkout, not $PWD: as the worktree, a subdirectory would
+  # scope the write root to itself and send `nix develop` looking for the flake
+  # there, so a launch from src/lib would silently get csb's fallback devShell.
+  # The process cwd is untouched -- csb never cds before the exec -- so the agent
+  # still starts in the directory it was run from.
+  worktree="$repo_root"
 else
   [[ -n "$branch" ]] || die "branch name required"
   worktree=$(ensure_worktree "$repo_root" "$branch") || exit 1
@@ -2336,16 +2423,25 @@ if [[ -f "$worktree/.worktreeenv" ]]; then
 fi
 
 # Profile setenv=, after .worktreeenv (user config beats the repo file when both
-# set a var — later `env` args win).
+# set a var — later `env` args win), then the setenv_cmd values run host-side.
+# The two cannot name the same variable: csb-config refuses that outright, so
+# their relative order settles nothing and is only for determinism.
 env_overrides+=("${profile_setenv[@]+"${profile_setenv[@]}"}")
+env_overrides+=("${resolved_setenv_cmd[@]+"${resolved_setenv_cmd[@]}"}")
 
 # csb's own launch state, for the sandboxed process to surface (a statusline
 # script, a prompt): these csb concepts have no representation in the agent's
 # env or status output. Authoritative, so appended last (they win a name
 # collision).
 csb_mode="worktree"; [[ "$here" == "true" ]] && csb_mode="here"
+# Every -p, joined the way --dump-config joins a list, so a statusline can show
+# the whole stack rather than whichever one happened to be last.
+csb_profile=""
+for v in "${profile_names[@]+"${profile_names[@]}"}"; do
+  csb_profile+="${csb_profile:+|}$v"
+done
 env_overrides+=(
-  "CSB_PROFILE=$profile_name"
+  "CSB_PROFILE=$csb_profile"
   "CSB_AGENT=$agent"
   "CSB_NS=$csb_ns"
   "CSB_EPHEMERAL=$csb_ephemeral"

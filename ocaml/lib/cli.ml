@@ -19,7 +19,7 @@ type t = {
   reseed : bool;
   branch : string option;
   agent_args : string list option;  (* Some _ once `--` appeared, even if empty *)
-  profile : string option;
+  profiles : string list;           (* every -p, in the order given *)
   shell : bool option;
   yolo : bool option;
   paranoid : bool option;
@@ -40,6 +40,8 @@ type t = {
   token_env : string Layer.t;
   tmpdir : string Layer.t;
   setenv : (string * string) list;
+  setenv_cmd : (string * string) list;
+  seed_merge : (string * string) list;
   keep : string list;
   deny_read : string list;
   allow_write : string list;
@@ -65,6 +67,7 @@ let value_taking =
   [ "-N"; "--ns"; "--agent"; "--nix-target"; "--nix-target-shell";
     "--nix-target-agent";
     "--seed-home"; "--accent"; "--token-cmd"; "--token-env"; "--tmpdir"; "--setenv";
+    "--setenv-cmd"; "--seed-merge";
     "-p"; "--profile"; "-k"; "--keep"; "--deny-read";
     "--allow-write"; "--allow-socket"; "--allow-host"; "--allow-port";
     "--paranoid-deny-read"; "--paranoid-allow-read" ]
@@ -138,14 +141,13 @@ let setting ~pos ~neg ~cleared value =
   | None, false -> Layer.Unset
   | Some _, true -> Err.die "%s and %s are mutually exclusive" pos neg
 
-let mode ~delete ~list_ns ~reap =
-  match (delete, list_ns, reap) with
-  | true, true, _ | true, _, true | _, true, true ->
-      Err.die "-d/--delete, --list-ns and --reap are mutually exclusive"
-  | true, false, false -> Types.Delete
-  | false, true, false -> Types.List_ns
-  | false, false, true -> Types.Reap
-  | false, false, false -> Types.Launch
+let mode ~delete ~list_ns ~list_wt ~reap =
+  match List.filter (fun (g, _) -> g) [ (delete, Types.Delete); (list_ns, Types.List_ns);
+                                        (list_wt, Types.List_wt); (reap, Types.Reap) ] with
+  | [] -> Types.Launch
+  | [ (_, m) ] -> m
+  | _ ->
+      Err.die "-d/--delete, -l/--list, --list-ns and --reap are mutually exclusive"
 
 let dump ~config ~sandbox =
   match (config, sandbox) with
@@ -225,6 +227,12 @@ let term env pre =
          created, under .worktrees/, are ever torn down or removed. The launch \
          HOME is NOT removed: it is per-repo, or a shared @-namespace, and not \
          tied to one branch. Retire a namespace deliberately with rm -rf."
+  and+ list_wt =
+    flag [ "l"; "list" ]
+      ~doc:
+        "List the worktrees csb created under .worktrees/, then exit. Works from \
+         anywhere in the repository, linked worktrees included. Note the case: \
+         -L is --latest, which launches."
   and+ list_ns =
     flag [ "list-ns" ]
       ~doc:
@@ -471,6 +479,25 @@ let term env pre =
     opt_str_all [ "setenv" ] ~docv:"VAR=VALUE" ~docs:s_seed
       ~doc:
         "Export VAR=VALUE in the launched environment, after the scrub, so it          survives regardless of --keep. Repeatable; the last layer to name a VAR          wins, and this is the highest layer."
+  and+ setenv_cmd =
+    opt_str_all [ "setenv-cmd" ] ~docv:"VAR=CMD" ~docs:s_seed
+      ~doc:
+        "Run CMD on the HOST, outside the sandbox, and export its output as VAR \
+         in the launched environment -- --token-cmd generalized to any variable, \
+         for a secrets-manager read such as 'op read op://vault/rag/token'. The \
+         command is the configuration, never the value, so it is safe in a \
+         config file. Failure or empty output aborts the launch before any \
+         worktree or namespace side effect. Repeatable; a VAR may not also be \
+         named by --setenv or --token-env."
+  and+ seed_merge =
+    opt_str_all [ "seed-merge" ] ~docv:"DEST=FILE" ~docs:s_seed
+      ~doc:
+        "Deep-merge the JSON in host FILE into DEST, relative to the launch \
+         HOME, on EVERY launch -- so one edited file reaches every sandbox \
+         without --reseed and without overwriting what the HOME accumulated. \
+         The merged keys win. FILE may carry ${CSB_WORKTREE} and ${CSB_HOME}, \
+         substituted per launch. Repeatable; applied after the agent's own \
+         seed, so it can override that too."
   and+ accent =
     opt_str [ "accent" ] ~docv:"COLOR"
       ~doc:
@@ -479,13 +506,16 @@ let term env pre =
          blue, magenta, cyan, white, gray/grey, or a bright-* variant -- or raw \
          ANSI SGR parameters such as 38;5;208."
   and+ profile =
-    opt_str [ "p"; "profile" ] ~docv:"NAME"
+    opt_str_all [ "p"; "profile" ] ~docv:"NAME"
       ~doc:
-        "Load launch defaults from ~/.config/csb/profiles/NAME. A gitignored \
-         NAME.local is layered on top for host-specific values, and its values \
-         win; explicit CLI flags beat both, and both beat the config sections. \
-         Bare 'csb -p NAME' with no BRANCH launches --here, while plain 'csb' \
-         still lists worktrees. See the CONFIGURATION section for the keys."
+        "Load launch defaults from ~/.config/csb/profiles/NAME, or from a \
+         [profile NAME] block in the config file -- one or the other, never \
+         both. A gitignored NAME.local is layered on top for host-specific \
+         values, and its values win; explicit CLI flags beat both, and both beat \
+         the config sections. Repeatable: each -p is its own layer, folded left \
+         to right, so the last one to answer a scalar wins and their lists \
+         union. Like any launch naming no BRANCH, 'csb -p NAME' runs --here. See \
+         the CONFIGURATION section for the keys."
   and+ keep =
     opt_str_all [ "k"; "keep" ] ~docv:"VAR"
       ~doc:"Also keep environment variable VAR across the scrub. Repeatable."
@@ -533,13 +563,18 @@ let term env pre =
          Rejected if it overlaps a deny. Repeatable."
   and+ positional = Arg.(value & pos_all string [] & info [] ~docv:"BRANCH") in
   {
-    mode = mode ~delete:(given delete) ~list_ns:(given list_ns) ~reap:(given reap);
+    mode =
+      mode ~delete:(given delete) ~list_ns:(given list_ns) ~list_wt:(given list_wt)
+        ~reap:(given reap);
     dump = dump ~config:(given dump_config) ~sandbox:(given dump_sandbox);
     no_launch = given no_launch;
     reseed = given reseed;
     branch = branch_of positional;
     agent_args = pre.rest;
-    profile = need ~msg:"--profile requires a non-empty NAME" profile;
+    profiles =
+      List.map
+        (Validate.profile_name ~where:"--profile")
+        (need_all ~msg:"--profile requires a non-empty NAME" profile);
     shell = pair ~pos:"-s/--shell" ~neg:"--no-shell" (given shell) (given no_shell);
     yolo = pair ~pos:"-y/--yolo" ~neg:"--no-yolo" (given yolo) (given no_yolo);
     paranoid =
@@ -613,6 +648,12 @@ let term env pre =
     setenv =
       List.map (Validate.setenv ~where:"--setenv")
         (need_all ~msg:"--setenv requires VAR=VALUE" setenv);
+    setenv_cmd =
+      List.map (Validate.setenv_cmd ~where:"--setenv-cmd")
+        (need_all ~msg:"--setenv-cmd requires VAR=CMD" setenv_cmd);
+    seed_merge =
+      List.map (Validate.seed_merge env ~where:"--seed-merge")
+        (need_all ~msg:"--seed-merge requires DEST=FILE" seed_merge);
     keep =
       List.map
         (Validate.keep_var ~msg:"invalid env var name for --keep")
@@ -672,4 +713,8 @@ let check_exclusive c =
     Err.die
       "--here and BRANCH are mutually exclusive (either provision a worktree for \
        BRANCH, or run --here)";
+  if c.mode = Types.List_wt && c.branch <> None then
+    Err.die "-l/--list takes no BRANCH argument";
+  if c.mode = Types.List_wt && c.here = Some true then
+    Err.die "-l/--list and --here are mutually exclusive (one lists, one launches)";
   ()

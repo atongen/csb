@@ -83,6 +83,22 @@ dump_config() {
   run "$CSB" --dump-config "$@"
 }
 
+# emit_records ARGS... -- run csb-config with CSB_EMIT_TO and print the resolved
+# wire, one NUL-terminated record per line. The dumps report a seed's SHAPE only
+# (verb and destination), so this is the one seam that can assert what content a
+# seed instruction actually carries across to bin/csb. Drives csb-config
+# directly, so it behaves the same under `make test` and `make ocaml-test`.
+emit_records() {
+  local emit; emit="$TEST_TMP/emit.$$"
+  run env CSB_EMIT_TO="$emit" "$CSB_CONFIG_BIN" "$@"
+  if [[ -s "$emit" ]]; then
+    output="$(tr '\0' '\n' <"$emit")"
+    lines=()
+    while IFS= read -r _rec; do lines+=("$_rec"); done <<<"$output"
+  fi
+  rm -f "$emit"
+}
+
 # dump_sandbox REPO ARGS... -- run `csb --here --dump-sandbox ARGS` inside REPO.
 # $output is combined stdout+stderr (validation tests grep the stderr message).
 dump_sandbox() {

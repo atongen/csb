@@ -11,7 +11,15 @@
    A [group NAME] header is a named bundle rather than a selector: it matches no
    repository, and `use = NAME` splices its lines into the section naming it, at
    that point in document order. Path and concept are different grouping axes --
-   a selector can only collect repos that share a path shape. *)
+   a selector can only collect repos that share a path shape.
+
+   A [profile NAME] header is a third kind again: it matches no repository and no
+   use= can name it, and it applies only when `-p NAME` asks for it -- one layer
+   ABOVE every section here. Keeping it distinct from [group] is what stops a
+   bundle meant for splicing from being launchable, and a launch config from
+   being spliced into every repo that says use=. A block in config.local EXTENDS
+   the one config defined, exactly as profiles/NAME.local extends profiles/NAME;
+   twice in one file is a typo and refused. *)
 
 (* A selector header: comma-separated terms, `!` excluding. The first positive
    pattern is its own field, so a header of exclusions alone -- which would
@@ -24,28 +32,35 @@ type term_set = {
 }
 
 (* A named bundle, in definition order. `label` is the file that defined it, so
-   a use from config.local still reports where the lines came from. *)
+   a use from config.local still reports where the lines came from. The same
+   shape serves a [profile NAME] block: both are bodies of lines held until
+   something names them, and `uses` records the groups already spliced in so the
+   provenance a profile block reports is the whole of what it carried. *)
 type group = {
   name : string;
   label : string;
   body : (string * string * string) list; (* where, key, value *)
+  uses : string list;                     (* label[group NAME], in splice order *)
 }
 
-type header = Group_def of string | Select of term_set
+type header = Group_def of string | Profile_def of string | Select of term_set
 
 (* Accumulating across both files, then the one sealed layer they amount to. *)
 type acc = {
   draft : Profile.draft;
   seen : string list; (* file[selector], in application order *)
   groups : group list;
+  profiles : group list;
 }
 
 type t = {
   layer : Profile.t;
   matched : string list;
+  (* The [profile NAME] blocks, for a -p to resolve against. *)
+  blocks : group list;
 }
 
-let empty = { draft = Profile.blank; seen = []; groups = [] }
+let empty = { draft = Profile.blank; seen = []; groups = []; profiles = [] }
 
 (* '*' matches any run of characters, INCLUDING '/', and is the only
    metacharacter. That one rule covers all three shapes: [*] is everything,
@@ -70,15 +85,16 @@ let header_of line =
   else None
 
 let group_keyword = "group"
+let profile_keyword = "profile"
 
-(* [group NAME] can never collide with a selector: a selector is matched against
-   an absolute path, which no leading keyword can begin. *)
-let group_name_of s =
-  let n = String.length group_keyword in
-  if s = group_keyword then Some ""
+(* [group NAME] and [profile NAME] can never collide with a selector: a selector
+   is matched against an absolute path, which no leading keyword can begin. *)
+let keyword_arg_of keyword s =
+  let n = String.length keyword in
+  if s = keyword then Some ""
   else if
     String.length s > n
-    && String.sub s 0 n = group_keyword
+    && String.sub s 0 n = keyword
     && (s.[n] = ' ' || s.[n] = '\t')
   then Some (String.trim (String.sub s n (String.length s - n)))
   else None
@@ -103,14 +119,22 @@ let parse_header env ~where raw =
   let s = String.trim raw in
   if s = "" then Err.die "%s: [] selects nothing (use [*] for every repo)" where
   else
-    match group_name_of s with
-    | Some "" -> Err.die "%s: [group] needs a name" where
-    | Some name -> Group_def (Validate.group_name ~where name)
-    | None -> Select (parse_terms env ~where s)
+    match (keyword_arg_of group_keyword s, keyword_arg_of profile_keyword s) with
+    | Some "", _ -> Err.die "%s: [group] needs a name" where
+    | Some name, _ -> Group_def (Validate.group_name ~where name)
+    | _, Some "" -> Err.die "%s: [profile] needs a name" where
+    | _, Some name -> Profile_def (Validate.profile_name ~where name)
+    | None, None -> Select (parse_terms env ~where s)
 
 let extend_group groups name entry =
   List.map
     (fun g -> if g.name = name then { g with body = g.body @ [ entry ] } else g)
+    groups
+
+let extend_group_uses groups name (body, used) =
+  List.map
+    (fun g ->
+      if g.name = name then { g with body = g.body @ body; uses = g.uses @ [ used ] } else g)
     groups
 
 (* A forward reference and a typo are the same mistake here -- the group has to
@@ -123,11 +147,16 @@ let find_group acc ~where name =
 
 let use_key = "use"
 
-(* A section is one of four states, and only two of them keep anything: the
+(* A section is one of five states, and only three of them keep anything: the
    region before any header holds no selector at all, and a non-matching section
    is still parsed so a typo in one repo's section cannot hide until that repo is
    the one being launched. *)
-type region = Preamble | Skipped | Applied | Defining of string
+type region =
+  | Preamble
+  | Skipped
+  | Applied
+  | Defining of string
+  | Defining_profile of string
 
 let read env ~path acc =
   if not (Sys.file_exists path) then acc
@@ -145,9 +174,24 @@ let read env ~path acc =
             | Group_def name ->
                 if List.exists (fun g -> g.name = name) acc.groups then
                   Err.die "%s: group '%s' is already defined" where name;
-                ( { acc with groups = acc.groups @ [ { name; label; body = [] } ] },
+                ( { acc with groups = acc.groups @ [ { name; label; body = []; uses = [] } ] },
                   Defining name,
                   lineno )
+            | Profile_def name ->
+                (* An existing block is EXTENDED, the way profiles/NAME.local
+                   extends profiles/NAME -- but only from the other file. Twice
+                   in one file has no such reading and is refused. *)
+                (match List.find_opt (fun g -> g.name = name) acc.profiles with
+                | Some g when g.label = label ->
+                    Err.die "%s: profile '%s' is already defined in %s" where name label
+                | Some _ -> ()
+                | None -> ());
+                let acc =
+                  if List.exists (fun g -> g.name = name) acc.profiles then acc
+                  else
+                    { acc with profiles = acc.profiles @ [ { name; label; body = []; uses = [] } ] }
+                in
+                (acc, Defining_profile name, lineno)
             | Select sel ->
                 let hit =
                   match env.Env.main_root with
@@ -172,6 +216,25 @@ let read env ~path acc =
                 ( { acc with groups = extend_group acc.groups name (where, key, value) },
                   region,
                   lineno )
+            | Defining_profile name ->
+                (* use= composes here, unlike inside a [group]: a group is the
+                   shared fragment and a profile is what assembles fragments,
+                   so the composition has one direction and cannot cycle. The
+                   lines are spliced at this point in document order, which is
+                   what keeps a scalar set after the use= winning. *)
+                if key = use_key then
+                  let g = find_group acc ~where value in
+                  ( { acc with
+                      profiles =
+                        extend_group_uses acc.profiles name
+                          (g.body, g.label ^ "[group " ^ g.name ^ "]") },
+                    region,
+                    lineno )
+                else (
+                  ignore (Profile.apply env ~where Profile.blank key value);
+                  ( { acc with profiles = extend_group acc.profiles name (where, key, value) },
+                    region,
+                    lineno ))
             | Skipped ->
                 if key = use_key then ignore (find_group acc ~where value)
                 else ignore (Profile.apply env ~where Profile.blank key value);
@@ -201,4 +264,16 @@ let load env =
     Err.warn "warning: no git repository here, so no config section in %s applies"
       env.Env.config_dir;
   let acc = List.fold_left (fun acc path -> read env ~path acc) empty paths in
-  { layer = Profile.seal ~label:"config" acc.draft; matched = acc.seen }
+  { layer = Profile.seal ~label:"config" acc.draft;
+    matched = acc.seen;
+    blocks = acc.profiles }
+
+(* The layer a `-p NAME` resolves to when the config file defines it, plus the
+   provenance it contributes: the block itself, then every group it spliced. *)
+let block env cfg ~name =
+  match List.find_opt (fun g -> g.name = name) cfg.blocks with
+  | None -> None
+  | Some g ->
+      Some
+        ( Profile.of_body env ~label:("profile " ^ name) g.body,
+          (g.label ^ "[profile " ^ name ^ "]") :: g.uses )

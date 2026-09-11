@@ -292,7 +292,15 @@ load helpers
   assert_line "agent_args=--model|sonnet"
 }
 
-# --- bare -p NAME implies --here ---------------------------------------------
+# --- a launch naming no BRANCH is a launch HERE -------------------------------
+
+@test "bare csb (no BRANCH, no flags) resolves to --here" {
+  dump_config
+  assert_success
+  assert_line "mode=launch"
+  assert_line "here=true"
+  assert_line "branch="
+}
 
 @test "bare -p NAME (no BRANCH) resolves to --here" {
   write_profile p "ns=x"
@@ -301,16 +309,93 @@ load helpers
   assert_line "namespace=x"
 }
 
-@test "a profile here=false suppresses the implied --here" {
-  write_profile p "here=false"
-  dump_config -p p
-  assert_line "here=false"
+@test "a launch-only flag with no BRANCH resolves to --here too" {
+  # -s used to be silently dropped here: the run listed worktrees and ignored
+  # the flag that said a shell was wanted.
+  dump_config -s
+  assert_success
+  assert_line "here=true"
+  assert_line "shell=true"
 }
 
-@test "--no-here suppresses the implied --here" {
+@test "an explicit BRANCH still wins over the implication" {
+  dump_config somebranch
+  assert_success
+  assert_line "here=false"
+  assert_line "branch=somebranch"
+}
+
+@test "a profile here=false with no BRANCH is refused, not silently listed" {
+  # The implication is declined and nothing answers "what should run", so the
+  # resolution dies naming the flag that does answer it.
+  write_profile p "here=false"
+  dump_config -p p
+  assert_failure
+  assert_output --partial "nothing to launch"
+  assert_output --partial "-l/--list"
+}
+
+@test "--no-here with no BRANCH is refused the same way" {
   write_profile p "ns=x"
   dump_config -p p --no-here
+  assert_failure
+  assert_output --partial "nothing to launch"
+}
+
+@test "here=false is honoured, not refused, when a BRANCH answers the question" {
+  write_profile p "here=false"
+  dump_config -p p somebranch
+  assert_success
   assert_line "here=false"
+  assert_line "branch=somebranch"
+}
+
+# --- -l/--list: the worktree listing, now a mode of its own -------------------
+
+@test "-l/--list selects the worktree list mode" {
+  dump_config --list
+  assert_success
+  assert_line "mode=list_wt"
+  assert_line "here=false"
+  assert_line "branch="
+
+  dump_config -l
+  assert_success
+  assert_line "mode=list_wt"
+}
+
+@test "--list takes no BRANCH" {
+  dump_config --list somebranch
+  assert_failure
+  assert_output --partial "takes no BRANCH argument"
+}
+
+@test "--list and --here are mutually exclusive" {
+  dump_config --list --here
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+@test "--list and the other list/delete modes are mutually exclusive" {
+  dump_config --list --list-ns
+  assert_failure
+  assert_output --partial "mutually exclusive"
+
+  dump_config --list -d somebranch
+  assert_failure
+  assert_output --partial "mutually exclusive"
+
+  dump_config --list --reap
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+@test "--list is unaffected by a profile here=true" {
+  # A profile is a launch config; naming a mode on the CLI is not a launch.
+  write_profile p "here=true"
+  dump_config -p p --list
+  assert_success
+  assert_line "mode=list_wt"
 }
 
 # --- agent (which agent CLI runs) --------------------------------------------
@@ -368,4 +453,106 @@ load helpers
   dump_config -p p --no-token-env
   assert_success
   assert_line "token_env=CLAUDE_CODE_OAUTH_TOKEN"
+}
+
+# --- multiple -p: each its own layer, folded left to right --------------------
+
+@test "two profiles both apply, the later one winning a scalar" {
+  write_profile a "accent=blue" "paranoid=true"
+  write_profile b "accent=magenta"
+  dump_config -p a -p b
+  assert_success
+  assert_line "accent=magenta"
+  assert_line "paranoid=true"
+  assert_line "profile=a|b"
+}
+
+@test "reversing the order reverses which profile wins the scalar" {
+  write_profile a "accent=blue"
+  write_profile b "accent=magenta"
+  dump_config -p b -p a
+  assert_line "accent=blue"
+  assert_line "profile=b|a"
+}
+
+@test "lists union across every profile, in the order named" {
+  write_profile a "allow_host=from.a" "deny_read=/from/a"
+  write_profile b "allow_host=from.b" "deny_read=/from/b"
+  dump_config -p a -p b
+  assert_line "allow_host=from.a|from.b"
+  assert_line "deny_read=/from/a|/from/b"
+}
+
+@test "a later profile's HOME selector replaces an earlier profile's whole axis" {
+  # The axis rule is unchanged by there being several profiles: each -p is a
+  # layer, and a layer naming any key on the axis retracts the ones below it.
+  write_profile a "ns=shared"
+  write_profile b "ephemeral=true"
+  dump_config -p a -p b
+  assert_line "namespace="
+  assert_line "ephemeral=true"
+}
+
+@test "an earlier profile's HOME selector stands when the later is silent" {
+  write_profile a "ns=shared"
+  write_profile b "accent=magenta"
+  dump_config -p a -p b
+  assert_line "namespace=shared"
+}
+
+@test "a later profile retracts an earlier profile's scalar with an empty value" {
+  write_profile a "token_cmd=op read op://a/token"
+  write_profile b "token_cmd="
+  dump_config -p a -p b
+  assert_line "token_cmd=absent"
+}
+
+@test "each profile brings its own .local overlay" {
+  write_profile a "accent=blue"
+  write_profile a.local "accent=cyan"
+  write_profile b "paranoid=true"
+  dump_config -p a -p b
+  assert_line "accent=cyan"
+  assert_line "paranoid=true"
+}
+
+@test "the CLI still beats every profile in the stack" {
+  write_profile a "accent=blue"
+  write_profile b "accent=magenta"
+  dump_config -p a -p b --accent green
+  assert_line "accent=green"
+}
+
+@test "a profile file and a config block stack like two files" {
+  write_profile file_p "accent=blue" "allow_port=5432"
+  write_config config "[profile block_p]" "accent=magenta" "allow_port=6379"
+  export CSB_MAIN_ROOT="/src/work/myrepo"
+  dump_config -p file_p -p block_p
+  assert_line "accent=magenta"
+  assert_line "allow_port=5432|6379"
+  assert_line "profile=file_p|block_p"
+}
+
+@test "naming the same profile twice is not an error, it just folds twice" {
+  # Scalars are idempotent and lists are add-only, so a repeat is harmless
+  # rather than a state worth refusing.
+  write_profile a "accent=blue" "allow_port=5432"
+  dump_config -p a -p a
+  assert_success
+  assert_line "accent=blue"
+  assert_line "allow_port=5432|5432"
+}
+
+@test "one missing profile in a stack aborts the whole resolution" {
+  write_profile a "accent=blue"
+  dump_config -p a -p missing
+  assert_failure
+  assert_output --partial "profile not found"
+}
+
+@test "several -p with no BRANCH still imply --here" {
+  write_profile a "accent=blue"
+  write_profile b "paranoid=true"
+  dump_config -p a -p b
+  assert_line "here=true"
 }

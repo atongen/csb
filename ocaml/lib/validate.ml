@@ -101,6 +101,50 @@ let setenv ~where v =
       (String.sub v 0 i, String.sub v (i + 1) (String.length v - i - 1))
   | _ -> Err.die "%s: setenv needs VAR=value: '%s'" where v
 
+(* A setenv_cmd= value: VAR=command. The command is what gets configured and its
+   stdout is what reaches the sandbox, so an empty one has nothing to inject. *)
+let setenv_cmd ~where v =
+  match String.index_opt v '=' with
+  | Some i when is_var_name (String.sub v 0 i) ->
+      let cmd = String.sub v (i + 1) (String.length v - i - 1) in
+      if cmd = "" then Err.die "%s: setenv_cmd needs a command: '%s'" where v
+      else (String.sub v 0 i, cmd)
+  | _ -> Err.die "%s: setenv_cmd needs VAR=command: '%s'" where v
+
+(* A seed destination is joined onto the launch HOME and onto nothing else, so an
+   absolute path or a '..' component would place the write outside it. *)
+let seed_dest ~where v =
+  let ok =
+    v <> "" && v.[0] <> '/'
+    && List.for_all
+         (fun p -> p <> "" && p <> "." && p <> "..")
+         (String.split_on_char '/' v)
+  in
+  if ok then v
+  else
+    Err.die "%s: seed_merge needs a relative destination under the launch HOME, no '..': '%s'"
+      where v
+
+(* A seed_merge= value: DEST=FILE, the launch-HOME destination first so it reads
+   like setenv's target=source. FILE is a host path read at resolution time. *)
+let seed_merge env ~where v =
+  match String.index_opt v '=' with
+  | None -> Err.die "%s: seed_merge needs DEST=FILE: '%s'" where v
+  | Some i ->
+      let dest = String.sub v 0 i in
+      let src = String.sub v (i + 1) (String.length v - i - 1) in
+      if src = "" then Err.die "%s: seed_merge needs a source FILE: '%s'" where v
+      else (seed_dest ~where dest, list_path env ~where src)
+
+(* The NAME in a [profile NAME] header, and in the -p that names one. Held to the
+   same word shape as a group: it is also a file name under profiles/, so a
+   separator or a leading dot would name something else entirely. *)
+let profile_name ~where v =
+  if v <> "" && v <> "." && v <> ".."
+     && for_all (fun c -> is_alnum c || c = '.' || c = '_' || c = '-') v
+  then v
+  else Err.die "%s: invalid profile name '%s' (use letters, digits, . _ -)" where v
+
 let profile_bool ~where ~key v =
   match v with
   | "true" -> true

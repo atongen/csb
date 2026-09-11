@@ -1,6 +1,6 @@
 (* The --dump-config wire format: the exact keys, order and value spellings of
    bin/csb's dump block. Never prints a secret -- token_cmd reports
-   present/absent and setenv reports VAR names only. *)
+   present/absent, and setenv and setenv_cmd report VAR names only. *)
 
 open Types
 
@@ -11,6 +11,7 @@ let mode_name = function
   | Launch -> "launch"
   | Delete -> "delete"
   | List_ns -> "list_ns"
+  | List_wt -> "list_wt"
   | Reap -> "reap"
 
 let is_here = function Here -> true | List_worktrees | Branch _ -> false
@@ -66,7 +67,7 @@ let to_lines c =
     ("branch", branch_name c.target);
     ("ephemeral", string_of_bool (is_throwaway c.home));
     ("ephemeral_name", throwaway_name c.home);
-    ("profile", opt c.profile);
+    ("profile", joined c.profiles);
     ("seed_creds", string_of_bool c.seed_creds);
     ("seed_home", opt c.seed_home);
     ("reseed", string_of_bool c.reseed);
@@ -77,9 +78,15 @@ let to_lines c =
     ("token_env", c.token_env);
     ("seed", joined (seed_shapes c.seed));
     ("cred_seed", joined (seed_shapes c.cred_seed));
+    (* dest=source, which `seed` cannot show: there it is one more json_merge
+       shape among the adapter's own. *)
+    ("seed_merge", joined (List.map (fun (d, s) -> d ^ "=" ^ s) c.seed_merge));
     ("agent_args", joined c.agent_args);
     ("keep", joined c.keep);
     ("setenv", joined (List.map fst c.setenv));
+    (* Names only, like setenv: the command is the configuration, but it can name
+       a vault path, and the dump is the seam an operator pastes into a report. *)
+    ("setenv_cmd", joined (List.map fst c.setenv_cmd));
     ("deny_read", joined c.deny_read);
     ("allow_write", joined c.allow_write);
     ("allow_socket", joined c.allow_socket);

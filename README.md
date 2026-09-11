@@ -116,7 +116,8 @@ Five environment variables tune csb:
 csb feature/foo                  # worktree for feature/foo (off HEAD) + the agent in the devShell
 csb -y feature/foo               # allow-all (the agent's skip-every-prompt flag)
 csb feature/foo -- --model opus  # everything after -- is passed to the agent
-csb --here                       # run in the current dir, no worktree (per-repo namespace)
+csb                              # run in the checkout you are standing in, no worktree
+csb --here                       # the same thing, said explicitly
 csb -s feature/foo               # interactive shell instead of the agent (exact same env)
 csb -s -E --here -- cat ~/.ssh/config   # run a command in the agent's env (this one fails: denied)
 csb -s --no-sandbox --real-home --here -k SSH_AUTH_SOCK   # deploy shell: same devShell
@@ -133,13 +134,38 @@ csb -n feature/foo               # just prepare/reuse the worktree, don't launch
 csb -d feature/foo               # remove the worktree (branch and per-repo HOME are kept)
 csb --list-ns                    # list csb namespace configs (per repo+agent, shared @)
 csb --reap                       # reclaim what dead sessions left (proxies, ephemeral HOMEs)
-csb                              # list csb worktrees
+csb -l                           # list csb worktrees  (note: -L is --latest, which launches)
 ```
 
 `BRANCH` and `--here` are mutually exclusive: either csb provisions a worktree
-for `BRANCH`, or it runs in the current directory as-is. All combinations of
+for `BRANCH`, or it runs in the current checkout as-is. All combinations of
 {agent, `-s` shell} x {worktree, `--here`} land in the same restricted devShell.
 tmux is yours to manage: run `csb` in one pane, edit / `git push` from another.
+
+**A launch that names no `BRANCH` is a launch `--here`.** csb is a launcher, so
+the absence of a target is an answer rather than a question -- and `--here` works
+from *any* checkout, a linked worktree included. Together those mean there is no
+"cd back to the main checkout and spell the branch" step: stand in the worktree
+you are already editing and run `csb -s`.
+
+```console
+$ cd .worktrees/feature/some-long-name
+$ csb -s                          # shell in this worktree; no cd, no branch name
+```
+
+`--here` resolves to the **root** of that checkout, not to `$PWD`, so running it
+from a subdirectory still gets the repo's devShell and a repo-wide write root.
+The process working directory is untouched -- the agent starts where you ran it.
+
+To decline the implication, name a mode: `-l/--list` lists the worktrees,
+`--list-ns` the namespaces. `--no-here` (or a profile `here=false`) with no
+`BRANCH` leaves nothing to run and is refused, rather than quietly listing:
+
+```console
+$ csb --no-here
+csb: nothing to launch: no BRANCH, and here is off.
+  name a BRANCH, drop --no-here / here=false, or use -l/--list to list the worktrees.
+```
 
 `csb --help` prints the full flag reference. `make help` lists the build/install
 targets.
@@ -206,6 +232,11 @@ login is never visible. Two ways in:
   (MCP connector grants) is preserved. Caveat:
   long-lived tokens carry the entitlements from **mint time** -- they can lag
   newly released model tiers until regenerated (unverified; see docs/TODO.md).
+
+`token_cmd=` is the agent-credential shape of a general mechanism:
+[`setenv_cmd=VAR=CMD`](#profiles) runs any host command and exports its output
+as any variable, for a service token the launched process needs that is not the
+agent's own. The two may not name the same variable.
 
 ## Namespaces
 
@@ -333,7 +364,8 @@ Four layers answer every knob. Lowest first:
 1. **the agent's own defaults**
 2. **`${XDG_CONFIG_HOME:-~/.config}/csb/config`**, then the gitignored
    **`config.local`** beside it -- the sections matching this repository
-3. **the profile** named by `-p NAME`, then its gitignored `NAME.local`
+3. **the profiles** named by `-p NAME`, each with its gitignored `NAME.local`.
+   `-p` is repeatable, and each one is its own sub-layer folded left to right
 4. **the command line**
 
 Layer 1 is the resolved [agent](#choosing-the-agent---agent)'s quiet knobs. For
@@ -435,8 +467,11 @@ undefined group is fatal even in a section that did not match -- the same rule
 as everywhere else here, so a typo cannot lie dormant until the day the repo it
 belongs to is the one launching.
 
-`use =` is a config-file key only; it is not a profile key. A used group appears
-in `--dump-config` where it applied, labelled by the file that defined it:
+`use =` is a config-file key only; it is not a key in a profile *file*. It does
+work inside a [`[profile NAME]` block](#profiles-in-the-config-file), which is
+the composition this is for: a group is the shared fragment, a profile is what
+assembles fragments. A used group appears in `--dump-config` where it applied,
+labelled by the file that defined it:
 
 ```
 $ csb --here --dump-config | grep config_sections
@@ -491,8 +526,15 @@ args=bash --rcfile ~/.config/my.bashrc    # the ARGS after --: command in -s mod
                                           # ~/ or ${HOME} expands to the HOST home.
 keep=COLORTERM DIRENV_LOG_FORMAT          # space-separated, appended to --keep
 setenv=CLAUDE_CODE_DISABLE_MOUSE_CLICKS=1 # as --setenv; repeatable; injected post-scrub
+setenv_cmd=VAULT_TOKEN=op read op://v/t   # as --setenv-cmd: run host-side via bash -c, stdout
+                                          # -> VAR post-scrub (never echoed); repeatable. A VAR
+                                          # named by setenv= or token_env= too is refused
+seed_merge=.claude/settings.json=~/s.json # as --seed-merge: deep-merge that host JSON into the
+                                          # launch HOME every launch; repeatable
 deny_read=~/notes                         # as --deny-read: extra read deny (both modes); repeatable
-allow_write=~/scratch                     # as --allow-write: extra write root (both modes); repeatable
+allow_write=~/scratch                     # as --allow-write: extra write root (both modes); repeatable.
+                                          # Refused if it IS a git repo root (its .git/hooks would be
+                                          # writable) -- name a subdirectory instead
 allow_socket=/tmp/.s.PGSQL.5432           # as --allow-socket: reachable unix socket (macOS); repeatable
 filter_egress=true                        # as --filter-egress: HTTPS only via csb-proxy, allowlisted
 allow_host=api.anthropic.com              # as --allow-host: allowed under filtering; repeatable
@@ -502,14 +544,29 @@ allow_loopback=true                       # as --allow-loopback: every localhost
                                           # names one at a time
 paranoid_deny_read=/Volumes               # as --paranoid-deny-read: extra deny under --paranoid; repeatable
 paranoid_allow_read=~/ref                 # as --paranoid-allow-read: re-expose read-only under --paranoid;
-                                          # repeatable; rejected if it overlaps a deny
+                                          # repeatable; rejected if it overlaps a deny, or an allow_write
 ```
 
-Note: bare `csb -p NAME` (no BRANCH) **launches** in the current dir --
-`--here` is implied, unless the CLI or the profile says otherwise; plain `csb`
-always lists. A failing or empty-output `token_cmd` aborts the launch before
-any worktree/namespace side effects. In `-s` shell mode `token_cmd=` is skipped
-and `seed_creds=` is ignored with a warning (a shell runs no agent).
+Note: `csb -p NAME` with no BRANCH **launches** in the current checkout, like
+any other launch naming no BRANCH -- `--here` is implied unless the CLI or the
+profile says otherwise. A failing or empty-output `token_cmd` or `setenv_cmd` aborts the
+launch before any worktree/namespace side effects. In `-s` shell mode
+`token_cmd=` is skipped and `seed_creds=` is ignored with a warning (a shell
+runs no agent); `setenv_cmd=` is **not** skipped -- a test suite reaching a
+service in `-s` needs its variable exactly as the agent would.
+
+**Stacking profiles.** `-p` is repeatable, and each one is its own layer folded
+left to right: the last to answer a scalar wins, their lists union, and a later
+one naming any HOME-axis key retracts an earlier one's. So a read-only default
+and an opt-in write root can be separate profiles composed per invocation:
+
+```console
+$ csb -p notes -p paranoid --here
+```
+
+Naming the same profile twice is harmless rather than refused -- scalars are
+idempotent and lists are add-only -- but one missing profile anywhere in the
+stack aborts the whole resolution.
 
 **Host-specific overlay.** A profile `NAME` can have a sibling, gitignored
 `NAME.local` layered on top after it is read: same syntax, but its
@@ -535,6 +592,44 @@ seed_home=~/dotfiles/csb-home
 ```
 
 For a shorthand, alias the profile: `alias csbw='csb -p work'`.
+
+### Profiles in the config file
+
+A profile does not need a file of its own. A `[profile NAME]` header in
+`~/.config/csb/config` defines the same thing inline, which keeps a small
+variant next to the sections it varies instead of in a one-line file two
+directories away:
+
+```ini
+[group pg]
+allow_port = 5432
+
+[profile notes]
+use = pg
+allow_write = ~/src/github.com/Example/junk-drawer/notes
+accent = magenta
+```
+
+Three rules make the three header kinds distinct rather than overlapping:
+
+- A `[profile NAME]` block **matches no repository** and applies only when
+  `-p NAME` names it -- one layer *above* every `[SELECTOR]` section here.
+- `use =` **works inside it** (unlike inside a `[group]`, where it is an error),
+  and **cannot name it**: a section's `use = NAME` sees groups only. A bundle is
+  spliceable and a launch config is not, which is the whole reason `[profile]`
+  is not just another `[group]`.
+- A `[profile NAME]` in `config.local` **extends** the one in `config`, exactly
+  as `profiles/NAME.local` extends `profiles/NAME`: its scalars win, its lists
+  union. Twice in *one* file has no such reading and is refused.
+
+A name may come from a file **or** a block, never both -- `profiles/work` beside
+a `[profile work]` is an error, not a ranking. `--dump-config` reports a block
+where it applied, with any group it spliced:
+
+```
+$ csb --here -p notes --dump-config | grep config_sections
+config_sections=config[*]|config[profile notes]|config[group pg]
+```
 
 ## Seeding the sandbox HOME
 
@@ -571,6 +666,43 @@ cp -r "$(git rev-parse --show-toplevel)/templates/home" ~/.config/csb/home
 For **project-level** instructions you usually don't need this: a `CLAUDE.md` at
 the worktree root is read directly, and a gitignored one can ride in via
 `.worktreeinclude`.
+
+### `seed_merge=`: one JSON file, every launch
+
+The template above is **write-if-absent**, which is what you want for a file the
+agent then owns -- and exactly what you do *not* want for a setting you expect to
+keep editing. After the first launch the namespace has the file, so the template
+stops reaching it, and `--reseed` overwrites the whole thing, taking the
+namespace's accumulated state (project history, MCP OAuth grants) with it.
+
+`seed_merge=DEST=FILE` (CLI `--seed-merge`) is the other shape: a **deep merge**
+of a host JSON file into `DEST` under the launch HOME, run on **every** launch,
+with the merged keys winning. Editing one file reaches every sandbox on its next
+launch, without `--reseed` and without clobbering anything the merge does not
+name. That makes it the low-friction way to register an MCP server across
+namespaces:
+
+```ini
+[*]
+seed_merge = .claude/.claude.json = ~/.config/csb/seed/mcp.json
+```
+
+```json
+{ "mcpServers": { "project-rag": {
+    "command": "/Users/you/.config/csb/shared/bin/project-rag",
+    "args": ["--root", "${CSB_WORKTREE}"] } } }
+```
+
+`${CSB_WORKTREE}` and `${CSB_HOME}` are substituted per launch, JSON-escaped, by
+the only side that knows either value. csb reads `FILE` **host-side at config
+resolution**, so the launch carries the bytes rather than a path the sandbox
+would have to reach -- and a missing, empty, or NUL-bearing source is fatal
+before anything is provisioned. `DEST` is relative to the launch HOME and may
+not contain `..`.
+
+Repeatable, and applied **after** the agent's own seed instructions, so an
+operator key wins the merge. It needs `jq` on the host; without it csb warns and
+leaves an existing destination untouched.
 
 ## Per-repo worktree files
 
@@ -719,6 +851,33 @@ Extra roots go via `--allow-write PATH` (repeatable) or a profile's
 installation fail inside the sandbox; tools that write caches to absolute paths
 outside `$HOME` need an entry.
 
+**A write root may not be a git repository root.** The `hooks/` and `config`
+denies above are derived from the *launch* repo, so any **other** repo made
+writable keeps a writable `.git/hooks` -- and a hook planted there runs on the
+**host**, as you, at that repo's next `git` command. csb refuses it:
+
+```console
+$ csb --here --allow-write ~/src/notes-repo
+csb: allow_write '/Users/you/src/notes-repo' is a git repository root: .git/hooks
+  under it stays writable, and a hook planted there runs on the HOST at that
+  repo's next git command
+  (name a SUBDIRECTORY instead -- .git then sits outside the write root)
+```
+
+Naming a **subdirectory** is the supported shape and the one to reach for when
+you want a shared, git-tracked scratch area several sandboxes write to: `.git`
+stays a sibling of the write root, so the allow-list never reaches it, while the
+surrounding repo still tracks the content. The check covers the named root
+itself, not a repo nested somewhere beneath it -- hygiene against the likely
+mistake, not containment.
+
+Bear in mind what a cross-repo write root *is*: a channel between sandboxes. An
+agent launched in one repo can write files an agent in another repo later reads
+as instructions. That is usually the point of such a directory, but it is worth
+naming. Granting it only under a named profile (`allow_write=` in
+`[profile notes]`, read-only everywhere else) keeps the blast radius to the runs
+that need it.
+
 ### `--no-sandbox` and `--real-home`: the deploy shell
 
 Two independent axes let you loosen the environment when you're the one driving
@@ -774,6 +933,14 @@ A `paranoid_allow_read` that overlaps a deny root (the floor, a `deny_read`, or 
 `paranoid_deny_read`) is rejected, so an allow can never silently re-expose a
 denied path. Enable per run (`--paranoid` / negate `--no-paranoid`) or per
 context via a profile's `paranoid=true`; there is no global toggle.
+
+The two are **alternatives, not a pair**: a path named by both `allow_write` and
+`paranoid_allow_read` is rejected too. A write root is already read-re-allowed
+under `--paranoid`, so the combination adds nothing on macOS -- while on Linux
+the read-only bind is emitted after the writable one and would silently take the
+write away. The refusal fires in **both** modes and on both platforms, so a
+profile shared across hosts cannot end up writable on one and read-only on the
+other.
 
 The deny is scoped to the real HOME, so a source tree that lives *outside* HOME
 stays readable -- e.g. a `~/src -> /Volumes/src` symlink resolves to a path that
@@ -855,6 +1022,11 @@ All five read/write/socket lists are set per launch, via CLI flags or profile va
 | reachable unix socket (macOS) | `--allow-socket` | `allow_socket=` | both |
 | extra paranoid read deny | `--paranoid-deny-read` | `paranoid_deny_read=` | `--paranoid` |
 | paranoid read re-allow (read-only) | `--paranoid-allow-read` | `paranoid_allow_read=` | `--paranoid` |
+
+Two build-time refusals apply across the table, and fire in **both** modes so a
+shared profile fails identically everywhere: an `allow_write` that is a git
+repository root, and a path named by both `allow_write` and
+`paranoid_allow_read`.
 
 ### `--pasteboard` (macOS)
 
@@ -1019,9 +1191,9 @@ The host tmp/scratch dir is the `CSB_TMPDIR` env var (see [Quickstart](#quicksta
 ## Inspecting the config and sandbox (dry-run)
 
 Two read-only flags resolve a launch and print what it *would* use, then exit
-before any launch, HOME seeding, credential seeding, or `token_cmd`. Both are
-safe to run anywhere and never print a secret, so they double as the seam the
-test suite (`docs/PLAN-005-tests.md`) drives.
+before any launch, HOME seeding, credential seeding, `token_cmd` or
+`setenv_cmd`. Both are safe to run anywhere and never print a secret, so they
+double as the seam the test suite (`docs/PLAN-005-tests.md`) drives.
 
 - `--dump-config` -- print the resolved knobs as stable `KEY=VALUE` lines (all
   four layers, after all precedence), plus the `config_sections=` this repo
@@ -1029,25 +1201,31 @@ test suite (`docs/PLAN-005-tests.md`) drives.
   stops there -- no worktree lookup -- so the default (per-repo) namespace shows
   as an empty `namespace=` plus `branch=`, and outside a repository it still
   runs, selecting nothing. `token_cmd` is reported `present`/`absent` (never
-  run), and `setenv` lists VAR names only (never their values).
+  run), and `setenv` and `setenv_cmd` list VAR names only (never their values,
+  and never the command).
 
   ```
-  $ csb -p work --paranoid --dump-config
+  $ csb -p work -p notes --paranoid --dump-config
   mode=launch
   here=true
   agent=claude
   paranoid=true
   namespace=@work
+  profile=work|notes
   token_cmd=present
   token_env=CLAUDE_CODE_OAUTH_TOKEN
-  seed=json_merge:.claude/.claude.json
+  seed=json_merge:.claude/.claude.json|json_merge:.claude/settings.json
+  seed_merge=.claude/settings.json=/Users/you/.config/csb/seed/mcp.json
+  setenv_cmd=VAULT_TOKEN
   agent_args=--model|opus
   ...
   ```
 
   The `agent*`, `token_env`, `seed` and `cred_seed` lines are the resolved
   [agent adapter](#choosing-the-agent---agent): what csb will build, which
-  variable carries the credential, and what it will seed where.
+  variable carries the credential, and what it will seed where. `seed` reports
+  each instruction's *shape* only (verb and destination), so `seed_merge=` names
+  the host source each of yours came from.
 
 - `--dump-sandbox` -- print the generated sandbox artifact: the seatbelt profile
   text on macOS, or the `bwrap` argv (one token per line) on Linux. It runs the

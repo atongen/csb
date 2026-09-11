@@ -8,10 +8,13 @@ type mode =
   | Launch
   | Delete
   | List_ns
+  | List_wt
   | Reap
 
-(* Neither BRANCH nor --here is a real third state -- the worktree listing. bash
-   spells it as two empty variables. *)
+(* List_worktrees is the absence of a launch target, which only the non-Launch
+   modes have: naming no BRANCH under Launch means Here, and the one invocation
+   that answers neither -- here=false with no branch -- is refused in Resolve
+   rather than quietly listing. *)
 type target =
   | List_worktrees
   | Here
@@ -98,7 +101,9 @@ type t = {
   reseed : bool;
   seed_creds : bool;
   nix_targets : nix_targets;
-  profile : string option;
+  (* Every -p in the order given, each its own sub-layer: the last one to answer
+     a scalar wins, and their lists union. Empty when no -p was passed. *)
+  profiles : string list;
   token_cmd : string option;
   (* The variable token_cmd's output is exported into, and which joins the
      scrub's keep list. Always answered: the agent's default when no layer
@@ -111,6 +116,12 @@ type t = {
   agent_args : string list;
   keep : string list;
   setenv : (string * string) list;
+  (* VAR -> a command bin/csb runs on the HOST, whose stdout becomes VAR inside
+     the launch. token_cmd generalized: the value never appears in any config,
+     only the way to obtain it. A VAR may be named by setenv, setenv_cmd or
+     token_env -- never by two of them, so "which one wins" is not a question
+     this config can ask. *)
+  setenv_cmd : (string * string) list;
   deny_read : string list;
   allow_write : string list;
   allow_socket : string list;
@@ -122,9 +133,15 @@ type t = {
   paranoid_allow_read : string list;
   (* The launch HOME's onboarding seed, then the --seed-creds sources: two
      lists because bin/csb gates them differently -- onboarding runs on every
-     redirected-HOME launch, credentials only in the --seed-creds arm. *)
+     redirected-HOME launch, credentials only in the --seed-creds arm. `seed`
+     carries the agent adapter's own instructions first and the operator's
+     seed_merge= after, so an operator key wins the deep merge. *)
   seed : seed list;
   cred_seed : seed list;
+  (* seed_merge= as written: launch-HOME destination and the host file read into
+     the Json_merge instruction above. Reported so --dump-config can say which
+     source produced which merge, which `seed` alone cannot. *)
+  seed_merge : (string * string) list;
   (* Which config sections were selected, in application order: provenance for
      the layer above, reported by --dump-config and by nothing else. *)
   config_sections : string list;

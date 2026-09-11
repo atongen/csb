@@ -1,5 +1,100 @@
 # TODO
 
+- [ ] drop seed_creds (from native home) functionality - it doesn't work well and oauth tokens are the correct way
+    * WHY it doesn't work well, precisely: the resolved item below established
+      that the sandbox DOES persist refreshes and rotate the token. What bites is
+      (a) the refresh family has a fixed ~monthly deadline, and (b) N
+      uncoordinated parallel sessions share one rotating refresh-token family and
+      log each other out. A static token fixes both and needs no new machinery.
+    * BLOCKED on an unrun experiment, not on design: the README's claim that a
+      `claude setup-token` token carries mint-time entitlements and can lag new
+      model tiers has no measurement recorded in any docs/PLAN-*.md. The A/B is
+      same account, same day, `/model` under a fresh setup-token vs --seed-creds;
+      the credential blob carries subscriptionType and rateLimitTier, which is
+      what makes the claim plausible and gives the fields to compare.
+    * ENABLER SHIPPED: setenv_cmd= (below) is token_cmd generalized, so the
+      token-only world this moves to already has its injection mechanism. The
+      removal itself is agent.ml's four cred_* rows, the --seed-creds arm in
+      bin/csb, the keychain boundary, the tests and the README.
+- [X] generalize token_cmd. DONE: `setenv_cmd=VAR=CMD` (CLI `--setenv-cmd`),
+      repeatable, run host-side via `bash -c`, stdout exported as VAR after the
+      env scrub. Failure or empty output aborts before any worktree/namespace
+      side effect, as token_cmd does -- but it is NOT skipped in -s shell mode,
+      since a test suite reaching a service needs its variable exactly as the
+      agent would. token_cmd= keeps its own field and semantics (it joins the
+      scrub keep list, and bin/csb reports on it around --seed-creds); a VAR named
+      by both setenv= and setenv_cmd=, or by setenv_cmd= and token_cmd=, is
+      REFUSED rather than ranked -- all three land in one `env` invocation where
+      the last argument would otherwise win silently.
+    * "do we need a config path for per-agent configuration?" -- ANSWERED: no.
+      Between `agent=`, `[profile NAME]` blocks and seed_merge=, per-agent setup
+      is a named profile you compose. What does not exist is an agent-axis
+      SELECTOR (`[when agent=opencode]`), because sections select on repo path and
+      the agent is resolved after the layers that decide it. Deferred until a
+      second agent exists rather than designed against a hypothetical one.
+- [X] allow specifying multiple "profiles". DONE: `-p` is repeatable, each one
+      its own sub-layer folded left to right (reusing Profile.overlay, the same
+      function NAME.local already went through). The axis rule is untouched: a
+      later profile naming any of ns=/ephemeral=/real_home= retracts an earlier
+      one's. Deliberately NOT merged into a single layer first -- that would make
+      two profiles disagreeing on the axis an internal conflict needing a new
+      error, instead of the ordinary "last layer wins" that already exists.
+- [X] profiles can be defined in the main "config" file. DONE: a `[profile NAME]`
+      header, resolved by `-p NAME` at layer 3, alongside the file form.
+    * kept DISTINCT from [group NAME] rather than folded into it: a group is a
+      spliceable fragment and a profile is a launch config, and separate headers
+      are what stop a mixin from being launchable, or a launch config from being
+      spliced into every repo that says use=. `use =` works INSIDE a [profile]
+      (composition has one direction and cannot cycle) and cannot name one.
+    * a block in config.local EXTENDS the one in config, matching the established
+      profiles/NAME + NAME.local idiom; twice in ONE file is a typo and refused.
+      A name defined as both a file and a block is refused, not ranked.
+
+- [X] seed_merge= (not previously listed; the operator-side counterpart of the
+      two above). A user-extensible Json_merge seed: `seed_merge=DEST=FILE` deep-
+      merges a host JSON file into DEST under the launch HOME on EVERY launch,
+      merged keys winning. seed_home= is write-if-absent, so after the first
+      launch an edited template stops reaching the namespace and --reseed
+      overwrites the accumulated state; this is the self-healing shape, and the
+      low-friction way to register an MCP server across namespaces. csb-config
+      reads the source host-side at resolution, so the launch carries bytes
+      rather than a path the sandbox would have to reach.
+
+- [X] reduce the friction of opening a shell in the worktree you are already in.
+      DONE: a launch naming no BRANCH is a launch --here, so `cd <worktree> &&
+      csb -s` works with no cd back to the main checkout and no branch name to
+      spell. The worktree listing moved to `-l/--list` (its own mode, mutually
+      exclusive with -d/--list-ns/--reap by construction).
+    * the original sketch was cwd-dependent -- implicit --here at a git root,
+      but "cd to the root and launch BRANCH" from inside a worktree. Dropped:
+      --here already works inside a worktree (the guard exempts it), so one rule
+      covers both. The two-branch form was also strictly worse -- it re-ran
+      .worktreeinclude and .worktreesetup.sh `up` as a side effect of where you
+      were standing, and died on a worktree not under .worktrees/, which
+      ensure_worktree refuses to reuse.
+    * PREREQUISITE, and a latent bug on its own: --here used $PWD as the
+      worktree. From a subdirectory that scoped the write root to the
+      subdirectory AND sent `nix develop` looking for the flake there -- a
+      silent fallback devShell. --here now resolves to the checkout ROOT; the
+      process cwd is untouched, so the agent still starts where it was run.
+    * `--no-here` / `here=false` with no BRANCH now DIES naming -l/--list,
+      rather than falling back to a listing nobody asked for. That is the one
+      invocation the old default quietly absorbed.
+    * premise correction recorded: bare `csb` outside a repo failing was NOT
+      evidence it was already treated as launch intent -- `bin/csb:2128` is a
+      blanket "not in a git repository" guard that fires for --list-ns too.
+      The change stands on the listing simply not being worth the default slot.
+
+- [X] two sandbox-build refusals found while doing the above:
+    * an allow_write= that IS a git repository root is refused. The hooks/config
+      write-denies are derived from the LAUNCH repo only, so any other repo made
+      writable kept a writable .git/hooks -- host execution at that repo's next
+      git command. Naming a subdirectory is the supported shape.
+    * a path named by both allow_write= and paranoid_allow_read= is refused. On
+      Linux the read-only bind was emitted AFTER the writable one, so the pair
+      came out read-only there and writable on macOS. Refused in both modes and
+      on both platforms, so a shared profile cannot diverge.
+
 - [X] debug the logout expirations (tied to session stop/start with credential seeding) and reduced model options set
     * renenable claude instrumentation and telemetry?
     * use oauth token instead of credential seeding? At one point I thought that using the oauth token was what lead to the reduces model options set - need to confirm, I could have been mistaken

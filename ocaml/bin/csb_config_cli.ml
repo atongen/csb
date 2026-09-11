@@ -28,22 +28,45 @@ let exit_answered = 2
 (* bin/csb's own order: the CLI exclusions, then CSB_TMPDIR, then the config
    layers bottom-up, then the allowed-hosts file. Each step can die, and which
    message the operator sees depends on getting here first. *)
+(* One -p, from whichever source defines it. A name defined BOTH as a file under
+   profiles/ and as a [profile NAME] block is refused rather than ranked: two
+   launch configs answering to one name is a mistake in the configuration, and
+   picking one silently is how the wrong sandbox gets built. *)
+let one_profile env config name =
+  match (Config_file.block env config ~name, Profile.has_file env ~name) with
+  | Some _, true ->
+      Err.die
+        "profile '%s' is defined twice: %s and a [profile %s] block in the config file"
+        name (Profile.file env ~name) name
+  | Some (layer, seen), false -> (layer, seen)
+  | None, true -> (Profile.load env ~name, [])
+  | None, false ->
+      Err.die "profile not found: %s (nor a [profile %s] block in the config file)"
+        (Profile.file env ~name) name
+
+(* Every -p in turn, each its own layer folded onto the ones before it. One -p is
+   the same statement with a one-element list, so the repeatable case needs no
+   rule of its own. *)
+let profile_layers env config names =
+  List.fold_left
+    (fun (layer, seen) name ->
+      let over, from_config = one_profile env config name in
+      (Profile.overlay ~base:layer ~over, seen @ from_config))
+    (Profile.empty, []) names
+
 let run env cli emit ~answered =
   Cli.check_exclusive cli;
   let tmpdir = Env.resolve_tmpdir env in
   let config = Config_file.load env in
-  let profile =
-    match cli.Cli.profile with
-    | None -> Profile.empty
-    | Some name -> Profile.load env ~name
-  in
-  (* Two file layers, config below the profile. The built-in layer that used to
+  let profile, from_config = profile_layers env config cli.Cli.profiles in
+  (* Two file layers, config below the profiles. The built-in layer that used to
      sit under them is now the agent adapter's setenv, applied in Resolve --
      which agent's knobs those are is exactly what these layers decide. *)
   let layers = Profile.overlay ~base:config.Config_file.layer ~over:profile in
   let cfg =
-    Resolve.resolve ~env ~cli ~layers ~config_sections:config.Config_file.matched ~tmpdir
-      ~read_hosts:(Hosts_file.read env)
+    Resolve.resolve ~env ~cli ~layers
+      ~config_sections:(config.Config_file.matched @ from_config)
+      ~tmpdir ~read_hosts:(Hosts_file.read env)
   in
   match (cfg.Types.dump, emit) with
   | Types.Dump_config, _ | _, None ->
@@ -76,13 +99,16 @@ let man =
     `Noblank;
     `P "$(mname) --list-ns";
     `Noblank;
-    `P "$(mname)";
+    `P "$(mname) -l";
     `S Manpage.s_description;
     `P
       "The first form provisions a git worktree for $(i,BRANCH) and launches the \
-       agent in it; --here launches in the current checkout instead. -n \
-       prepares a worktree without launching, -d removes one, --list-ns lists \
-       the namespace configs, and a bare $(mname) lists the worktrees.";
+       agent in it; --here launches in the current checkout instead. A launch \
+       that names no BRANCH is a launch --here, so a bare $(mname) runs in the \
+       checkout you are standing in -- a linked worktree included, with no need \
+       to return to the main checkout and spell its branch. -n prepares a \
+       worktree without launching, -d removes one, -l lists the worktrees and \
+       --list-ns the namespace configs.";
     `P
       "The agent, or the -s shell, runs inside the repo's own nix devShell with a \
        scrubbed environment, a private HOME (per repo and agent by default), a \
@@ -130,7 +156,7 @@ let man =
     `S "CONFIGURATION";
     `P
       "Four layers, lowest first: built-in defaults, the matching sections of \
-       ~/.config/csb/config and then ~/.config/csb/config.local, the profile \
+       ~/.config/csb/config and then ~/.config/csb/config.local, the profiles \
        named by -p, and the command line. A scalar or boolean goes to the \
        highest layer that sets it; every list unions across all of them.";
     `P
@@ -142,14 +168,24 @@ let man =
        selector without '*' is one exact path. Every matching section applies, \
        in document order, and --dump-config reports which ones did.";
     `P
+      "A [group NAME] header is a named bundle rather than a selector: it \
+       matches no repository, and 'use = NAME' splices its lines into the \
+       section -- or the [profile NAME] block -- that names it, at that point in \
+       document order.";
+    `P
       "-p NAME reads ~/.config/csb/profiles/NAME, then the optional gitignored \
-       NAME.local overlay, in the same grammar without the section headers. \
-       Every layer takes the same keys: agent, ns, token_cmd, token_env, latest, \
+       NAME.local overlay, in the same grammar without the section headers -- or \
+       a [profile NAME] block in the config file, where config.local's block \
+       extends config's the same way NAME.local extends NAME. One source or the \
+       other: a name defined in both is an error. -p is repeatable, and each one \
+       is its own layer folded left to right.";
+    `P
+      "Every layer takes the same keys: agent, ns, token_cmd, token_env, latest, \
        verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, \
        shell, nix_target, nix_target_shell, nix_target_agent, seed_creds, \
-       seed_home, tmpdir, accent, args, keep, setenv, deny_read, allow_write, \
-       allow_socket, filter_egress, allow_loopback, allow_host, allow_port, \
-       paranoid_deny_read, paranoid_allow_read.";
+       seed_home, seed_merge, tmpdir, accent, args, keep, setenv, setenv_cmd, \
+       deny_read, allow_write, allow_socket, filter_egress, allow_loopback, \
+       allow_host, allow_port, paranoid_deny_read, paranoid_allow_read.";
     `P
       "The three HOME selectors -- ns, ephemeral, real_home -- are one axis, as \
        are the three nix_target keys: a layer naming any key on an axis replaces \

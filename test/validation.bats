@@ -263,6 +263,140 @@ load helpers
   assert_success
 }
 
+# --- --here resolves to the checkout ROOT, not $PWD ---------------------------
+
+# bats test_tags=dump-sandbox
+@test "--here from a subdirectory still scopes the write root to the checkout" {
+  # $PWD as the worktree would scope the write root to the subdirectory AND send
+  # `nix develop` looking for the flake there -- a silent fallback devShell plus
+  # a sandbox that cannot write the rest of the repo.
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$repo/deep/nested"
+  dump_sandbox "$repo/deep/nested"
+  assert_success
+  local root; root="$(realpath "$repo")"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    assert_line "(allow file-write* (subpath \"$root\"))"
+    refute_line "(allow file-write* (subpath \"$root/deep/nested\"))"
+  else
+    assert_output --partial "--bind"$'\n'"$root"$'\n'"$root"
+    refute_output --partial "--bind"$'\n'"$root/deep/nested"
+  fi
+}
+
+# bats test_tags=dump-sandbox
+@test "--here inside a linked worktree scopes to that worktree, not the main checkout" {
+  # The guard at the top of the launch path exempts --here precisely so this
+  # works; the write root must follow the worktree you are standing in.
+  local repo wt; repo="$(fake_repo)"
+  wt="$TEST_TMP/wt"
+  git -C "$repo" worktree add -q -b wtbranch "$wt"
+  mkdir -p "$wt/sub"
+  dump_sandbox "$wt/sub"
+  assert_success
+  local wtroot; wtroot="$(realpath "$wt")"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    assert_line "(allow file-write* (subpath \"$wtroot\"))"
+    refute_line "(allow file-write* (subpath \"$wtroot/sub\"))"
+  else
+    assert_output --partial "--bind"$'\n'"$wtroot"$'\n'"$wtroot"
+  fi
+}
+
+# --- a write root may not be a git repository root ----------------------------
+
+# bats test_tags=dump-sandbox
+@test "an allow-write naming a git repository root is refused" {
+  # The hooks/config write-denies cover the LAUNCH repo only, so any other repo
+  # made writable keeps a writable .git/hooks -- host execution at that repo's
+  # next git command.
+  local repo other; repo="$(fake_repo)"; other="$(fake_repo)"
+  dump_sandbox "$repo" --allow-write "$other"
+  assert_failure
+  assert_output --partial "is a git repository root"
+}
+
+# bats test_tags=dump-sandbox
+@test "an allow-write on a subdirectory of a repository is accepted" {
+  # The positive control, and the supported shape: .git is a SIBLING of the
+  # write root, so the allow-list never reaches it.
+  local repo other; repo="$(fake_repo)"; other="$(fake_repo)"
+  mkdir -p "$other/shared"
+  dump_sandbox "$repo" --allow-write "$other/shared"
+  assert_success
+  if [[ "$(uname -s)" == Darwin ]]; then
+    assert_line "(allow file-write* (subpath \"$(realpath "$other/shared")\"))"
+    refute_line "(allow file-write* (subpath \"$(realpath "$other")/.git\"))"
+  fi
+}
+
+# bats test_tags=dump-sandbox
+@test "an allow-write naming the launch repo's own checkout stays allowed" {
+  # Its hooks and config ARE denied below, so the refusal above would be a false
+  # alarm -- and the worktree is a write root either way.
+  local repo; repo="$(fake_repo)"
+  dump_sandbox "$repo" --allow-write "$repo"
+  assert_success
+}
+
+# bats test_tags=dump-sandbox
+@test "an allow-write on a plain directory that is not a repo is accepted" {
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/scratch"
+  dump_sandbox "$repo" --allow-write "$TEST_TMP/scratch"
+  assert_success
+}
+
+# --- allow_write and paranoid_allow_read may not name the same path -----------
+
+# bats test_tags=dump-sandbox
+@test "a path in both allow-write and paranoid-allow-read is refused" {
+  # On Linux the read-only bind lands AFTER the writable one, so the pair comes
+  # out read-only there and writable on macOS. Refused so it cannot diverge.
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/both"
+  dump_sandbox "$repo" --paranoid --allow-write "$TEST_TMP/both" \
+    --paranoid-allow-read "$TEST_TMP/both"
+  assert_failure
+  assert_output --partial "overlaps allow_write"
+}
+
+# bats test_tags=dump-sandbox
+@test "the allow-write / paranoid-allow-read overlap is refused without --paranoid too" {
+  # The list is inert without --paranoid, but a profile carrying both must fail
+  # the same way whichever mode reads it -- the rule the IPC refusals set.
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/both"
+  dump_sandbox "$repo" --allow-write "$TEST_TMP/both" \
+    --paranoid-allow-read "$TEST_TMP/both"
+  assert_failure
+  assert_output --partial "overlaps allow_write"
+}
+
+# bats test_tags=dump-sandbox
+@test "a paranoid-allow-read INSIDE a write root is refused as an overlap" {
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/outer/inner"
+  dump_sandbox "$repo" --paranoid --allow-write "$TEST_TMP/outer" \
+    --paranoid-allow-read "$TEST_TMP/outer/inner"
+  assert_failure
+  assert_output --partial "overlaps allow_write"
+}
+
+# bats test_tags=dump-sandbox
+@test "disjoint allow-write and paranoid-allow-read roots are accepted" {
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/w" "$TEST_TMP/r"
+  dump_sandbox "$repo" --paranoid --allow-write "$TEST_TMP/w" \
+    --paranoid-allow-read "$TEST_TMP/r"
+  assert_success
+  if [[ "$(uname -s)" == Darwin ]]; then
+    assert_line "(allow file-write* (subpath \"$(realpath "$TEST_TMP/w")\"))"
+    assert_line "(allow file-read* (subpath \"$(realpath "$TEST_TMP/r")\"))"
+    refute_line "(allow file-write* (subpath \"$(realpath "$TEST_TMP/r")\"))"
+  fi
+}
+
 # --- the IPC broker paths may not be re-opened by any flag (PLAN-007 D9) -----
 
 # bats test_tags=dump-sandbox
@@ -552,4 +686,187 @@ none
   assert_failure
   assert_output --partial "unknown key 'nix_target_claude'"
   assert_output --partial "nix_target_agent"
+}
+
+# --- setenv_cmd: token_cmd generalized to any variable -----------------------
+
+@test "--setenv-cmd requires VAR=CMD" {
+  dump_config --setenv-cmd nope
+  assert_failure
+  assert_output --partial "setenv_cmd needs VAR=command"
+}
+
+@test "--setenv-cmd without a value dies" {
+  dump_config --setenv-cmd
+  assert_failure
+  assert_output --partial "--setenv-cmd requires VAR=CMD"
+}
+
+@test "a setenv_cmd with an empty command dies" {
+  # A command is the whole configuration here; nothing to run is a typo, not a
+  # retraction (lists do not retract).
+  write_profile p "setenv_cmd=FOO="
+  dump_config -p p
+  assert_failure
+  assert_output --partial "setenv_cmd needs a command"
+}
+
+@test "a setenv_cmd whose name is not a variable dies" {
+  dump_config --setenv-cmd 'not a var=echo hi'
+  assert_failure
+  assert_output --partial "setenv_cmd needs VAR=command"
+}
+
+@test "setenv and setenv_cmd naming one variable is refused" {
+  # Both land in the same post-scrub `env` invocation, where the last argument
+  # would win silently.
+  write_profile p "setenv=SHARED=literal"
+  dump_config -p p --setenv-cmd 'SHARED=printf x'
+  assert_failure
+  assert_output --partial "setenv and setenv_cmd both name SHARED"
+}
+
+@test "setenv_cmd naming the token variable while token_cmd is set is refused" {
+  dump_config --token-cmd 'printf t' --setenv-cmd 'CLAUDE_CODE_OAUTH_TOKEN=printf u'
+  assert_failure
+  assert_output --partial "setenv_cmd and token_cmd both name CLAUDE_CODE_OAUTH_TOKEN"
+}
+
+@test "setenv_cmd may name the token variable when no token_cmd is set" {
+  # The collision is with token_cmd, not with the variable: naming it is how an
+  # operator authenticates through setenv_cmd instead.
+  dump_config --setenv-cmd 'CLAUDE_CODE_OAUTH_TOKEN=printf u'
+  assert_success
+  assert_line "setenv_cmd=CLAUDE_CODE_OAUTH_TOKEN"
+}
+
+@test "setenv_cmd reports variable NAMES only, never the command" {
+  write_profile p "setenv_cmd=VAULT_TOKEN=op read op://vault/secret/token"
+  dump_config -p p
+  assert_success
+  assert_line "setenv_cmd=VAULT_TOKEN"
+  refute_output --partial "op://vault"
+}
+
+# --- seed_merge: the operator's own json_merge instruction --------------------
+
+@test "--seed-merge requires DEST=FILE" {
+  dump_config --seed-merge nope
+  assert_failure
+  assert_output --partial "seed_merge needs DEST=FILE"
+}
+
+@test "--seed-merge without a value dies" {
+  dump_config --seed-merge
+  assert_failure
+  assert_output --partial "--seed-merge requires DEST=FILE"
+}
+
+@test "a seed_merge destination escaping the launch HOME is refused" {
+  printf '{}\n' > "$TEST_TMP/m.json"
+  dump_config --seed-merge "../escape.json=$TEST_TMP/m.json"
+  assert_failure
+  assert_output --partial "relative destination under the launch HOME"
+}
+
+@test "an absolute seed_merge destination is refused" {
+  printf '{}\n' > "$TEST_TMP/m.json"
+  dump_config --seed-merge "/etc/thing.json=$TEST_TMP/m.json"
+  assert_failure
+  assert_output --partial "relative destination under the launch HOME"
+}
+
+@test "a seed_merge with no source FILE is refused" {
+  dump_config --seed-merge ".claude/x.json="
+  assert_failure
+  assert_output --partial "seed_merge needs a source FILE"
+}
+
+@test "a relative seed_merge source is refused" {
+  dump_config --seed-merge ".claude/x.json=relative.json"
+  assert_failure
+  assert_output --partial "not an absolute or ~/ path"
+}
+
+@test "a seed_merge source that does not exist is fatal" {
+  dump_config --seed-merge ".claude/x.json=$TEST_TMP/missing.json"
+  assert_failure
+  assert_output --partial "seed_merge: source not found"
+}
+
+@test "a seed_merge source that is a directory is fatal" {
+  mkdir -p "$TEST_TMP/adir"
+  dump_config --seed-merge ".claude/x.json=$TEST_TMP/adir"
+  assert_failure
+  assert_output --partial "seed_merge: source is a directory"
+}
+
+@test "an empty seed_merge source is fatal" {
+  : > "$TEST_TMP/empty.json"
+  dump_config --seed-merge ".claude/x.json=$TEST_TMP/empty.json"
+  assert_failure
+  assert_output --partial "seed_merge: source is empty"
+}
+
+@test "a seed_merge source holding a NUL byte is fatal" {
+  # NUL terminates the records bin/csb reads back, so one inside the content
+  # would split a single instruction into two.
+  printf '{"a":"b\000c"}' > "$TEST_TMP/nul.json"
+  dump_config --seed-merge ".claude/x.json=$TEST_TMP/nul.json"
+  assert_failure
+  assert_output --partial "seed_merge: source contains a NUL byte"
+}
+
+@test "a ~/ seed_merge source expands against HOME" {
+  mkdir -p "$HOME/seeds"
+  printf '{"a":1}\n' > "$HOME/seeds/m.json"
+  write_profile p 'seed_merge=.claude/x.json=~/seeds/m.json'
+  dump_config -p p
+  assert_success
+  assert_line "seed_merge=.claude/x.json=$HOME/seeds/m.json"
+}
+
+# --- profile names ------------------------------------------------------------
+
+@test "an invalid --profile name dies" {
+  dump_config -p 'two words'
+  assert_failure
+  assert_output --partial "invalid profile name 'two words'"
+}
+
+@test "a --profile naming a parent directory dies" {
+  dump_config -p ..
+  assert_failure
+  assert_output --partial "invalid profile name '..'"
+}
+
+@test "an empty --profile dies" {
+  dump_config -p ''
+  assert_failure
+  assert_output --partial "--profile requires a non-empty NAME"
+}
+
+@test "the unknown-key error names the new config keys" {
+  write_profile p "setenv_command=FOO=bar"
+  dump_config -p p
+  assert_failure
+  assert_output --partial "unknown key 'setenv_command'"
+  assert_output --partial "setenv_cmd"
+  assert_output --partial "seed_merge"
+}
+
+@test "seed_merge under --real-home warns that it will not be seeded" {
+  # It would resolve, read its source, and then do nothing: csb never writes the
+  # operator's own HOME.
+  printf '{"a":1}\n' > "$TEST_TMP/m.json"
+  dump_config --real-home --seed-merge ".claude/x.json=$TEST_TMP/m.json"
+  assert_success
+  assert_output --partial "--real-home is never seeded"
+}
+
+@test "seed_merge without --real-home warns about nothing" {
+  printf '{"a":1}\n' > "$TEST_TMP/m.json"
+  dump_config --here --seed-merge ".claude/x.json=$TEST_TMP/m.json"
+  assert_success
+  refute_output --partial "never seeded"
 }

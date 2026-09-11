@@ -608,3 +608,173 @@ setup_root() { export CSB_MAIN_ROOT="$REPO"; }
   assert_line "config_sections="
   assert_output --partial "no git repository here"
 }
+
+# --- [profile NAME] blocks ----------------------------------------------------
+
+@test "a [profile NAME] block matches no repository on its own" {
+  setup_root
+  write_config config "[profile work]" "paranoid=true"
+  dump_config
+  assert_success
+  assert_line "paranoid=false"
+  assert_line "config_sections="
+}
+
+@test "-p resolves a [profile NAME] block in the config file" {
+  setup_root
+  write_config config "[profile work]" "paranoid=true" "accent=magenta"
+  dump_config -p work
+  assert_success
+  assert_line "paranoid=true"
+  assert_line "accent=magenta"
+  assert_line "profile=work"
+}
+
+@test "a used [profile NAME] is reported, labelled by the file defining it" {
+  setup_root
+  write_config config "[profile work]" "paranoid=true"
+  dump_config -p work
+  assert_line "config_sections=config[profile work]"
+}
+
+@test "a [profile NAME] block beats a config section, like a profile file" {
+  setup_root
+  write_config config "[*]" "accent=blue" "[profile work]" "accent=magenta"
+  dump_config -p work
+  assert_line "accent=magenta"
+}
+
+@test "a CLI flag still beats a [profile NAME] block" {
+  setup_root
+  write_config config "[profile work]" "paranoid=true"
+  dump_config -p work --no-paranoid
+  assert_line "paranoid=false"
+}
+
+@test "a [profile NAME] block can use= a group" {
+  # The composition win: a group is the shared fragment, a profile assembles
+  # fragments. use= is refused inside a [group] and allowed here.
+  setup_root
+  write_config config \
+    "[group db]" "allow_port=5432" "allow_host=db.internal" \
+    "[profile work]" "use=db" "paranoid=true"
+  dump_config -p work
+  assert_line "allow_port=5432"
+  assert_line "allow_host=db.internal"
+  assert_line "paranoid=true"
+}
+
+@test "a group used by a profile is reported alongside it" {
+  setup_root
+  write_config config "[group db]" "allow_port=5432" "[profile work]" "use=db"
+  dump_config -p work
+  assert_line "config_sections=config[profile work]|config[group db]"
+}
+
+@test "a profile's use= splices at its point in document order" {
+  setup_root
+  write_config config \
+    "[group g]" "nix_target=fromgroup" \
+    "[profile p]" "nix_target=before" "use=g"
+  dump_config -p p
+  assert_line "nix_target=fromgroup"
+
+  write_config config \
+    "[group g]" "nix_target=fromgroup" \
+    "[profile p]" "use=g" "nix_target=after"
+  dump_config -p p
+  assert_line "nix_target=after"
+}
+
+@test "a [profile NAME] in config.local extends the one in config" {
+  # The same relationship profiles/NAME.local has to profiles/NAME: scalars from
+  # the later file win, lists union.
+  setup_root
+  write_config config "[profile work]" "accent=blue" "allow_host=from.config"
+  write_config config.local "[profile work]" "accent=magenta" "allow_host=from.local"
+  dump_config -p work
+  assert_line "accent=magenta"
+  assert_line "allow_host=from.config|from.local"
+}
+
+@test "a [profile NAME] defined twice in ONE file is refused" {
+  setup_root
+  write_config config "[profile work]" "paranoid=true" "[profile work]" "yolo=true"
+  dump_config -p work
+  assert_failure
+  assert_output --partial "profile 'work' is already defined in config"
+}
+
+@test "a bad key in a [profile NAME] nobody names is still fatal" {
+  setup_root
+  write_config config "[profile work]" "paranoidd=true"
+  dump_config
+  assert_failure
+  assert_output --partial "unknown key 'paranoidd'"
+}
+
+@test "a [profile NAME] naming two HOME selectors is refused" {
+  setup_root
+  write_config config "[profile work]" "ns=shared" "real_home=true"
+  dump_config -p work
+  assert_failure
+  assert_output --partial "mutually exclusive"
+}
+
+@test "[profile] with no name is refused" {
+  setup_root
+  write_config config "[profile]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "[profile] needs a name"
+}
+
+@test "an invalid profile-block name is refused" {
+  setup_root
+  write_config config "[profile two words]" "paranoid=true"
+  dump_config
+  assert_failure
+  assert_output --partial "invalid profile name 'two words'"
+}
+
+@test "a profile block cannot be named by a section's use=" {
+  # The two headers are different roles: a bundle is spliceable, a launch config
+  # is not, and keeping them apart is why [profile] is not just [group].
+  setup_root
+  write_config config "[profile work]" "paranoid=true" "[*]" "use=work"
+  dump_config
+  assert_failure
+  assert_output --partial "no [group work] defined above this line"
+}
+
+@test "a group cannot be named by -p" {
+  setup_root
+  write_config config "[group work]" "paranoid=true"
+  dump_config -p work
+  assert_failure
+  assert_output --partial "profile not found"
+}
+
+@test "a name defined as BOTH a profile file and a block is refused" {
+  setup_root
+  write_profile work "paranoid=true"
+  write_config config "[profile work]" "yolo=true"
+  dump_config -p work
+  assert_failure
+  assert_output --partial "defined twice"
+}
+
+@test "a -p naming nothing at all reports both sources" {
+  setup_root
+  dump_config -p missing
+  assert_failure
+  assert_output --partial "profile not found"
+  assert_output --partial "[profile missing] block in the config file"
+}
+
+@test "a bare -p naming a config block still implies --here" {
+  setup_root
+  write_config config "[profile work]" "accent=magenta"
+  dump_config -p work
+  assert_line "here=true"
+}

@@ -2,11 +2,11 @@
    file as NUL-terminated KEY=VALUE records.
 
    Two things separate it from Dump, which is the operator-facing seam. It
-   redacts nothing -- token_cmd carries its command, setenv its values -- so it
-   goes to a file the caller reads and unlinks rather than to a terminal. And a
-   list key repeats, once per element, instead of joining: NUL is the one byte a
-   path, an argument or a variable's value cannot contain, so no element can
-   split itself into two.
+   redacts nothing -- token_cmd and setenv_cmd carry their commands, setenv its
+   values -- so it goes to a file the caller reads and unlinks rather than to a
+   terminal. And a list key repeats, once per element, instead of joining: NUL is
+   the one byte a path, an argument or a variable's value cannot contain, so no
+   element can split itself into two.
 
    The key set is exactly what bin/csb consumes. An unknown key on either side
    is an error there, so a field added here without a reader fails loudly. *)
@@ -66,7 +66,7 @@ let records c =
       ("branch", s (Dump.branch_name c.target));
       ("ephemeral", b (Dump.is_throwaway c.home));
       ("ephemeral_name", s (Dump.throwaway_name c.home));
-      ("profile", s (Dump.opt c.profile));
+      ("profile", c.profiles);
       ("seed_creds", b c.seed_creds);
       ("seed_home", s (Dump.opt c.seed_home));
       ("reseed", b c.reseed);
@@ -79,6 +79,7 @@ let records c =
       ("agent_args", c.agent_args);
       ("keep", c.keep);
       ("setenv", setenv_words);
+      ("setenv_cmd", List.map (fun (k, v) -> k ^ "=" ^ v) c.setenv_cmd);
       ("deny_read", c.deny_read);
       ("allow_write", c.allow_write);
       ("allow_socket", c.allow_socket);
