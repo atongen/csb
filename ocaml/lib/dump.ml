@@ -76,6 +76,9 @@ let to_lines c =
     ("tmp_base", c.tmp_base);
     ("token_cmd", (match c.token_cmd with Some _ -> "present" | None -> "absent"));
     ("token_env", c.token_env);
+    (* The profile NAME, which is configuration and not a credential: what it
+       resolves to is fetched at launch and never reaches this seam. *)
+    ("aws_profile", opt c.aws_profile);
     ("seed", joined (seed_shapes c.seed));
     ("cred_seed", joined (seed_shapes c.cred_seed));
     (* dest=source, which `seed` cannot show: there it is one more json_merge

@@ -180,8 +180,9 @@ let man =
        other: a name defined in both is an error. -p is repeatable, and each one \
        is its own layer folded left to right.";
     `P
-      "Every layer takes the same keys: agent, ns, token_cmd, token_env, latest, \
-       verbose, yolo, paranoid, pasteboard, sandbox, real_home, here, ephemeral, \
+      "Every layer takes the same keys: agent, ns, token_cmd, token_env, \
+       aws_profile, latest, verbose, yolo, paranoid, pasteboard, sandbox, \
+       real_home, here, ephemeral, \
        shell, nix_target, nix_target_shell, nix_target_agent, seed_creds, \
        seed_home, seed_merge, tmpdir, accent, args, keep, setenv, setenv_cmd, \
        deny_read, allow_write, allow_socket, filter_egress, allow_loopback, \

@@ -1829,6 +1829,50 @@ run_setenv_cmds() {
   done
 }
 
+# Fetch short-lived credentials for $aws_profile host-side and stage them as env
+# overrides for the launch. The aws CLI is needed on the HOST only; the sandbox
+# receives an environment and never a credential file, and ~/.aws stays denied.
+#
+# Credentials that do not expire are refused, and the check needs no parsing:
+# export-credentials emits every variable csb-config named for a SESSION (sso,
+# assume-role, credential_process) and only the key pair for long-lived IAM user
+# keys, so a missing one IS the refusal.
+fetch_aws_creds() {
+  aws_env=()
+  [[ -n "$aws_profile" ]] || return 0
+  command -v aws >/dev/null 2>&1 || die "aws_profile needs the aws CLI on the host"
+  local creds line kv var region expiry="" v got=" " missing=""
+  if ! creds=$(aws configure export-credentials --profile "$aws_profile" --format env 2>/dev/null); then
+    echo "$PROG: no valid credentials for '$aws_profile'; trying sso device-code login" >&2
+    aws sso login --profile "$aws_profile" --use-device-code \
+      || die "aws sso login --profile '$aws_profile' failed"
+    creds=$(aws configure export-credentials --profile "$aws_profile" --format env) \
+      || die "aws configure export-credentials failed for '$aws_profile' after login"
+  fi
+  while IFS= read -r line; do
+    kv="${line#export }"; var="${kv%%=*}"
+    for v in "${aws_cred_vars[@]+"${aws_cred_vars[@]}"}"; do
+      [[ "$var" == "$v" ]] || continue
+      aws_env+=("$kv"); got+="$var "
+      [[ "$var" != "$aws_expiry_var" ]] || expiry="${kv#*=}"
+    done
+  done <<< "$creds"
+  for v in "${aws_cred_vars[@]+"${aws_cred_vars[@]}"}"; do
+    [[ "$got" == *" $v "* ]] || missing+="${missing:+, }$v"
+  done
+  [[ -z "$missing" ]] || die "profile '$aws_profile' exported no $missing, so its credentials do not expire.
+  csb injects short-lived credentials only: configure the profile as an sso,
+  assume-role or credential_process profile instead of long-lived IAM user keys."
+  # export-credentials does not emit the region; supply it from the profile.
+  region=$(aws configure get region --profile "$aws_profile" 2>/dev/null || true)
+  if [[ -n "$region" ]]; then
+    for v in "${aws_region_vars[@]+"${aws_region_vars[@]}"}"; do aws_env+=("$v=$region"); done
+  fi
+  # The session does not refresh inside a running launch, so make its deadline
+  # visible at the one moment something can be done about it.
+  echo "$PROG: AWS credentials for '$aws_profile'${expiry:+ (expire: $expiry)}" >&2
+}
+
 # --- config resolution ------------------------------------------------------------
 #
 # csb-config owns the flag grammar, the profiles, their validation, --help and
@@ -1869,7 +1913,8 @@ csb_config_scalars=(dump mode no_launch here shell agent agent_bin_attr
                     paranoid pasteboard
                     nix_target_effective sandbox real_home yolo latest verbose
                     namespace branch ephemeral ephemeral_name seed_creds
-                    seed_home reseed accent cfg_tmpdir tmp_base token_cmd filter_egress
+                    seed_home reseed accent cfg_tmpdir tmp_base token_cmd aws_profile
+                    aws_expiry_var filter_egress
                     allow_loopback)
 
 # Run csb-config over this invocation's argv and read the resolution back into
@@ -1949,6 +1994,10 @@ resolve_config() {
       cfg_tmpdir)           cfg_tmpdir="$v" ;;
       tmp_base)             cfg_tmp_base="$v" ;;
       token_cmd)            token_cmd="$v" ;;
+      aws_profile)          aws_profile="$v" ;;
+      aws_expiry_var)       aws_expiry_var="$v" ;;
+      aws_cred_var)         aws_cred_vars+=("$v") ;;
+      aws_region_var)       aws_region_vars+=("$v") ;;
       filter_egress)        filter_egress="$v" ;;
       allow_loopback)       allow_loopback="$v" ;;
       agent_args)           agent_args+=("$v") ;;
@@ -2025,6 +2074,13 @@ accent=""
 cfg_tmpdir=""
 cfg_tmp_base="/tmp"  # replaced by csb-config's resolved answer
 token_cmd=""
+# The aws profile whose short-lived credentials are injected, the variables
+# csb-config says to extract them into, and the result of the host-side fetch.
+aws_profile=""
+aws_expiry_var="AWS_CREDENTIAL_EXPIRATION"
+aws_cred_vars=()
+aws_region_vars=()
+aws_env=()
 filter_egress="false"
 allow_loopback="false"
 agent_args=()
@@ -2090,13 +2146,15 @@ for v in "${keep_vars[@]}"; do keep_args+=(--keep "$v"); done
 # branch/--here term keeps a listing run out of the password store); the -s
 # shell skips token_cmd too (it runs no agent — no reason to touch it).
 #
-# setenv_cmd runs under the same guard MINUS the shell exclusion: it carries
-# whatever the launched process needs, and a test suite reaching a service in -s
-# needs its variable exactly as the agent would.
+# setenv_cmd and the aws fetch run under the same guard MINUS the shell
+# exclusion: they carry whatever the launched process needs, and a test suite or
+# an operator reaching a service in -s needs those variables exactly as the agent
+# would.
 if [[ "$mode" == "launch" && "$no_launch" != "true" \
       && -z "$dump" && ( -n "$branch" || "$here" == "true" ) ]]; then
   [[ "$shell" == "true" ]] || run_token_cmd
   run_setenv_cmds
+  fetch_aws_creds
 fi
 
 # --- reap mode --------------------------------------------------------------------
@@ -2428,6 +2486,9 @@ fi
 # their relative order settles nothing and is only for determinism.
 env_overrides+=("${profile_setenv[@]+"${profile_setenv[@]}"}")
 env_overrides+=("${resolved_setenv_cmd[@]+"${resolved_setenv_cmd[@]}"}")
+# The aws session, fetched host-side. No layer can have named these variables --
+# csb-config refuses that outright -- so this is the only thing that sets them.
+env_overrides+=("${aws_env[@]+"${aws_env[@]}"}")
 
 # csb's own launch state, for the sandboxed process to surface (a statusline
 # script, a prompt): these csb concepts have no representation in the agent's

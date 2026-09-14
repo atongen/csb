@@ -1,0 +1,28 @@
+# Starter profile for AWS access. Copy it to
+# ${XDG_CONFIG_HOME:-~/.config}/csb/profiles/aws and launch with `csb -p aws`,
+# which is all it takes to turn the injection on for one run:
+#
+#   csb -p aws mybranch              # agent, with the session injected
+#   csb -p aws -s -- aws sts get-caller-identity
+#   csb -p work -p aws mybranch      # composes with another profile
+#
+# See the "AWS credentials" section of README.md, and docs/PLAN-011-aws.md for
+# the account side -- the view-only role, and what CloudTrail must capture.
+
+# The profile in ~/.aws/config whose SHORT-LIVED credentials csb fetches on the
+# host. It must resolve to a SESSION -- sso, assume-role or credential_process
+# -- because csb refuses to inject credentials that do not expire.
+aws_profile=agent-view-only
+
+# The endpoints the injected session needs, listed here so that turning egress
+# filtering on works rather than failing as an opaque transport error. Harmless
+# without --filter-egress: an allowlist is only read when one is enforced.
+allow_host=*.amazonaws.com
+# Newer service endpoints, and the docs the agent may want to read:
+# allow_host=*.api.aws
+# allow_host=docs.aws.amazon.com
+
+# Uncomment to make this profile filter egress as well. The agent's own hosts
+# come from the allowed-hosts file and union with the lines above -- with no
+# such file, filtering here would cut the agent off from its own API.
+# filter_egress=true

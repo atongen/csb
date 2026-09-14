@@ -109,6 +109,10 @@ type t = {
      scrub's keep list. Always answered: the agent's default when no layer
      names one. *)
   token_env : string;
+  (* The aws profile whose SHORT-LIVED credentials bin/csb fetches host-side and
+     injects. A name, never a credential: what it resolves to lives in ~/.aws,
+     which the sandbox never sees. *)
+  aws_profile : string option;
   seed_home : string option;
   accent : string option;
   cfg_tmpdir : string option;

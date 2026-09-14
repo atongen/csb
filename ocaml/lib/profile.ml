@@ -16,6 +16,7 @@ type t = {
   shell : bool option;
   token_cmd : string Layer.t;
   token_env : string Layer.t;
+  aws_profile : string Layer.t;
   latest : bool option;
   verbose : bool option;
   yolo : bool option;
@@ -46,7 +47,7 @@ type t = {
 let empty =
   {
     home = Layer.Unset; nix = Layer.Unset; agent = Layer.Unset; shell = None;
-    token_cmd = Layer.Unset; token_env = Layer.Unset;
+    token_cmd = Layer.Unset; token_env = Layer.Unset; aws_profile = Layer.Unset;
     latest = None; verbose = None; yolo = None; paranoid = None;
     pasteboard = None; sandbox = None; here = None; seed_creds = None;
     seed_home = Layer.Unset; tmpdir = Layer.Unset; accent = Layer.Unset;
@@ -79,7 +80,7 @@ let blank =
   }
 
 let known_keys =
-  "agent, ns, token_cmd, token_env, latest, verbose, yolo, paranoid, pasteboard, \
+  "agent, ns, token_cmd, token_env, aws_profile, latest, verbose, yolo, paranoid, pasteboard, \
    sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
    nix_target_agent, seed_creds, seed_home, seed_merge, tmpdir, accent, args, \
    keep, setenv, setenv_cmd, deny_read, allow_write, allow_socket, \
@@ -124,6 +125,12 @@ let apply env ~where d key value =
           token_env =
             (if value = "" then Layer.Cleared
              else Layer.Set (Validate.keep_var ~msg:(where ^ ": invalid token_env name") value)) }
+  | "aws_profile" ->
+      keep_layer
+        { p with
+          aws_profile =
+            (if value = "" then Layer.Cleared
+             else Layer.Set (Validate.aws_profile ~where:(where ^ ": aws_profile") value)) }
   | "latest" -> keep_layer { p with latest = b () }
   | "verbose" -> keep_layer { p with verbose = b () }
   | "yolo" -> keep_layer { p with yolo = b () }
@@ -282,6 +289,7 @@ let overlay ~base ~over =
     shell = s over.shell base.shell;
     token_cmd = Layer.over over.token_cmd base.token_cmd;
     token_env = Layer.over over.token_env base.token_env;
+    aws_profile = Layer.over over.aws_profile base.aws_profile;
     latest = s over.latest base.latest;
     verbose = s over.verbose base.verbose;
     yolo = s over.yolo base.yolo;

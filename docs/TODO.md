@@ -241,12 +241,21 @@
       (profiles under ~/.config/csb, outside every write root, + CLI flags),
       never from repo/worktree files; and allow_write widens --paranoid READS
       too (write roots are read-re-allowed there).
-- [x] ~~future --aws upgrade path (out of scope for plan-002): host-side
-      credential broker + AWS_CONTAINER_CREDENTIALS_FULL_URI, viable because
-      sandbox networking is open — would fix the no-refresh-in-session caveat.~~
-      DROPPED (2026-07-14): the whole `--aws`/`aws_profile=` credential-injection
-      feature was removed from bin/csb and the README (no ongoing need). See the
-      removal note in docs/PLAN-002.md phase 3. `~/.aws` stays in the deny-list.
+- [x] aws credential injection. DROPPED 2026-07-14, RESTORED 2026-09-14 in a
+      different shape: `aws_profile=` is a csb-config axis (CLI `--aws` /
+      `--no-aws`), so a profile is the activation -- `csb -p aws`. The injection
+      OWNS its eight variables: a setenv/setenv_cmd/token_env/keep naming one is
+      refused, `keep=AWS_PROFILE` with it. Credentials that do not expire are
+      REFUSED, which needs no parsing -- export-credentials emits the session
+      token and the expiry for a session and not for static keys, so the missing
+      pair is the refusal. `~/.aws` stays in the deny floor and the SDK's config
+      files are pinned to /dev/null, so the environment is the only AWS access a
+      launch has. See docs/PLAN-011-aws.md; the account side (view-only role,
+      CloudTrail) is sections 3-6 there.
+    * STILL DEFERRED, and now written up rather than a TODO line: the host-side
+      credential broker (AWS_CONTAINER_CREDENTIALS_FULL_URI on loopback) that
+      would fix the no-refresh-in-session caveat. PLAN-011 section 7. csb-proxy
+      has since established the host-side-server-on-loopback pattern it needs.
 - [ ] hardening for the untrusted-instruction threat model (single layer +
       open egress is the exposure; see README "Hardening"). Highest leverage:
       a second boundary — separate unprivileged OS user, or a lightweight VM

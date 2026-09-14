@@ -38,6 +38,7 @@ type t = {
   accent : string Layer.t;
   token_cmd : string Layer.t;
   token_env : string Layer.t;
+  aws_profile : string Layer.t;
   tmpdir : string Layer.t;
   setenv : (string * string) list;
   setenv_cmd : (string * string) list;
@@ -66,7 +67,7 @@ type t = {
 let value_taking =
   [ "-N"; "--ns"; "--agent"; "--nix-target"; "--nix-target-shell";
     "--nix-target-agent";
-    "--seed-home"; "--accent"; "--token-cmd"; "--token-env"; "--tmpdir"; "--setenv";
+    "--seed-home"; "--accent"; "--token-cmd"; "--token-env"; "--aws"; "--tmpdir"; "--setenv";
     "--setenv-cmd"; "--seed-merge";
     "-p"; "--profile"; "-k"; "--keep"; "--deny-read";
     "--allow-write"; "--allow-socket"; "--allow-host"; "--allow-port";
@@ -414,6 +415,9 @@ let term env pre =
   and+ no_agent =
     flag [ "no-agent" ] ~docs:s_negate
       ~doc:"Cancel a configured agent= and use the default, claude."
+  and+ no_aws =
+    flag [ "no-aws" ] ~docs:s_negate
+      ~doc:"Cancel a configured aws_profile= and launch with no AWS credentials."
   and+ no_tmpdir =
     flag [ "no-tmpdir" ] ~docs:s_negate
       ~doc:"Cancel a configured tmpdir= and fall back to CSB_TMPDIR."
@@ -471,6 +475,18 @@ let term env pre =
          scrub keeps. Defaults to the agent's own (claude: \
          CLAUDE_CODE_OAUTH_TOKEN); name another to authenticate an agent through \
          a provider key instead."
+  and+ aws =
+    opt_str [ "aws" ] ~docv:"PROFILE" ~docs:s_seed
+      ~doc:
+        "Fetch SHORT-LIVED credentials for aws profile PROFILE on the host -- \
+         'aws configure export-credentials', with an sso device-code login \
+         fallback -- and inject them into the launched environment, in both \
+         agent and shell modes. Credentials that do not expire are REFUSED: a \
+         profile must resolve to a session (sso, assume-role, \
+         credential_process), never to long-lived IAM user keys. The real \
+         ~/.aws stays denied inside the sandbox, so the injected session is the \
+         only AWS access the launch has, and it does NOT refresh -- re-launch \
+         when it expires."
   and+ tmpdir =
     opt_str [ "tmpdir" ] ~docv:"DIR"
       ~doc:
@@ -641,6 +657,11 @@ let term env pre =
            (need
               ~msg:"--token-env requires a VAR (--no-token-env uses the agent's own)"
               token_env));
+    aws_profile =
+      Layer.map
+        (Validate.aws_profile ~where:"--aws")
+        (setting ~pos:"--aws" ~neg:"--no-aws" ~cleared:(given no_aws)
+           (need ~msg:"--aws requires a PROFILE (--no-aws cancels a configured one)" aws));
     tmpdir =
       setting ~pos:"--tmpdir" ~neg:"--no-tmpdir" ~cleared:(given no_tmpdir)
         (need ~msg:"--tmpdir requires a DIR (--no-tmpdir falls back to CSB_TMPDIR)"

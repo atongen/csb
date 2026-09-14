@@ -218,12 +218,14 @@ for the previously-unverified linux path):
 
 #### phase 3: profiles config + --aws
 
-> NOTE (2026-07-14): the `--aws` / `aws_profile=` credential-injection feature
-> described in this phase was implemented but later REMOVED (no ongoing need).
-> The `--aws PROFILE` flag, the `aws_profile=` profile key, and `fetch_aws_creds`
-> are gone from bin/csb; the README no longer documents them. The read deny-list
-> entry for `~/.aws` is unrelated and stays. This section is retained as
-> historical record of the original design.
+> NOTE (2026-09-14): the `--aws` / `aws_profile=` credential-injection feature
+> described in this phase was implemented, REMOVED on 2026-07-14, and RESTORED
+> in a different shape. **docs/PLAN-011-aws.md is the current design**; what
+> follows is the original, kept as the historical record. The differences that
+> matter: resolution lives in csb-config rather than in bash, the injection owns
+> its variables (a second source naming one is refused), credentials that do not
+> expire are refused outright, and the SDK's config files are pinned away from
+> the denied `~/.aws`.
 
 Profiles config: `${XDG_CONFIG_HOME:-~/.config}/csb/profiles/<name>`, one file
 per profile, line-oriented KEY=VALUE with only these keys recognized (anything

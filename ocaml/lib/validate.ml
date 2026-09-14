@@ -145,6 +145,14 @@ let profile_name ~where v =
   then v
   else Err.die "%s: invalid profile name '%s' (use letters, digits, . _ -)" where v
 
+(* An aws profile name, as it appears in ~/.aws/config. Held to the charset the
+   aws CLI's own names use -- granted-sso names carry a '/', a role name an '@'
+   -- so no whitespace or quote reaches the argv csb builds around it. *)
+let aws_profile ~where v =
+  let ok c = is_alnum c || List.mem c [ '.'; '_'; '-'; '/'; '@'; '+' ] in
+  if v <> "" && for_all ok v then v
+  else Err.die "%s: invalid aws profile '%s' (use letters, digits, . _ - / @ +)" where v
+
 let profile_bool ~where ~key v =
   match v with
   | "true" -> true

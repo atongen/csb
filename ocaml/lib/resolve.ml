@@ -58,6 +58,32 @@ let refuse_env_collisions ~setenv ~setenv_cmd ~token_env ~token_cmd =
           var)
     setenv_cmd
 
+(* The injection owns its variables outright: every other way to name one is
+   refused rather than ranked, so "which source won" is not a question an
+   operator can be left holding. A kept AWS_PROFILE is its own refusal -- it
+   names a profile whose definition lives in the denied ~/.aws, so the SDK would
+   fail looking for it while holding a working session. *)
+let refuse_aws_collisions ~aws_profile ~setenv ~setenv_cmd ~keep ~token_env =
+  match aws_profile with
+  | None -> ()
+  | Some _ ->
+      let owns var where =
+        Err.die "aws_profile injects %s; %s may not also name it (a variable has one source)"
+          var where
+      in
+      List.iter (fun (var, _) -> if List.mem var Aws.owned then owns var "setenv") setenv;
+      List.iter (fun (var, _) -> if List.mem var Aws.owned then owns var "setenv_cmd") setenv_cmd;
+      if List.mem token_env Aws.owned then owns token_env "token_env";
+      List.iter
+        (fun var ->
+          if List.mem var Aws.owned then owns var "keep";
+          if List.mem var Aws.profile_vars then
+            Err.die
+              "aws_profile and keep=%s are mutually exclusive (the sandbox would look for \
+               that profile in the denied ~/.aws)"
+              var)
+        keep
+
 let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections ~tmpdir
     ~read_hosts =
   let pf sel = sel layers in
@@ -143,6 +169,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
 
   let seed_home = Layer.value (Layer.over cli.seed_home (pf (fun p -> p.seed_home))) in
   let token_cmd = Layer.value (Layer.over cli.token_cmd (pf (fun p -> p.token_cmd))) in
+  let aws_profile = Layer.value (Layer.over cli.aws_profile (pf (fun p -> p.aws_profile))) in
   let token_env =
     Option.value
       (Layer.value (Layer.over cli.token_env (pf (fun p -> p.token_env))))
@@ -227,6 +254,13 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     Profile.dedupe_setenv (plist (fun p -> p.setenv_cmd) @ cli.setenv_cmd)
   in
   refuse_env_collisions ~setenv ~setenv_cmd ~token_env ~token_cmd;
+  let keep = cli.keep @ plist (fun p -> p.keep) in
+  refuse_aws_collisions ~aws_profile ~setenv ~setenv_cmd ~keep ~token_env;
+  (* The file pins ride as the highest setenv layer rather than as a private
+     arrangement between the injection and bin/csb: they are part of the launched
+     environment, so --dump-config is where they belong. Nothing can collide with
+     them -- the refusal above has already run. *)
+  let setenv = if aws_profile = None then setenv else setenv @ Aws.file_pins in
 
   (* seed_merge= reads its sources here, so a missing or unreadable one fails
      before the launch has provisioned anything. The instructions go AFTER the
@@ -247,6 +281,17 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
             dest })
         seed_merge
   in
+
+  let allow_hosts = cli.allow_hosts @ plist (fun p -> p.allow_hosts) @ read_hosts agent in
+  (* Injecting a session the sandbox has no route to use is a trap: a denied
+     CONNECT reaches the SDK as an opaque transport error. A hint, not a refusal
+     -- csb does not widen an egress policy the operator wrote. *)
+  if aws_profile <> None && filter_egress
+     && not (List.exists (String.ends_with ~suffix:Aws.endpoint_suffix) allow_hosts)
+  then (
+    Err.warn "warning: aws_profile is set but no allow_host covers *.%s, so the"
+      Aws.endpoint_suffix;
+    Err.note "  injected credentials reach no AWS endpoint (see templates/profiles/aws)");
 
   let target =
     if here then Types.Here
@@ -281,12 +326,13 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     profiles = cli.profiles;
     token_cmd;
     token_env;
+    aws_profile;
     seed_home;
     accent;
     cfg_tmpdir;
     tmp_base;
     agent_args;
-    keep = cli.keep @ plist (fun p -> p.keep);
+    keep;
     (* The agent's quiet knobs are the lowest setenv layer: they cannot live in
        a static built-in layer any more, because which ones they are is exactly
        what the layers above decide. *)
@@ -297,7 +343,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     allow_socket;
     filter_egress;
     allow_loopback;
-    allow_hosts = cli.allow_hosts @ plist (fun p -> p.allow_hosts) @ read_hosts agent;
+    allow_hosts;
     allow_ports = cli.allow_ports @ plist (fun p -> p.allow_ports);
     paranoid_deny_read;
     paranoid_allow_read;

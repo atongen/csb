@@ -74,6 +74,13 @@ let records c =
       ("cfg_tmpdir", s (Dump.opt c.cfg_tmpdir));
       ("tmp_base", s c.tmp_base);
       ("token_cmd", s (Dump.opt c.token_cmd));
+      ("aws_profile", s (Dump.opt c.aws_profile));
+      ("aws_expiry_var", s Aws.expiry_var);
+      (* Which variables bin/csb extracts from the aws CLI's output, and which it
+         fills with the profile's region. They ride the seam so the names live in
+         one place rather than two; a launch with no injection needs none. *)
+      ("aws_cred_var", if c.aws_profile = None then [] else Aws.cred_vars);
+      ("aws_region_var", if c.aws_profile = None then [] else Aws.region_vars);
       ("filter_egress", b c.filter_egress);
       ("allow_loopback", b c.allow_loopback);
       ("agent_args", c.agent_args);

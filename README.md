@@ -67,7 +67,8 @@ csb feature/foo                  # worktree for feature/foo + the agent in the d
 ```
 
 Requires [Nix](https://nixos.org) with flakes (Determinate Nix works out of the
-box); `csb` shells out to `nix`.
+box); `csb` shells out to `nix`. [`aws_profile=`](#aws-credentials-aws_profile)
+additionally needs the `aws` CLI on the host (only there).
 
 csb installs as two programs. `csb` orchestrates -- git, nix, the sandbox
 profile, the launch -- and `csb-config` owns the flag grammar, the profiles,
@@ -123,7 +124,8 @@ csb -s -E --here -- cat ~/.ssh/config   # run a command in the agent's env (this
 csb -s --no-sandbox --real-home --here -k SSH_AUTH_SOCK   # deploy shell: same devShell
                                  # + env scrub, but full fs + real HOME (see Filesystem sandbox)
 csb -p work feature/foo          # profile: ns/token/keeps/env from ~/.config/csb/profiles/work
-csb -k AWS_PROFILE feature/foo   # also keep AWS_PROFILE across the env scrub (repeatable)
+csb -p aws feature/foo           # a profile whose aws_profile= injects a short-lived AWS session
+csb -k COLORTERM feature/foo     # also keep COLORTERM across the env scrub (repeatable)
 csb -L feature/foo               # newest claude (re-lock claude-code to upstream HEAD this run)
 csb --agent claude feature/foo   # which agent runs (claude is the default)
 csb --ns work feature/foo        # shared, cross-repo HOME (default is per repo and agent)
@@ -237,6 +239,74 @@ login is never visible. Two ways in:
 [`setenv_cmd=VAR=CMD`](#profiles) runs any host command and exports its output
 as any variable, for a service token the launched process needs that is not the
 agent's own. The two may not name the same variable.
+
+## AWS credentials (`aws_profile=`)
+
+`aws_profile=NAME` (CLI `--aws NAME`) fetches **short-lived** credentials for an
+aws profile on the host and injects them into the launch, in both agent and
+shell modes. It is ordinary configuration, so a profile is the whole activation:
+
+```
+# ~/.config/csb/profiles/aws        (copy templates/profiles/aws)
+aws_profile=agent-view-only
+allow_host=*.amazonaws.com
+```
+
+```sh
+csb -p aws mybranch                                  # agent, with the session
+csb -p aws -s -- aws sts get-caller-identity         # the assumed role
+csb -p aws -s -- cat "$HOME/.aws/config"             # denied, as always
+csb -p work -p aws mybranch                          # composes with another profile
+csb -p aws --no-aws mybranch                         # this run only, without it
+```
+
+**Short-lived or nothing.** csb runs `aws configure export-credentials` (with an
+`aws sso login --use-device-code` fallback when the profile has no live session)
+and refuses anything that does not expire. A profile resolving to long-lived IAM
+user keys exports no `AWS_SESSION_TOKEN` or `AWS_CREDENTIAL_EXPIRATION`, and
+that missing pair *is* the refusal:
+
+```console
+$ csb -p aws -s
+csb: profile 'agent-view-only' exported no AWS_SESSION_TOKEN, AWS_CREDENTIAL_EXPIRATION, so its credentials do not expire.
+  csb injects short-lived credentials only: configure the profile as an sso,
+  assume-role or credential_process profile instead of long-lived IAM user keys.
+```
+
+So *how* the session is minted is settled in `~/.aws/config`, where it belongs --
+an sso profile, a `role_arn`/`source_profile` pair, a `credential_process` -- and
+csb needs to know none of it. The aws CLI is required on the **host** only; for
+the agent to call AWS the repo's devShell needs `awscli2` like any other tool.
+
+What lands in the launched environment: `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CREDENTIAL_EXPIRATION`, plus
+`AWS_REGION` and `AWS_DEFAULT_REGION` from the profile's configured region, plus
+`AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` pinned to `/dev/null`. The
+injection **owns** those variables: a `setenv=`, `setenv_cmd=`, `token_env=` or
+`keep=` naming one is refused rather than ranked, and `keep=AWS_PROFILE` is
+refused too -- it would send the SDK looking for a profile definition in the
+denied `~/.aws` while holding a working session.
+
+The expiry prints at launch, because it is the one moment something can be done
+about it:
+
+```console
+csb: AWS credentials for 'agent-view-only' (expire: 2026-09-14T18:22:07+00:00)
+```
+
+Two caveats, both structural:
+
+- **No refresh.** The session is fetched once, host-side, before any worktree or
+  namespace side effect. It does not renew inside a running launch -- re-launch
+  when it expires. (A host-side broker on loopback would fix this; see
+  docs/PLAN-011-aws.md section 7.)
+- **Egress.** Under [`--filter-egress`](#filtering-egress---filter-egress) the
+  injected session reaches nothing unless an `allow_host=` covers the AWS
+  endpoints, so csb warns when one is set without the other. It warns rather
+  than widening: an egress policy is the operator's to write.
+
+`--dump-config` reports the profile NAME and nothing else -- what it resolves to
+is fetched at launch and never reaches a config seam.
 
 ## Namespaces
 
@@ -503,6 +573,8 @@ ns=@work                                  # as --ns
 token_cmd=pass work/claude/token          # as --token-cmd; run host-side via bash -c;
                                           # stdout -> $token_env (never echoed)
 token_env=OPENROUTER_API_KEY              # as --token-env; defaults to the agent's own variable
+aws_profile=agent-view-only               # as --aws: fetch that aws profile's SHORT-LIVED creds
+                                          # host-side and inject them (see AWS credentials)
 latest=true                               # as -L/--latest; beats CSB_LATEST, loses to explicit -L
 verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, loses to explicit -v
 yolo=true                                 # as -y/--yolo (allow-all)
@@ -1201,8 +1273,9 @@ double as the seam the test suite (`docs/PLAN-005-tests.md`) drives.
   stops there -- no worktree lookup -- so the default (per-repo) namespace shows
   as an empty `namespace=` plus `branch=`, and outside a repository it still
   runs, selecting nothing. `token_cmd` is reported `present`/`absent` (never
-  run), and `setenv` and `setenv_cmd` list VAR names only (never their values,
-  and never the command).
+  run), `setenv` and `setenv_cmd` list VAR names only (never their values, and
+  never the command), and `aws_profile` is a profile name whose credentials are
+  fetched at launch and never resolved here.
 
   ```
   $ csb -p work -p notes --paranoid --dump-config
@@ -1474,6 +1547,7 @@ flake.nix                  packages {csb, csb-tools, one per agent, bwrap/pasta/
 templates/repo/            scaffold: a standalone dev-shell flake for a consuming repo
 templates/home/            starter seed-home skeleton (copy to ~/.config/csb/home)
 templates/allowed-hosts.*  starter per-agent egress allowlist (copy to ~/.config/csb/)
+templates/profiles/aws     starter profile for AWS access (copy to ~/.config/csb/profiles/)
 Makefile                   install, lint, test, and build targets (make help)
 test/                      bats test suite (make test); see docs/PLAN-005-tests.md
 docs/PLAN-002.md           the implemented design (single mode, deny-list, profiles)
@@ -1483,6 +1557,7 @@ docs/PLAN-005-tests.md     the test-suite plan (dump seams + bats tiers)
 docs/PLAN-007-escape.md    the sandbox-escape investigation and what it closed
 docs/PLAN-009-proxy.md     egress filtering, and the OCaml config layer
 docs/PLAN-010-agents.md    the agent axis, and the plan for agents beyond claude
+docs/PLAN-011-aws.md       AWS injection, the view-only role, and CloudTrail
 docs/TODO.md               current state and next steps
 ```
 
