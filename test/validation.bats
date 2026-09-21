@@ -246,13 +246,65 @@ load helpers
 }
 
 # bats test_tags=dump-sandbox
-@test "a paranoid-allow-read overlapping a deny root is refused" {
+@test "a paranoid-allow-read overlapping a BASE deny root is refused" {
+  # The floor and deny_read= are absolute: an allow may not re-expose what csb's
+  # own containment closed, whichever way the two nest.
   local repo; repo="$(fake_repo)"
   mkdir -p "$TEST_TMP/deny/sub"
   dump_sandbox "$repo" --paranoid \
-    --paranoid-deny-read "$TEST_TMP/deny" --paranoid-allow-read "$TEST_TMP/deny/sub"
+    --deny-read "$TEST_TMP/deny" --paranoid-allow-read "$TEST_TMP/deny/sub"
   assert_failure
   assert_output --partial "overlaps deny root"
+}
+
+# bats test_tags=dump-sandbox
+@test "a paranoid-allow-read INSIDE a paranoid-deny-read fence is accepted" {
+  # The operator's own fence, re-opened in part: fencing a tree broadly and
+  # re-exposing one subtree read-only is what paranoid_deny_read is for.
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/fence/keep" "$TEST_TMP/fence/hidden"
+  dump_sandbox "$repo" --paranoid \
+    --paranoid-deny-read "$TEST_TMP/fence" --paranoid-allow-read "$TEST_TMP/fence/keep"
+  assert_success
+  local fence keep; fence="$(realpath "$TEST_TMP/fence")"; keep="$(realpath "$TEST_TMP/fence/keep")"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    # Later rule wins, so the allow has to be emitted after the deny.
+    assert_line "(deny file-read* (subpath \"$fence\"))"
+    assert_line "(allow file-read* (subpath \"$keep\"))"
+    refute_line "(allow file-read* (subpath \"$fence\"))"
+  else
+    # bwrap resolves by mount order: the ro-bind has to land after the tmpfs.
+    local l n=0 deny=-1 allow=-1
+    for l in "${lines[@]}"; do
+      if [[ "$l" == "$fence" && "$deny" -lt 0 ]]; then deny="$n"; fi
+      if [[ "$l" == "$keep" && "$allow" -lt 0 ]]; then allow="$n"; fi
+      n=$((n + 1))
+    done
+    (( deny >= 0 ))
+    (( allow > deny ))
+  fi
+}
+
+# bats test_tags=dump-sandbox
+@test "a paranoid-allow-read ABOVE a paranoid-deny-read fence is refused" {
+  # This direction erases the fence on both platforms rather than punching
+  # through it, so it is the one the refusal still has to catch.
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/outer/fenced"
+  dump_sandbox "$repo" --paranoid \
+    --paranoid-deny-read "$TEST_TMP/outer/fenced" --paranoid-allow-read "$TEST_TMP/outer"
+  assert_failure
+  assert_output --partial "is at or above paranoid_deny_read"
+}
+
+# bats test_tags=dump-sandbox
+@test "a paranoid-allow-read equal to a paranoid-deny-read is refused" {
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/same"
+  dump_sandbox "$repo" --paranoid \
+    --paranoid-deny-read "$TEST_TMP/same" --paranoid-allow-read "$TEST_TMP/same"
+  assert_failure
+  assert_output --partial "is at or above paranoid_deny_read"
 }
 
 # bats test_tags=dump-sandbox

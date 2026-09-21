@@ -647,8 +647,9 @@ allow_loopback=true                       # as --allow-loopback: every localhost
                                           # names one at a time
 paranoid_deny_read=/Volumes               # as --paranoid-deny-read: extra deny under --paranoid; repeatable
 paranoid_allow_read=~/ref                 # as --paranoid-allow-read: re-expose read-only under --paranoid;
-                                          # repeatable; rejected if it overlaps a deny, or sits at/under
-                                          # an allow_write (containing one is fine)
+                                          # repeatable; rejected if it overlaps a BASE deny, sits at/above
+                                          # a paranoid_deny_read, or sits at/under an allow_write
+                                          # (containing either of those two is fine)
 ```
 
 Note: `csb -p NAME` with no BRANCH **launches** in the current checkout, like
@@ -1033,10 +1034,25 @@ config land under that re-allowed dir and keep working -- so `--paranoid` is
 rarely disruptive. When something needs a specific real-HOME path, re-expose it
 read-only with `--paranoid-allow-read PATH` (or a profile's `paranoid_allow_read=`),
 or make it writable with `--allow-write` (write-allow roots are read-allowed too).
-A `paranoid_allow_read` that overlaps a deny root (the floor, a `deny_read`, or a
-`paranoid_deny_read`) is rejected, so an allow can never silently re-expose a
-denied path. Enable per run (`--paranoid` / negate `--no-paranoid`) or per
-context via a profile's `paranoid=true`; there is no global toggle.
+Which denies a `paranoid_allow_read` may punch through depends on whose deny it
+is. The **base** deny-list -- the floor and `deny_read=` -- is absolute: an
+overlap either way is rejected, so an allow can never re-expose what csb's own
+containment closed. A **`paranoid_deny_read`** is your own fence, and re-opening
+part of it is the point, so an allow strictly *inside* one is accepted and lands
+on top; an allow at or *above* the fence would erase it and is rejected. This is
+the shape for a volume of checkouts where only some are the agent's business:
+
+```
+paranoid_deny_read=/Volumes
+paranoid_allow_read=/Volumes/src/github.com/you/thisrepo
+```
+
+Enable per run (`--paranoid` / negate `--no-paranoid`) or per context via a
+profile's `paranoid=true`; there is no global toggle.
+
+Paths are canonicalized before any rule is evaluated, so write them the way
+`realpath` resolves them -- on a machine where `~/src` is a mount of another
+volume, the rules (and every refusal message) speak in that volume's path.
 
 **A `paranoid_allow_read` may CONTAIN a write root, but may not sit at or under
 one.** Reading a whole repo while writing one subdirectory of it is the shape to
@@ -1345,7 +1361,7 @@ double as the seam the test suite (`docs/PLAN-005-tests.md`) drives.
   text on macOS, or the `bwrap` argv (one token per line) on Linux. It runs the
   real build path (`build_deny_paths` / `build_write_roots` and every path
   validation), so build-time errors -- a `"`/`\` in a path, a
-  `--paranoid-allow-read` that overlaps a deny -- surface here too. Drive it with
+  `--paranoid-allow-read` that re-exposes a base deny -- surface here too. Drive it with
   `--here` inside a git repo so no `.worktrees/` checkout is created:
 
   ```

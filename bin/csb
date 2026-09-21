@@ -1301,10 +1301,19 @@ build_deny_wrapper() {
   # and paranoid_allow_read=/--paranoid-allow-read), canonicalized and existence-
   # checked like the deny-list. The write-root re-allows below reopen the active
   # worktree on top (later rule wins), so a broad deny like /Volumes never locks
-  # the agent out of its own repo. A paranoid_allow_read re-exposes a slice of the
-  # paranoid HOME deny read-only (no write), but is rejected if it overlaps any
-  # explicit deny (floor, deny_read, or paranoid_deny_read) so the emitted profile
-  # stays unambiguous -- re-exposing a denied path is never silently resolved.
+  # the agent out of its own repo.
+  #
+  # A paranoid_allow_read re-exposes a slice read-only (no write), and which
+  # denies it may punch through depends on WHOSE deny it is:
+  #   - the base deny-list (floor + deny_read) is absolute. An allow there would
+  #     re-expose what csb's own containment closed, so it is refused whichever
+  #     way the two nest.
+  #   - a paranoid_deny_read root is the operator's own fence, and fencing a tree
+  #     broadly to re-open part of it is the point (the flag exists so a deny may
+  #     cover the worktree at all). An allow strictly INSIDE one is therefore
+  #     allowed, and lands on top: seatbelt emits allows after denies, bwrap the
+  #     ro-bind after the tmpfs. The other direction -- an allow at or above the
+  #     deny root -- would erase the fence on both platforms, so it is refused.
   local -a paranoid_deny_roots=() paranoid_allow_roots=()
   if [[ "$paranoid" == "true" ]]; then
     local pp pr d
@@ -1322,10 +1331,14 @@ build_deny_wrapper() {
       case "$pr" in
         *'"'*|*\\*) die "paranoid_allow_read path contains a double quote or backslash (unsupported): $pr" ;;
       esac
-      for d in "${deny_dirs[@]+"${deny_dirs[@]}"}" "${deny_files[@]+"${deny_files[@]}"}" \
-               "${paranoid_deny_roots[@]+"${paranoid_deny_roots[@]}"}"; do
+      for d in "${deny_dirs[@]+"${deny_dirs[@]}"}" "${deny_files[@]+"${deny_files[@]}"}"; do
         paths_overlap "$pr" "$d" \
           && die "paranoid_allow_read '$pr' overlaps deny root '$d' (an allow may not re-expose a denied path)"
+      done
+      for d in "${paranoid_deny_roots[@]+"${paranoid_deny_roots[@]}"}"; do
+        path_at_or_under "$d" "$pr" \
+          && die "paranoid_allow_read '$pr' is at or above paranoid_deny_read '$d' (it would
+  erase the fence; name a path INSIDE the denied tree to re-expose part of it)"
       done
       paranoid_allow_roots+=("$pr")
     done
