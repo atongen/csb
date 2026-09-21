@@ -511,7 +511,7 @@ let term env pre =
         "Deep-merge the JSON in host FILE into DEST, relative to the launch \
          HOME, on EVERY launch -- so one edited file reaches every sandbox \
          without --reseed and without overwriting what the HOME accumulated. \
-         The merged keys win. FILE may carry ${CSB_WORKTREE} and ${CSB_HOME}, \
+         The merged keys win. FILE may carry \\${CSB_WORKTREE} and \\${CSB_HOME}, \
          substituted per launch. Repeatable; applied after the agent's own \
          seed, so it can override that too."
   and+ accent =
