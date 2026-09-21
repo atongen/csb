@@ -347,18 +347,18 @@ load helpers
   assert_success
 }
 
-# --- allow_write and paranoid_allow_read may not name the same path -----------
+# --- a paranoid_allow_read may CONTAIN a write root, but not sit under one ----
 
 # bats test_tags=dump-sandbox
 @test "a path in both allow-write and paranoid-allow-read is refused" {
-  # On Linux the read-only bind lands AFTER the writable one, so the pair comes
-  # out read-only there and writable on macOS. Refused so it cannot diverge.
+  # A write root is already read-re-allowed under --paranoid, so naming it again
+  # grants nothing and only obscures which of the two is in force.
   local repo; repo="$(fake_repo)"
   mkdir -p "$TEST_TMP/both"
   dump_sandbox "$repo" --paranoid --allow-write "$TEST_TMP/both" \
     --paranoid-allow-read "$TEST_TMP/both"
   assert_failure
-  assert_output --partial "overlaps allow_write"
+  assert_output --partial "is at or under allow_write"
 }
 
 # bats test_tags=dump-sandbox
@@ -370,17 +370,45 @@ load helpers
   dump_sandbox "$repo" --allow-write "$TEST_TMP/both" \
     --paranoid-allow-read "$TEST_TMP/both"
   assert_failure
-  assert_output --partial "overlaps allow_write"
+  assert_output --partial "is at or under allow_write"
 }
 
 # bats test_tags=dump-sandbox
-@test "a paranoid-allow-read INSIDE a write root is refused as an overlap" {
+@test "a paranoid-allow-read INSIDE a write root is refused as redundant" {
   local repo; repo="$(fake_repo)"
   mkdir -p "$TEST_TMP/outer/inner"
   dump_sandbox "$repo" --paranoid --allow-write "$TEST_TMP/outer" \
     --paranoid-allow-read "$TEST_TMP/outer/inner"
   assert_failure
-  assert_output --partial "overlaps allow_write"
+  assert_output --partial "is at or under allow_write"
+}
+
+# bats test_tags=dump-sandbox
+@test "a paranoid-allow-read CONTAINING a write root is accepted" {
+  # The least-privilege shape: read a whole repo, write one subdirectory of it.
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/outer/inner"
+  dump_sandbox "$repo" --paranoid --allow-write "$TEST_TMP/outer/inner" \
+    --paranoid-allow-read "$TEST_TMP/outer"
+  assert_success
+  local outer inner; outer="$(realpath "$TEST_TMP/outer")"; inner="$(realpath "$TEST_TMP/outer/inner")"
+  if [[ "$(uname -s)" == Darwin ]]; then
+    # Separate operation classes, so the read on the parent cannot shadow the
+    # write on the child whatever order they are emitted in.
+    assert_line "(allow file-read* (subpath \"$outer\"))"
+    assert_line "(allow file-write* (subpath \"$inner\"))"
+    refute_line "(allow file-write* (subpath \"$outer\"))"
+  else
+    # bwrap resolves by mount order, so the rw bind has to come after the ro one.
+    local l n=0 ro=-1 rw=-1
+    for l in "${lines[@]}"; do
+      if [[ "$l" == "$outer" && "$ro" -lt 0 ]]; then ro="$n"; fi
+      if [[ "$l" == "$inner" && "$rw" -lt 0 ]]; then rw="$n"; fi
+      n=$((n + 1))
+    done
+    (( ro >= 0 ))
+    (( rw > ro ))
+  fi
 }
 
 # bats test_tags=dump-sandbox

@@ -621,6 +621,14 @@ paths_overlap() {
   [[ "$a" == "$b" || "$a" == "$b"/* || "$b" == "$a"/* ]]
 }
 
+# True when realpath'd absolute path $1 is $2 or sits beneath it. The directed
+# half of paths_overlap, for the rules where containment means opposite things
+# in the two directions.
+path_at_or_under() {
+  local a="$1" b="$2"
+  [[ "$a" == "$b" || "$a" == "$b"/* ]]
+}
+
 # Echo the canonical form of $1 WITHOUT requiring it to exist: realpath the
 # deepest existing ancestor and re-append the rest. Needed because a socket the
 # operator names may not be bound yet at launch (a test suite starts its database
@@ -1248,12 +1256,14 @@ refuse_git_write_roots() {
   return 0
 }
 
-# Refuse a path named by BOTH allow_write and paranoid_allow_read. A write root
-# is already read-re-allowed under --paranoid, so the pair buys nothing on macOS
-# -- while on Linux the read-only bind is emitted AFTER the writable one and
-# silently takes the write away. Checked in BOTH modes, and on both platforms, so
-# a profile shared across hosts fails identically rather than diverging into a
-# path that is writable on one and not the other.
+# Refuse a paranoid_allow_read at or UNDER a write root: a write root is already
+# read-re-allowed under --paranoid, so such an entry grants nothing and only
+# reads as a mistake about which of the two is in force. The other direction --
+# a read root CONTAINING a write root -- is the least-privilege shape (read the
+# repo, write one subdirectory) and is allowed: both platforms emit the write on
+# top of the read, seatbelt because reads and writes are separate operation
+# classes, bwrap because the rw bind lands after the ro one.
+# Checked in BOTH modes, so a profile fails identically whichever mode reads it.
 # Consumes the globals allow_write_paths and paranoid_allow_read_paths.
 refuse_write_allow_read_overlap() {
   local w rw p rp
@@ -1261,9 +1271,10 @@ refuse_write_allow_read_overlap() {
     rw=$(canon_path "$w")
     for p in "${paranoid_allow_read_paths[@]+"${paranoid_allow_read_paths[@]}"}"; do
       rp=$(canon_path "$p")
-      if paths_overlap "$rw" "$rp" || paths_overlap "$w" "$p"; then
-        die "paranoid_allow_read '$p' overlaps allow_write '$w' (a write root is already
-  readable under --paranoid; drop whichever of the two you did not mean)"
+      if path_at_or_under "$rp" "$rw" || path_at_or_under "$p" "$w"; then
+        die "paranoid_allow_read '$p' is at or under allow_write '$w' (a write root is
+  already readable under --paranoid, so this grants nothing; drop it, or name a
+  path outside the write root -- naming one that CONTAINS it is allowed)"
       fi
     done
   done
@@ -1585,16 +1596,17 @@ build_deny_wrapper() {
       for p in "${paranoid_deny_roots[@]+"${paranoid_deny_roots[@]}"}"; do
         deny_wrapper+=(--tmpfs "$p")
       done
+      # paranoid_allow_read: re-expose these read-only over the tmpfs'd HOME (no
+      # write, unlike the rw binds below). They come FIRST so a write root under
+      # one of them lands on top and keeps its write, which is what makes "read
+      # the repo, write one subdirectory" mean the same thing here as in the
+      # seatbelt profile, where reads and writes are separate operation classes.
+      for p in "${paranoid_allow_roots[@]+"${paranoid_allow_roots[@]}"}"; do
+        deny_wrapper+=(--ro-bind "$p" "$p")
+      done
       # WRITE policy: rw-bind the allowed roots over the read-only root.
       for p in "${write_roots[@]+"${write_roots[@]}"}"; do
         deny_wrapper+=(--bind "$p" "$p")
-      done
-      # paranoid_allow_read: re-expose these read-only over the tmpfs'd HOME (no
-      # write, unlike the rw binds above). These land AFTER the write binds, so a
-      # path in both lists would come out read-only here and writable on macOS;
-      # refuse_write_allow_read_overlap is what keeps the two from ever meeting.
-      for p in "${paranoid_allow_roots[@]+"${paranoid_allow_roots[@]}"}"; do
-        deny_wrapper+=(--ro-bind "$p" "$p")
       done
       # bwrap needs the bind source to exist: materialize absent deny targets
       # host-side (empty placeholders are inert for git) so the sandbox can't

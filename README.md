@@ -647,7 +647,8 @@ allow_loopback=true                       # as --allow-loopback: every localhost
                                           # names one at a time
 paranoid_deny_read=/Volumes               # as --paranoid-deny-read: extra deny under --paranoid; repeatable
 paranoid_allow_read=~/ref                 # as --paranoid-allow-read: re-expose read-only under --paranoid;
-                                          # repeatable; rejected if it overlaps a deny, or an allow_write
+                                          # repeatable; rejected if it overlaps a deny, or sits at/under
+                                          # an allow_write (containing one is fine)
 ```
 
 Note: `csb -p NAME` with no BRANCH **launches** in the current checkout, like
@@ -1037,13 +1038,21 @@ A `paranoid_allow_read` that overlaps a deny root (the floor, a `deny_read`, or 
 denied path. Enable per run (`--paranoid` / negate `--no-paranoid`) or per
 context via a profile's `paranoid=true`; there is no global toggle.
 
-The two are **alternatives, not a pair**: a path named by both `allow_write` and
-`paranoid_allow_read` is rejected too. A write root is already read-re-allowed
-under `--paranoid`, so the combination adds nothing on macOS -- while on Linux
-the read-only bind is emitted after the writable one and would silently take the
-write away. The refusal fires in **both** modes and on both platforms, so a
-profile shared across hosts cannot end up writable on one and read-only on the
-other.
+**A `paranoid_allow_read` may CONTAIN a write root, but may not sit at or under
+one.** Reading a whole repo while writing one subdirectory of it is the shape to
+reach for:
+
+```
+allow_write=~/src/somerepo/mysubdir
+paranoid_allow_read=~/src/somerepo
+```
+
+The write lands on top of the read on both platforms -- seatbelt because reads
+and writes are separate operation classes, bwrap because the read-only bind is
+emitted before the writable one. The other direction is rejected in **both**
+modes: a write root is already read-re-allowed under `--paranoid`, so naming it
+(or a path inside it) as a `paranoid_allow_read` grants nothing and only
+obscures which of the two is in force.
 
 The deny is scoped to the real HOME, so a source tree that lives *outside* HOME
 stays readable -- e.g. a `~/src -> /Volumes/src` symlink resolves to a path that
@@ -1128,8 +1137,8 @@ All five read/write/socket lists are set per launch, via CLI flags or profile va
 
 Two build-time refusals apply across the table, and fire in **both** modes so a
 shared profile fails identically everywhere: an `allow_write` that is a git
-repository root, and a path named by both `allow_write` and
-`paranoid_allow_read`.
+repository root, and a `paranoid_allow_read` at or under an `allow_write` (one
+that CONTAINS a write root is allowed -- see `--paranoid` above).
 
 ### `--pasteboard` (macOS)
 
