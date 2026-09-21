@@ -127,7 +127,7 @@ csb -p work feature/foo          # profile: ns/token/keeps/env from ~/.config/cs
 csb -p aws feature/foo           # a profile whose aws_profile= injects a short-lived AWS session
 csb -k COLORTERM feature/foo     # also keep COLORTERM across the env scrub (repeatable)
 csb -L feature/foo               # newest claude (re-lock claude-code to upstream HEAD this run)
-csb --agent claude feature/foo   # which agent runs (claude is the default)
+csb --agent opencode feature/foo # which agent runs (claude is the default)
 csb --ns work feature/foo        # shared, cross-repo HOME (default is per repo and agent)
 csb --ns @work feature/foo       # same thing -- the @ is optional (work == @work)
 csb -E feature/foo               # ephemeral: throwaway config/HOME, no namespace
@@ -175,8 +175,7 @@ targets.
 ## Choosing the agent (`--agent`)
 
 `agent=` (CLI `--agent NAME`, or the key in a config section or profile) selects
-which agent CLI a launch runs. `claude` is the default and, today, the only
-value.
+which agent CLI a launch runs: `claude` (the default) or `opencode`.
 
 The agent is one axis with one answer, and it decides everything csb has to know
 about the tool it launches: the flake output the binary comes from, the variable
@@ -196,6 +195,38 @@ token_env=CLAUDE_CODE_OAUTH_TOKEN
 seed=json_merge:.claude/.claude.json
 cred_seed=keychain:.claude/.credentials.json
 ```
+
+**opencode** carries an API key rather than a session: `token_env` defaults to
+`OPENROUTER_API_KEY`, `-y/--yolo` becomes `--auto`, and it seeds nothing --
+there is no trust or onboarding prompt to answer, so the key is the whole of
+what a launch needs. Which provider it reaches is decided by WHICH variable
+carries the key, so `token_env=` is how you point one launch at another
+provider:
+
+```
+# ~/.config/csb/profiles/oc
+agent=opencode
+args=-m openrouter/anthropic/claude-haiku-4.5
+token_cmd=op read op://vault/openrouter/key
+```
+
+Its egress list is `allowed-hosts.opencode` (start from
+`templates/allowed-hosts.opencode`) -- a measured full turn against OpenRouter
+reaches `openrouter.ai` and nothing else.
+
+csb has one axis for the agent and none for the provider, so **a profile is
+where the two compose**: one profile per (agent, provider) pair, carrying the
+`token_env=` that selects the provider and the `allow_host=` that lets the
+launch reach it, with `allowed-hosts.<agent>` holding only what that agent
+always reaches. That keeps each launch's allowlist as small as the launch needs.
+A `--seed-creds` opencode launch that also forwards a key drops the seeded
+`auth.json` wholesale rather than one entry from it, since which entry belongs
+to the forwarded key is a provider's question csb cannot yet ask
+(`docs/PLAN-010-agents.md` section 12).
+
+The launch HOME is per repo AND agent, so `--agent opencode` gets its own
+`repo-<key>-opencode` beside claude's -- separate sessions, separate state,
+separate retirement.
 
 Two knobs are deliberately agent-specific rather than generic:
 
@@ -568,7 +599,7 @@ negating `--no-*` flags. Launch with `-p/--profile NAME`. Recognized keys
 (anything else is an error):
 
 ```
-agent=claude                              # as --agent: which agent CLI runs (default claude)
+agent=opencode                            # as --agent: claude or opencode (default claude)
 ns=@work                                  # as --ns
 token_cmd=pass work/claude/token          # as --token-cmd; run host-side via bash -c;
                                           # stdout -> $token_env (never echoed)
@@ -1133,7 +1164,8 @@ Hosts union from `--allow-host` (repeatable), a config section's or profile's
 reads `allowed-hosts.<agent>` when that file exists and the unsuffixed
 `allowed-hosts` otherwise, so one shared list serves every agent until one needs
 its own. Copy `templates/allowed-hosts.claude` for a starting set covering Claude
-Code's own endpoints. A leading `*.` matches subdomains only, so list a bare
+Code's own endpoints, or `templates/allowed-hosts.opencode` for opencode's (one
+line per provider). A leading `*.` matches subdomains only, so list a bare
 parent separately when you want it too. `--filter-egress` with an
 empty allowlist is an error rather than a silent blackhole.
 

@@ -28,6 +28,7 @@ type runner =
    place csb has to know the answer reads that table, so nothing else branches. *)
 type agent =
   | Claude
+  | Opencode
 
 (* One seed step, deferred to bin/csb because it needs facts csb-config does not
    have: the resolved worktree path, the launch HOME, the macOS keychain. `arg`

@@ -653,6 +653,7 @@ none
   assert_failure
   assert_output --partial "unknown agent 'nosuchagent'"
   assert_output --partial "claude"
+  assert_output --partial "opencode"
 }
 
 @test "an unknown profile agent= dies" {

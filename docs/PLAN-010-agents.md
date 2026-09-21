@@ -1,9 +1,9 @@
 # plan 010 -- agents beyond claude (opencode, codex, gemini, ...)
 
-Status: **PASS 1 DONE (2026-08-31). Pass 2 not started.** csb is
-agent-generic with claude as the only agent; section 8's pass-1 list is
-implemented, including the HOME migration, the rename sweep and the deny-floor
-rider. What shipped, against that list:
+Status: **PASS 1 DONE (2026-08-31). PASS 2: the opencode row is written
+(2026-09-18), awaiting its first `--agent opencode` launch; codex and gemini not
+started.** Section 8's pass-1 list is implemented, including the HOME migration,
+the rename sweep and the deny-floor rider. What shipped, against that list:
 
 - `agent` and `token_env` are axes in csb-config, and the adapter table is
   `ocaml/lib/agent.ml` -- one row, ten fields: `bin_attr`/`bin_name`,
@@ -43,9 +43,10 @@ rider. What shipped, against that list:
   Goldens were edited mechanically (`.csb/claudes` -> `.csb/agents`) rather
   than regenerated, since the only shape change is that rename.
 
-Not done, and deferred to pass 2 with the agents themselves: the
-opencode/`filter_egress` loopback validation rule (there is no opencode row to
-validate), and per-agent `--latest`.
+Not done, and deferred: per-agent `--latest`, and the agent/provider split
+(section 12, with its trigger recorded there). The opencode/`filter_egress`
+loopback validation rule was deferred here too; it is now withdrawn rather than
+deferred, because opencode v1.18.30 dials no loopback port (sections 2 and 6).
 
 Decided (operator, 2026-08-27):
 
@@ -68,6 +69,8 @@ External facts below (paths, env vars, hosts, versions) were researched against
 upstream docs and source on 2026-08-27 and will drift; anything marked
 *(unverified)* or *(medium confidence)* was not confirmed against source. csb
 facts were read from `bin/csb` and `ocaml/` at the tree as of the same date.
+The opencode facts were re-read on 2026-09-18 against the pinned v1.18.30
+(section 10), which is what sections 2 and 11 now state.
 
 ---
 
@@ -128,21 +131,41 @@ of the launch rather than of claude:
 
 ## 2. opencode (+ OpenRouter) -- the cheapest target
 
-Upstream moved: `sst/opencode` -> `anomalyco/opencode`; site opencode.ai, npm
-`opencode-ai` (a wrapper around per-platform Bun-compiled self-contained
-binaries), v1.18.x at research time. nixpkgs attr **`opencode`**, current to
-within a patch release; the repo also ships an official flake.
+Re-verified 2026-09-18 against the exact version nixpkgs ships:
+`anomalyco/opencode` at tag **v1.18.30** and
+`pkgs/by-name/op/opencode/package.nix` on nixos-unstable. Every claim below
+names its source line; the *(medium confidence)* marks this section carried are
+gone, except where it says otherwise. Section 11 is the adapter row these facts
+imply.
 
-**Auth.** An env var alone suffices -- no state file: for every provider in the
-catalog, if any env var the catalog lists is set, the provider is enabled with
-that key. Verified names: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`OPENROUTER_API_KEY`, `GOOGLE_API_KEY`/`GOOGLE_GENERATIVE_AI_API_KEY`/
-`GEMINI_API_KEY`, `OPENCODE_API_KEY` (their own Zen gateway). The stored-cred
-path is `~/.local/share/opencode/auth.json` (0600; newer builds also have a
-sqlite credential table in `opencode.db`, `OPENCODE_DB` overrides) -- seedable,
-but unnecessary when the env var is injected. Note: Anthropic's ToS (rev.
-2026-02-19) prohibits Claude Pro/Max OAuth tokens in third-party tools, so
-opencode-against-Anthropic means an API key, not the claude session credential.
+**Binary.** Upstream moved: `sst/opencode` -> `anomalyco/opencode`; site
+opencode.ai, npm `opencode-ai`. nixpkgs attr **`opencode`** = 1.18.30, built
+from source with bun, `mainProgram = "opencode"` -- so `bin_attr` and `bin_name`
+are both `opencode`. The nixpkgs wrapper already `--set`s
+`OPENCODE_DISABLE_AUTOUPDATE=true`; `OPENCODE_DISABLE_MODELS_FETCH` is only a
+BUILD-time env there, so the adapter's setenv row still has to carry it.
+
+**Auth.** An env var alone suffices -- no state file, no login flow.
+`provider.ts` "load env": for every provider in the catalog,
+`provider.env.map(item => envs[item]).find(Boolean)`; the first listed name that
+is set registers the provider with `source: "env"` and that key. Verified names:
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
+`GOOGLE_API_KEY`/`GOOGLE_GENERATIVE_AI_API_KEY`/`GEMINI_API_KEY`,
+`OPENCODE_API_KEY` (their own Zen gateway). The stored-cred path is
+`~/.local/share/opencode/auth.json`, a plain 0600 JSON map of providerID ->
+`{type:"api",key}` (`auth/index.ts`) -- a one-verb `Copy` for `--seed-creds`,
+though unnecessary when the env var is injected. No keychain and no sqlite
+credential table on this path; `OPENCODE_AUTH_CONTENT` carries the same blob as
+an env var, which is a natural `token_cmd` target if a stored-auth provider ever
+needs one. Note: Anthropic's ToS (rev. 2026-02-19) prohibits Claude Pro/Max
+OAuth tokens in third-party tools, so opencode-against-Anthropic means an API
+key, not the claude session credential.
+
+**Stored auth BEATS the env var**, which is what makes csb's "token_env wins"
+invariant need an expression here: the "load apikeys" pass runs after "load env"
+and `mergeProvider` is `mergeDeep(existing, new)`, so a seeded `auth.json` entry
+overrides `OPENROUTER_API_KEY`. `cred_clear_expr = del(.openrouter)` restores
+the rule, exactly as claude's `del(.claudeAiOauth)` does.
 
 **The OPENAI_BASE_URL caveat.** `OPENAI_BASE_URL` is NOT honored. A generic
 OpenAI-compatible endpoint is configured per-provider in
@@ -167,29 +190,45 @@ needs `registry.npmjs.org` egress).
 **First run.** No trust dialog, no telemetry consent (telemetry is OTLP-only
 and off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set), no root refusal, no
 internal OS sandbox -- external sandboxing is its intended containment.
-Non-interactive is `opencode run "..."`; the yolo analog is `--auto`
-(config `"permission": "allow"` / `OPENCODE_PERMISSION` JSON also exist).
+Non-interactive is `opencode run "..."`; the yolo analog is **`--auto`**, taken
+by the default TUI command AND by `run` (`--yolo` and
+`--dangerously-skip-permissions` are hidden aliases of it in both), so one
+`yolo_flag` covers every invocation shape. Config `"permission": "allow"` /
+`OPENCODE_PERMISSION` JSON also exist.
 
-**Quiet knobs** (env-shaped, so the builtin-setenv layer pattern extends
-directly): `OPENCODE_DISABLE_AUTOUPDATE=1`; `OPENCODE_DISABLE_MODELS_FETCH=1`
-(the model catalog from `models.opencode.ai` has an embedded-snapshot fallback
-in the binary, so blocking the host is safe when the binary is recent).
+**State layout** (`core/src/global.ts`): pure XDG with `$HOME` fallbacks --
+config `~/.config/opencode`, data `~/.local/share/opencode` (auth.json, log/,
+repos/), state `~/.local/state/opencode`, cache `~/.cache/opencode`, tmp
+`$TMPDIR/opencode`. csb scrubs `XDG_*`, so all of it lands in the redirected
+HOME. `OPENCODE_CONFIG_DIR` relocates the config dir only and is the sole
+relocation var -- the `config_env` slot, pointing where the default already
+points. All seven dirs are `mkdir -p`ed at startup, inside the HOME and tmp
+write roots, so no policy change is needed.
 
-**The one structural wrinkle: loopback.** Every invocation (TUI and `run`)
-starts an internal HTTP server on 127.0.0.1 at an EPHEMERAL port (default
-`--port 0`), which the client side then dials. Under `--filter-egress` the
-sandbox can reach only the proxy port, so opencode's own client->server connect
-is denied and it breaks. Resolution: `agent=opencode` + `filter_egress` must
-require or imply `allow_loopback=true` (or a pinned `--port N` +
-`allow_port=N`). Unfiltered runs are unaffected (loopback TCP is open there on
-both platforms). It also `mkdir -p`s data/config/state/cache/log dirs and a
-`$TMPDIR/opencode` at startup -- all inside the redirected HOME and tmp write
-roots, so no policy change needed.
+**Quiet knobs**, confirmed by name in `core/src/flag/flag.ts` (truthy means
+`"true"` or `"1"`): `OPENCODE_DISABLE_AUTOUPDATE=1` (redundant with the nixpkgs
+wrapper, harmless) and `OPENCODE_DISABLE_MODELS_FETCH=1`. Both are env-shaped,
+so the adapter's setenv layer takes them directly.
 
-**Egress allowlist** (`allowed-hosts.opencode`): the provider host(s) in use
-(`openrouter.ai`, `api.anthropic.com`, `api.openai.com`, ...); optionally
-`models.opencode.ai`. Sharing (`opncd.ai`) and update/install hosts stay off
-via the knobs above; config `"share": "disabled"` exists.
+**The structural wrinkle is GONE -- withdrawn 2026-09-18.** This section used to
+say every invocation starts an internal HTTP server on an ephemeral 127.0.0.1
+port, which `--filter-egress` would deny. At v1.18.30 that is false: the TUI
+runs the server in a WORKER THREAD and talks to it through an in-process fetch
+at `http://opencode.internal` (`cli/cmd/tui.ts` `external` / `createWorkerFetch`),
+and `run` does the same (`cli/cmd/run.ts`, `Server.Default().app.fetch` behind
+the same base URL). A real TCP listener appears only when `--port`, `--hostname`
+or `--mdns` is passed, and `cli/network.ts` defaults all three off (`mdns:
+false`). So `--filter-egress` needs no loopback concession, and the validation
+rule section 6 proposed is withdrawn rather than implemented. An operator who
+passes `--port` is opting into the old shape and can pair it with `allow_port=`.
+
+**Egress allowlist** (`allowed-hosts.opencode`): the provider host(s) in use --
+`openrouter.ai` for the OpenRouter path, plus `api.anthropic.com` /
+`api.openai.com` / ... for others, one line per provider. Measured rather than
+read: a filtered turn dialled `openrouter.ai` twice and nothing else (section
+11). The model-catalog host never appears with `OPENCODE_DISABLE_MODELS_FETCH=1`
+set, so it needs no entry; sharing (`opncd.ai`) and the update host stay off via
+the knobs above, and config `"share": "disabled"` exists.
 
 ## 3. codex CLI -- upstream anticipates exactly this use
 
@@ -356,10 +395,10 @@ unchanged) -- and a per-agent adapter filling the slots of section 1:
    agent (`allowed-hosts` stays the claude spelling for compatibility, or is
    renamed with a fallback -- operator's call, section 9).
 
-Plus one validation rule, same family as the existing --no-sandbox refusals:
-`agent=opencode` + `filter_egress=true` without `allow_loopback` or an
-`allow_port` dies with a message naming the ephemeral-port server, rather than
-launching a sandbox whose agent cannot reach itself.
+The one validation rule this section proposed -- `agent=opencode` +
+`filter_egress=true` refusing to launch without `allow_loopback` or an
+`allow_port` -- is **withdrawn**: opencode v1.18.30 dials no loopback port at
+all (section 2). Nothing replaces it.
 
 ### 6a. Namespaces: per-repo-per-agent -- DECIDED (2026-08-27)
 
@@ -449,23 +488,25 @@ namespaces, the janitor, profiles/config layering and clearing semantics.
 scrub/HOME/sandbox. A profile:
 
     # ~/.config/csb/profiles/oc
-    keep=OPENROUTER_API_KEY
-    setenv=OPENCODE_DISABLE_AUTOUPDATE=1
-    setenv=OPENCODE_DISABLE_MODELS_FETCH=1
-    seed_home=~/.config/csb/opencode-home     # carries .config/opencode/opencode.json
     shell=true
-    args=opencode
+    args=opencode -m openrouter/<vendor>/<model>
+    setenv_cmd=OPENROUTER_API_KEY=op read op://vault/openrouter/key
+    setenv=OPENCODE_DISABLE_MODELS_FETCH=1
 
 gets sandboxed opencode today, provided the binary is on the devShell PATH (add
-`pkgs.opencode` to the repo devShell, or seed it into the launch HOME's `bin/`,
-which the path shim prepends). What the stopgap lacks versus real support: the
-yolo mapping, seed-creds, per-agent allowed-hosts selection, and `shell=true`
-skipping `token_cmd` (so the key rides `keep=` from the interactive env instead
-of a host-side command). That is exactly the right fidelity for validating each
-agent's runtime behavior -- the loopback server under `--filter-egress`, the
-codex TOML seed, gemini's auth picker -- before freezing the adapter design.
-Verification stays in-session-friendly: `--dump-config` / `--dump-sandbox` show
-everything but the agent's own behavior, and the stopgap launches cover that.
+`pkgs.opencode` to the repo devShell -- or to csb's own `devShells.default` to
+dogfood here and `devShells.fallback` to cover flakeless repos -- or seed it
+into the launch HOME's `bin/`, which the path shim prepends).
+
+The key comes from a host-side command even in the stopgap: only `token_cmd` is
+gated on `shell=true` (`bin/csb:2155`); `setenv_cmd` runs for shell launches
+too, so nothing has to ride `keep=` from the interactive env. What the stopgap
+still lacks versus real support: the yolo mapping, seed-creds, and per-agent
+allowed-hosts selection. That is exactly the right fidelity for validating each
+agent's runtime behavior -- the filtered run's host list, the codex TOML seed,
+gemini's auth picker -- before freezing the adapter design. Verification stays
+in-session-friendly: `--dump-config` / `--dump-sandbox` show everything but the
+agent's own behavior, and the stopgap launches cover that.
 
 ## 8. The two passes -- DECIDED (2026-08-27)
 
@@ -505,12 +546,12 @@ approach zero outside comments.
 
 **Pass 2 -- implement agents.** Per agent (opencode, then codex, then gemini
 on demand): one OCaml adapter row, one `allowed-hosts.<agent>` template, one
-flake output, plus the opencode/filter-egress loopback validation rule and the
-README section. Each agent is preceded by its stopgap validation (section
-7) on the host, converting this plan's *(medium confidence)* marks into
-measured facts before its row is frozen -- opencode's loopback server under
-filtering, codex `--yolo` inside the outer seatbelt on macOS and inside
-pasta+bwrap on Linux, gemini's seeded auth picker.
+flake output, and the README section. Each agent is preceded by its stopgap
+validation (section 7) on the host, converting this plan's *(medium confidence)*
+marks into measured facts before its row is frozen -- codex `--yolo` inside the
+outer seatbelt on macOS and inside pasta+bwrap on Linux, gemini's seeded auth
+picker. opencode's own marks were resolved by reading v1.18.30 (sections 2 and
+11), leaving it one host list to measure.
 
 Deferred beyond both passes: per-agent `--latest` (other agents' currency
 comes from bumping csb's nixpkgs input until someone misses it).
@@ -564,3 +605,139 @@ linux-sandbox trees, model-provider-info, config reference at
 learn.chatgpt.com), google-gemini/gemini-cli docs + the Antigravity transition
 announcement, nixpkgs master for every attr named. Versions and hosts in this
 document are snapshots of that date.
+
+Re-read 2026-09-18 for the opencode row only, pinned to what nixpkgs ships
+rather than to a moving branch: `anomalyco/opencode` at tag v1.18.30
+(`core/src/global.ts`, `core/src/flag/flag.ts`, `opencode/src/auth/index.ts`,
+`opencode/src/provider/provider.ts`, `opencode/src/cli/cmd/{tui,run}.ts`,
+`opencode/src/cli/network.ts`) and `pkgs/by-name/op/opencode/package.nix` on
+nixos-unstable. Sections 2 and 11 carry the result; codex and gemini were not
+re-read and their 2026-08-27 marks stand.
+
+## 11. The opencode adapter row, as researched
+
+What section 2 implies, in the shape `ocaml/lib/agent.ml` wants. Nothing here is
+a decision left open -- it is the row to write, subject to the three measurements
+below.
+
+| slot | value |
+|---|---|
+| `bin_attr` / `bin_name` | `opencode` / `opencode` |
+| `token_env` | `OPENROUTER_API_KEY` |
+| `token_hint` | create a key at openrouter.ai and export it |
+| `yolo_flag` | `--auto` |
+| `setenv` | `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_DISABLE_MODELS_FETCH=1` |
+| `config_dir` / `config_env` | `.config/opencode` / `OPENCODE_CONFIG_DIR` |
+| `hosts_file` | `allowed-hosts.opencode` |
+| `ns_migrate` | `false` (only claude predates the agent suffix) |
+| `seed` | none -- the env var is the whole onboarding |
+| `cred_seed` | `Copy ~/.local/share/opencode/auth.json` -> `.local/share/opencode/auth.json`, both platforms |
+| `cred_check` | `.local/share/opencode/auth.json` |
+| `cred_usable_expr` | empty -- an API key has no refresh deadline to respect |
+| `cred_clear_expr` | empty -- stored auth beats the env var (section 2), and which entry to retract is a provider's question csb cannot yet ask (section 12) |
+
+Two slots resolved to the simpler answer once the stopgap measured them, and the
+table above already reflects both: `config_env` is **empty** (opencode derives
+the config dir from HOME through XDG, which the scrub leaves unset, so exporting
+`OPENCODE_CONFIG_DIR` would only restate the default), and `seed` is **empty**
+(no trust or onboarding prompt exists to pre-answer).
+
+Written 2026-09-18: `types.ml` gained the variant, `agent.ml` an arm per
+function, `flake.nix` the `opencode = pkgs.opencode;` output (plus `pkgs.opencode`
+in the `default` and `fallback` devShells, which is what made the stopgap
+runnable), `templates/allowed-hosts.opencode`, the README's agent section, and
+cases in `agents.bats` / `validation.bats`. **`bin/csb` did not change**, which
+is the pass-1 seam paying off; the sandbox snapshot goldens hold no agent names,
+so they did not move either. `make check` and `make test` (347) pass.
+
+What the stopgap measured, on the host, before the row was frozen (2026-09-18,
+opencode 1.18.30, macOS): a full tool-using turn against OpenRouter under
+`--filter-egress` produced two connections, both `ALLOW openrouter.ai:443`, and
+**no denials at all** -- no catalog fetch, no update check, no telemetry, no
+sharing host, and no loopback port, which is the measurement the withdrawn
+validation rule rested on.
+
+Still unmeasured, because nothing inside a csb sandbox can do it: an actual
+`--agent opencode` launch. That is the one path the stopgap does NOT cover -- it
+ran opencode as a `csb -s` command, so `nix build "$CSB_SELF#opencode"`, the
+`repo-<key>-opencode` HOME, the `--auto` mapping and the `token_cmd` ->
+`OPENROUTER_API_KEY` export have been exercised only through the dump seams and
+bats. Note that `$CSB_SELF` defaults to the REMOTE, and resolves its default
+branch when the ref names none, so `#opencode` has to be pushed before
+`--agent opencode` can build anything; `CSB_SELF=path:/path/to/csb` is the
+local override. (The stopgap was unaffected: `resolve_devshell_ref` returns the
+repo directory itself for the `default` target, so only `#opencode`,
+`#fallback`, `#bwrap` and `#csb-tools` go through `CSB_SELF`.)
+
+## 12. The agent/provider split -- DEFERRED (operator, 2026-09-21)
+
+opencode is the first row where the agent and the model provider come apart, and
+the axis does not yet notice. claude-code fuses them -- it reaches Anthropic and
+nothing else -- so pass 1 never had to separate the harness csb CONTAINS from
+the service that harness TALKS TO. `agent=` is named for the binary csb launches,
+not for the intelligence behind it, and opencode reaches OpenRouter, Anthropic,
+OpenAI, a local endpoint, or anything else its catalog lists.
+
+**Already independent.** Three of the four things that vary by provider compose
+today, in any layer, with no new mechanism:
+
+- which variable carries the key -- `token_env=`
+- the model -- `args=-m openrouter/<vendor>/<model>`
+- an OpenAI-compatible endpoint's provider block -- `seed_merge=` / `seed_home=`
+
+**Welded to the agent, and wrongly.** Three slots hold provider knowledge:
+
+1. `hosts_file`. One `allowed-hosts.opencode` serves every provider an operator
+   might use, so a launch that only talks to OpenRouter still has every listed
+   host reachable. Least privilege is csb's own job, which makes this the one
+   that matters.
+2. `cred_clear_expr`. `del(.openrouter)` was provider knowledge in an agent
+   slot: override `token_env=ANTHROPIC_API_KEY` and it retracted the wrong
+   entry, so the "a forwarded key beats a seeded credential" invariant quietly
+   stopped holding. Fixed ahead of the axis -- see below.
+3. `token_env`'s default, which is a provider choice dressed as an agent
+   property.
+
+**The test for whether csb wants the axis at all**: does the thing change the
+CONTAINMENT surface? The model does not -- it is an argument, and it stays in
+`args=`. The provider does, in exactly three ways: which variable must survive
+the scrub, which host must be reachable, and which stored credential must be
+retracted. All three are csb's business rather than opencode's, so a `provider=`
+axis is defensible on csb's own terms and is not scope creep into model routing.
+
+**The shape, when it happens.** A second table keyed by provider holding
+`{ token variable, hosts, stored-credential key }`, with a per-agent default
+(claude -> anthropic, opencode -> openrouter) so every existing config resolves
+unchanged. Provider hosts come from the TABLE rather than a file, because they
+are facts rather than preferences; `allowed-hosts.<agent>` stays for the
+operator's own additions and the two union as they do today. The agent row loses
+its openrouter-specific fields entirely. The cost is what csb charges for any
+axis -- resolve, the emit/dump keys, `--dump-config`, tests -- plus one legality
+rule for the (agent, provider) pair, since it is not a free cross-product:
+claude has exactly one legal provider. Roughly the size of the opencode row
+itself.
+
+**Why not now.** With OpenRouter the provider is FIXED -- one host, one key --
+and what varies day to day is the model, which `args=` already carries for free.
+The axis starts paying the first time a second provider is actually in play;
+until then it is a table with one meaningful row and a validation rule guarding
+a case that cannot occur. **The trigger to build it: a second provider entering
+regular use** (direct Anthropic, a local endpoint, or a second agent whose
+provider differs from its default).
+
+**Done instead, 2026-09-21:**
+
+- Item 2 was a live defect rather than a missing feature, so it is fixed on its
+  own terms: `cred_clear_expr` for opencode is now EMPTY, which makes
+  `clear_seeded_credentials` drop the seeded `auth.json` wholesale. Blunter than
+  claude's surgical `del` -- it discards other providers' seeded entries too --
+  and correct for every provider rather than for one. The host copy is never
+  touched, so `--seed-creds` restores it on the next launch that forwards no
+  key. The alternative, deriving the expression from the resolved `token_env`,
+  was rejected: it is the provider table by the back door, and it cannot answer
+  for a `token_env=` the operator invents.
+- Items 1 and 3 need no code, because a PROFILE is already the composition
+  point: one profile per (agent, provider) pair, carrying `token_env=` and
+  `allow_host=`, with `allowed-hosts.<agent>` holding only what that agent
+  ALWAYS reaches. The README's agent section and
+  `templates/allowed-hosts.opencode` now say so.

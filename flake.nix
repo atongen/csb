@@ -41,6 +41,7 @@
           # bin_attr (ocaml/lib/agent.ml) — supplied from csb's flake so
           # consuming repos stay decoupled from every agent csb supports.
           claude = pkgs.claude-code;
+          opencode = pkgs.opencode;
 
           # The OCaml helpers under ocaml/: csb-proxy (egress allowlist proxy,
           # resolved at launch under --filter-egress) and csb-config (config
@@ -91,6 +92,7 @@
               pkgs.shellcheck
               pkgs.jq                # statusline template parses claude's session JSON
               pkgs.curl              # exercising csb-proxy (macOS has /usr/bin/curl; NixOS does not)
+              pkgs.opencode          # agent run through a `csb -s` profile (docs/PLAN-010-agents.md section 7)
               pkgs.bashInteractive   # `complete`/readline — mkShell's default bash lacks progcomp
               pkgs.bash-completion   # programmable Tab completion (git, etc.)
               # bats + assertion libraries for `make test` (docs/PLAN-005-tests.md).
@@ -133,6 +135,7 @@
               # gnu toolset (shadows macOS BSD /usr/bin variants; matches Linux)
               coreutils gnused gnugrep gawk findutils gnutar diffutils gnumake
               git ripgrep fd jq yq-go curl tree      # vcs + repo/agent staples
+              opencode                               # agent run through a `csb -s` profile
               bashInteractive bash-completion neovim less   # interactive shell
               gzip xz zstd unzip delta bat                  # convenience
             ];

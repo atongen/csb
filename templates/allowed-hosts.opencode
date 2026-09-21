@@ -1,0 +1,58 @@
+# Starter egress allowlist: the hosts opencode needs. Copy it to
+# ${XDG_CONFIG_HOME:-~/.config}/csb/allowed-hosts.opencode, where csb reads it
+# under --filter-egress for agent=opencode.
+#
+# csb prefers allowed-hosts.<agent> and falls back to a plain allowed-hosts, so
+# an unsuffixed file stays the shared list for every agent that has none of its
+# own.
+#
+# Format: one host per line; `#` comments and blank lines ignored. A leading
+# `*.` matches subdomains only, so list a bare parent domain separately when it
+# is also wanted.
+#
+# These entries are add-only: they union with --allow-host and any config
+# layer's allow_host=. The file is read once per launch, so an edit applies to
+# the next one.
+#
+# Which hosts opencode reaches is decided by the PROVIDER, not by opencode:
+# every provider in its catalog is enabled by its own API-key variable, and
+# `token_env=` names which one a launch carries.
+#
+# So keep this file to what you ALWAYS reach -- the provider matching the
+# adapter's default of OPENROUTER_API_KEY is below -- and let a PROFILE carry
+# any other. One profile per (agent, provider) pair keeps each launch's
+# allowlist as small as that launch needs, which listing every provider you
+# have ever used here would not:
+#
+#   # ~/.config/csb/profiles/oc-anthropic
+#   agent=opencode
+#   token_env=ANTHROPIC_API_KEY
+#   token_cmd=op read op://vault/anthropic/key
+#   allow_host=api.anthropic.com
+#
+# csb has no provider axis of its own yet; docs/PLAN-010-agents.md section 12
+# records what one would look like and what would trigger building it.
+
+# --- the always-reached provider ---------------------------------------------
+openrouter.ai
+
+# Deliberately NOT listed. Each was measured: a full tool-using turn against
+# OpenRouter, under --filter-egress with openrouter.ai as the only allowed
+# host, produced TWO connections and no denials at all (2026-09-18, opencode
+# 1.18.30). Nothing below was attempted, because the companion env keeps it
+# from being attempted -- the agent adapter injects both as its lowest setenv
+# layer, so this file and those knobs are already in sync:
+#
+#   OPENCODE_DISABLE_AUTOUPDATE=1     the update check
+#   OPENCODE_DISABLE_MODELS_FETCH=1   the models.dev catalog refresh; the
+#                                     binary carries a build-time snapshot,
+#                                     which is what the model picker lists
+#
+#   models.dev            model catalog (OPENCODE_MODELS_URL overrides it)
+#   opncd.ai              session sharing; config "share": "disabled" also
+#                         turns it off, and nothing shares by default
+#   registry.npmjs.org    runtime SDK install, reached only by an exotic
+#                         provider; every mainstream one is compiled in
+#
+# Telemetry needs no entry: it is OTLP-only and inert unless
+# OTEL_EXPORTER_OTLP_ENDPOINT is set, which the env scrub does not carry in.
