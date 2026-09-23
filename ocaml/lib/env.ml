@@ -1,5 +1,5 @@
-(* The process environment csb reads: HOME, the XDG config root, and the three
-   CSB_* knobs --dump-config reports. Captured once so resolution downstream is
+(* The process environment csb reads: HOME, the XDG config root, the three
+   CSB_* knobs --dump-config reports, and what bin/csb passes in. Captured once so resolution downstream is
    a function of this record rather than of global state. *)
 
 type t = {
@@ -22,10 +22,19 @@ type t = {
      Only the --seed-creds source reads it: a keyring on macOS, a file
      elsewhere. Absent, the file form is assumed. *)
   platform : string;
+  (* CSB_COMPLETE_BRANCHES / CSB_COMPLETE_WORKTREES: newline-separated branch
+     names bin/csb derives from git for a completion run. Absent otherwise. *)
+  complete_branches : string list;
+  complete_worktrees : string list;
 }
 
 let getenv_nonempty name =
   match Sys.getenv_opt name with None | Some "" -> None | Some v -> Some v
+
+let getenv_lines name =
+  match getenv_nonempty name with
+  | None -> []
+  | Some v -> List.filter (fun l -> l <> "") (String.split_on_char '\n' v)
 
 let of_process () =
   let home = Option.value (Sys.getenv_opt "HOME") ~default:"" in
@@ -43,11 +52,17 @@ let of_process () =
     system_tmpdir = getenv_nonempty "TMPDIR";
     main_root = getenv_nonempty "CSB_MAIN_ROOT";
     platform = Option.value (getenv_nonempty "CSB_PLATFORM") ~default:"";
+    complete_branches = getenv_lines "CSB_COMPLETE_BRANCHES";
+    complete_worktrees = getenv_lines "CSB_COMPLETE_WORKTREES";
   }
 
 let is_darwin env = env.platform = "Darwin"
 
 let profiles_dir env = Filename.concat env.config_dir "profiles"
+
+(* The persistent launch HOMEs, and where they lived before the agent axis. *)
+let ns_root env = Filename.concat env.home ".csb/agents"
+let ns_root_legacy env = Filename.concat env.home ".csb/claudes"
 let allowed_hosts_file env name = Filename.concat env.config_dir name
 let config_file env = Filename.concat env.config_dir "config"
 let config_local_file env = config_file env ^ ".local"

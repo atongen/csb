@@ -8,10 +8,7 @@
    warnings reach stderr as they are reached, and a die stops everything after
    it. *)
 
-let opt_or higher lower = match higher with Some _ -> higher | None -> lower
-
-let bool_layer ~cli ~profile ~default =
-  Option.value (opt_or cli profile) ~default
+let bool_layer = Layers.bool_layer
 
 (* Literal ${HOME} and a leading ~/ are the two expansions a profile args= word
    gets; nothing else is interpreted. *)
@@ -89,16 +86,13 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
   let pf sel = sel layers in
   let plist sel = sel layers in
 
-  let shell = bool_layer ~cli:cli.shell ~profile:(pf (fun p -> p.shell)) ~default:false in
+  let shell = Layers.shell ~cli:cli.shell layers in
 
   (* Which agent runs. One axis, one field, claude when no layer answers -- and
      the key every adapter lookup below is made through, so nothing else in csb
      needs to know the answer. It is resolved early because the egress
      allowlist file and the built-in setenv layer are both keyed by it. *)
-  let agent =
-    Option.value (Layer.value (Layer.over cli.agent (pf (fun p -> p.agent))))
-      ~default:Types.Claude
-  in
+  let agent = Layers.agent ~cli:cli.agent layers in
 
   (* The launch HOME: one axis, one field, every layer answering the same way.
      Per_repo is what Cleared and Unset both resolve to -- the difference between

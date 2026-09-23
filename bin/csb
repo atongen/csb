@@ -50,11 +50,6 @@ case "$CSB_SELF" in
   path:/*) CSB_SELF="path:$(cd "${CSB_SELF#path:}" 2>/dev/null && pwd -P || printf '%s' "${CSB_SELF#path:}")" ;;
 esac
 
-# The launch HOMEs: one per repo AND agent, plus the shared @NAME ones.
-# CSB_NS_ROOT_LEGACY is where they lived while csb ran claude and nothing else;
-# migrate_ns_root moves the whole root across once (PLAN-010 s6a).
-CSB_NS_ROOT="$HOME/.csb/agents"
-CSB_NS_ROOT_LEGACY="$HOME/.csb/claudes"
 # Where `make install` puts csb's native helpers. Deliberately NOT the bin dir
 # holding the csb script: that dir is meant to hold portable content and is
 # commonly under version control, which a per-platform binary must not enter.
@@ -1933,6 +1928,24 @@ csb_config_bin() {
   die "csb-config not found in $CSB_TOOLS_DIR, beside $PROG, or on PATH (run 'make install', or set CSB_CONFIG_BIN)"
 }
 
+# Replace this process with csb-config BIN ARGS..., passing the facts only this
+# side computes. exec -a so csb-config's diagnostics, usage line and version
+# name the program the operator actually typed. CSB_MAIN_ROOT carries the repo
+# identity its config sections are selected by: git stays on this side of the
+# seam, so there is one derivation of it. An inherited value is honoured
+# verbatim, an inherited EMPTY one included -- that is how the tests select
+# sections without a repository. CSB_PLATFORM travels the same way and for the
+# same reason: this script already runs uname for the sandbox, and the
+# --seed-creds source differs by platform (a keyring on macOS, a file
+# elsewhere).
+exec_csb_config() {
+  local bin="$1"; shift
+  CSB_MAIN_ROOT="${CSB_MAIN_ROOT-$(main_checkout_root)}"
+  CSB_PLATFORM="$(uname -s)"
+  export CSB_MAIN_ROOT CSB_PLATFORM
+  exec -a "$PROG" "$bin" "$@"
+}
+
 # Every scalar key csb-config emits, checked off as the records arrive. An
 # unknown key is loud on its own, but a VANISHED one would not be: `paranoid` or
 # `filter_egress` going missing would weaken the sandbox while looking like an
@@ -1946,7 +1959,7 @@ csb_config_scalars=(dump mode no_launch here shell agent agent_bin_attr
                     namespace branch ephemeral ephemeral_name seed_creds
                     seed_home reseed accent cfg_tmpdir tmp_base token_cmd aws_profile
                     aws_expiry_var filter_egress
-                    allow_loopback)
+                    allow_loopback ns_root ns_root_legacy)
 
 # Run csb-config over this invocation's argv and read the resolution back into
 # the globals below. The wire format is NUL-terminated KEY=VALUE records, a list
@@ -1958,24 +1971,13 @@ csb_config_scalars=(dump mode no_launch here shell agent agent_bin_attr
 # verb, arg, dest, interleaved per instruction -- so no field needs a separator
 # it might itself contain. The length check below is what keeps them aligned.
 resolve_config() {
-  local bin emit platform rc=0 rec k v unknown="" seen=" "
+  local bin emit rc=0 rec k v unknown="" seen=" "
   bin="$(csb_config_bin)"
-  platform="$(uname -s)"
   # The file carries token_cmd, so it is created private and unlinked as soon as
   # it is read. The one temp path that cannot use tmp_base: this call is what
   # resolves cfg_tmpdir, so the value does not exist yet.
   emit="$(mktemp "${TMPDIR:-/tmp}/csb-resolve.XXXXXX")"
-  # exec -a so csb-config's diagnostics, usage line and version name the program
-  # the operator actually typed. CSB_MAIN_ROOT carries the repo identity its
-  # config sections are selected by: git stays on this side of the seam, so
-  # there is one derivation of it. An inherited value is honoured verbatim, an
-  # inherited EMPTY one included -- that is how the tests select sections
-  # without a repository. CSB_PLATFORM travels the same way and for the same
-  # reason: this script already runs uname for the sandbox, and the --seed-creds
-  # source differs by platform (a keyring on macOS, a file elsewhere).
-  ( export CSB_EMIT_TO="$emit" CSB_MAIN_ROOT="${CSB_MAIN_ROOT-$(main_checkout_root)}" \
-           CSB_PLATFORM="$platform"
-    exec -a "$PROG" "$bin" "$@" ) || rc=$?
+  ( export CSB_EMIT_TO="$emit"; exec_csb_config "$bin" "$@" ) || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     rm -f "$emit"
     # 2 means csb-config answered the operator itself (--help, --version,
@@ -2031,6 +2033,8 @@ resolve_config() {
       aws_region_var)       aws_region_vars+=("$v") ;;
       filter_egress)        filter_egress="$v" ;;
       allow_loopback)       allow_loopback="$v" ;;
+      ns_root)              CSB_NS_ROOT="$v" ;;
+      ns_root_legacy)       CSB_NS_ROOT_LEGACY="$v" ;;
       agent_args)           agent_args+=("$v") ;;
       seed_verb)            seed_verbs+=("$v") ;;
       seed_arg)             seed_args+=("$v") ;;
@@ -2064,10 +2068,42 @@ resolve_config() {
     || die "csb-config emitted misaligned cred records (mismatched versions?)"
 }
 
+# Shell completion: csb-config answers; git-derived candidates travel as
+# newline-separated environment, since a ref name cannot hold a newline.
+complete_branches() {
+  git for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null || true
+}
+
+# The branches checked out in csb's own worktrees: what -d can remove.
+complete_worktrees() {
+  local gc root
+  gc=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 0
+  root=$(dirname "$gc")
+  git -C "$root" worktree list --porcelain 2>/dev/null | \
+    awk -v pre="$root/.worktrees/" '
+      /^worktree / { mine = index(substr($0, 10), pre) == 1 }
+      /^branch refs\/heads\// && mine { print substr($0, 19) }
+    ' || true
+}
+
+complete_dispatch() {
+  local bin
+  bin="$(csb_config_bin)"
+  CSB_COMPLETE_BRANCHES="$(complete_branches)"
+  CSB_COMPLETE_WORKTREES="$(complete_worktrees)"
+  export CSB_COMPLETE_BRANCHES CSB_COMPLETE_WORKTREES
+  exec_csb_config "$bin" "$@" 2>/dev/null  # a Tab press must never print
+}
+
 # Every knob csb-config resolves. The scalars carry csb-config's own defaults so
 # that a reader under `set -u` is never surprised; the arrays must exist before
 # resolve_config appends to them.
 dump=""             # "" | sandbox: the read-only seam that still needs this script
+# The launch HOMEs: one per repo AND agent, plus the shared @NAME ones.
+# CSB_NS_ROOT_LEGACY is where they lived while csb ran claude and nothing else;
+# migrate_ns_root moves the whole root across once (PLAN-010 s6a).
+CSB_NS_ROOT=""
+CSB_NS_ROOT_LEGACY=""
 mode="launch"
 no_launch="false"
 here="false"
@@ -2147,6 +2183,10 @@ agent_home=""        # set once the namespace/ephemeral HOME is resolved; empty
                      # earlier (under set -u) with no namespace HOME involved
 csb_ns=""            # resolved namespace name (empty for ephemeral)
 csb_ephemeral="false"
+
+if [[ "${1-}" == "--__complete" ]]; then
+  complete_dispatch "$@"
+fi
 
 resolve_config "$@"
 

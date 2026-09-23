@@ -111,6 +111,35 @@ Five environment variables tune csb:
   scratch device). Must be an existing directory. Host-scoped, so it lives here
   rather than in a profile.
 
+### Shell completion
+
+zsh and bash complete csb's options, their values -- profiles, `-N`
+namespaces, agents, accent colors, paths, variable names -- the repository's
+branches, and for `-d` the branches of csb's own worktrees. After `--`, a
+`-s` run hands over to the shell's own command completion, and an agent run
+offers that agent's flags. A profile that sets `shell=true` counts.
+
+`make install` generates the scripts into `~/.csb/share` (`SHARE_DIR`) with
+the devShell's cmdliner, the same library csb-config parses its flags with.
+The script calls csb back as `csb --__complete ... --__complete=WORD`, and
+csb-config answers; csb adds only the branch names, since csb-config runs no
+git. Enable it once in your shell rc:
+
+```sh
+# zsh, before compinit (then rm ~/.zcompdump once so compinit rescans)
+fpath=("$HOME/.csb/share/zsh/site-functions" $fpath)
+# bash, with bash-completion loaded
+source "$HOME/.csb/share/bash-completion/completions/csb"
+```
+
+A `nix profile install` of csb's flake ships the same scripts under the
+profile's `share/`. Check that it is live with
+`csb --__complete '--__complete=--par'`, which prints the protocol's
+directive stream. Not completed: `--nix-target*` (it would need `nix eval`),
+`-E=NAME`, the `A=B` values of `--setenv`, `--setenv-cmd` and `--seed-merge`,
+and `--allow-host`. One caveat, cmdliner's and not csb's: the scripts `eval`
+the typed command line, so a `$(...)` already on it runs when you press Tab.
+
 ## Use
 
 ```sh

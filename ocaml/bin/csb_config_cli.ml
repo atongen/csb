@@ -28,41 +28,12 @@ let exit_answered = 2
 (* bin/csb's own order: the CLI exclusions, then CSB_TMPDIR, then the config
    layers bottom-up, then the allowed-hosts file. Each step can die, and which
    message the operator sees depends on getting here first. *)
-(* One -p, from whichever source defines it. A name defined BOTH as a file under
-   profiles/ and as a [profile NAME] block is refused rather than ranked: two
-   launch configs answering to one name is a mistake in the configuration, and
-   picking one silently is how the wrong sandbox gets built. *)
-let one_profile env config name =
-  match (Config_file.block env config ~name, Profile.has_file env ~name) with
-  | Some _, true ->
-      Err.die
-        "profile '%s' is defined twice: %s and a [profile %s] block in the config file"
-        name (Profile.file env ~name) name
-  | Some (layer, seen), false -> (layer, seen)
-  | None, true -> (Profile.load env ~name, [])
-  | None, false ->
-      Err.die "profile not found: %s (nor a [profile %s] block in the config file)"
-        (Profile.file env ~name) name
-
-(* Every -p in turn, each its own layer folded onto the ones before it. One -p is
-   the same statement with a one-element list, so the repeatable case needs no
-   rule of its own. *)
-let profile_layers env config names =
-  List.fold_left
-    (fun (layer, seen) name ->
-      let over, from_config = one_profile env config name in
-      (Profile.overlay ~base:layer ~over, seen @ from_config))
-    (Profile.empty, []) names
-
 let run env cli emit ~answered =
   Cli.check_exclusive cli;
   let tmpdir = Env.resolve_tmpdir env in
   let config = Config_file.load env in
-  let profile, from_config = profile_layers env config cli.Cli.profiles in
-  (* Two file layers, config below the profiles. The built-in layer that used to
-     sit under them is now the agent adapter's setenv, applied in Resolve --
-     which agent's knobs those are is exactly what these layers decide. *)
-  let layers = Profile.overlay ~base:config.Config_file.layer ~over:profile in
+  let profile, from_config = Layers.profiles env config cli.Cli.profiles in
+  let layers = Layers.stack config profile in
   let cfg =
     Resolve.resolve ~env ~cli ~layers
       ~config_sections:(config.Config_file.matched @ from_config)
@@ -73,7 +44,7 @@ let run env cli emit ~answered =
       Dump.print cfg;
       answered
   | (Types.No_dump | Types.Dump_sandbox), Some path ->
-      Emit.to_file path cfg;
+      Emit.to_file env path cfg;
       0
 
 (* cmdliner picks its help renderer from TERM rather than from whether anyone is
@@ -246,7 +217,7 @@ let () =
   try
     let env = Env.of_process () in
     let pre = Cli.prepass (List.tl (Array.to_list Sys.argv)) in
-    let argv = Array.of_list (Sys.argv.(0) :: plain_help_when_piped pre.Cli.opts) in
+    let argv = Array.of_list (Sys.argv.(0) :: plain_help_when_piped (Cli.opts pre)) in
     match Cli.eval ~info ~argv (Cli.term env pre) with
     | Ok (`Ok cli) -> exit (run env cli emit ~answered)
     (* cmdliner printed the page itself, so nothing was resolved. *)

@@ -31,10 +31,22 @@
           # csb-tools is a runtime input because csb resolves its whole
           # configuration through csb-config, on every invocation: it looks
           # beside itself first, then PATH, which this supplies.
-          csb = pkgs.writeShellApplication {
+          # The completion scripts ride along under $out/share, where a nix
+          # profile's FPATH and XDG_DATA_DIRS already look.
+          csb = pkgs.symlinkJoin {
             name = "csb";
-            runtimeInputs = [ pkgs.git pkgs.coreutils csb-tools ];
-            text = builtins.readFile ./bin/csb;
+            paths = [
+              (pkgs.writeShellApplication {
+                name = "csb";
+                runtimeInputs = [ pkgs.git pkgs.coreutils csb-tools ];
+                text = builtins.readFile ./bin/csb;
+              })
+              (pkgs.runCommand "csb-completion"
+                { nativeBuildInputs = [ pkgs.ocamlPackages.cmdliner ]; }
+                ''
+                  cmdliner install tool-completion --standalone-completion csb "$out/share"
+                '')
+            ];
           };
 
           # One output per agent csb can launch, named by the agent adapter's

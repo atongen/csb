@@ -13,14 +13,16 @@
 
 open Types
 
-let known = "claude, opencode"
-
-let of_string ~where = function
-  | "claude" -> Claude
-  | "opencode" -> Opencode
-  | v -> Err.die "%s: unknown agent '%s' (%s)" where v known
+let all = [ Claude; Opencode ]
 
 let to_string = function Claude -> "claude" | Opencode -> "opencode"
+
+let names = List.map to_string all
+
+let of_string ~where v =
+  match List.find_opt (fun a -> to_string a = v) all with
+  | Some a -> a
+  | None -> Err.die "%s: unknown agent '%s' (%s)" where v (String.concat ", " names)
 
 (* The flake output bin/csb builds the binary from, as `$CSB_SELF#<attr>`, and
    the executable's name under that output's bin/ -- the two need not agree
@@ -45,6 +47,38 @@ let token_hint = function
 let yolo_flag = function
   | Claude -> "--dangerously-skip-permissions"
   | Opencode -> "--auto"
+
+(* The agent's own flags, offered when completing the arguments after `--`.
+   Curated, not discovered: csb-config execs nothing, so this lags upstream,
+   and a missing entry only means one flag is not suggested. *)
+let argv_flags a =
+  (yolo_flag a, "Allow every tool call without prompting.")
+  ::
+  (match a with
+   | Claude ->
+       [ ("--add-dir", "Allow tool access to an additional directory.");
+         ("--allowedTools", "Tools to allow without prompting.");
+         ("--append-system-prompt", "Append to the default system prompt.");
+         ("--continue", "Continue the most recent conversation.");
+         ("--debug", "Enable debug mode.");
+         ("--disallowedTools", "Tools to deny.");
+         ("--fork-session", "With --resume or --continue, start a new session id.");
+         ("--mcp-config", "Load MCP servers from a JSON file or string.");
+         ("--model", "Model for the session, an alias or a full name.");
+         ("--output-format", "With --print: text, json or stream-json.");
+         ("--permission-mode", "Permission mode for the session.");
+         ("--print", "Print the response and exit.");
+         ("--resume", "Resume a conversation by session id, or pick one.");
+         ("--settings", "Load additional settings from a JSON file or string.");
+         ("--verbose", "Verbose output.") ]
+   | Opencode ->
+       [ ("--agent", "Agent to use.");
+         ("--continue", "Continue the last session.");
+         ("--log-level", "Log level: DEBUG, INFO, WARN or ERROR.");
+         ("--model", "Model to use, as provider/model.");
+         ("--print-logs", "Print logs to stderr.");
+         ("--prompt", "Prompt to use.");
+         ("--session", "Session id to continue.") ])
 
 (* The quiet knobs, as the lowest setenv layer: cheap variables that remove
    noise a tight egress allowlist otherwise produces. The agent is pinned by

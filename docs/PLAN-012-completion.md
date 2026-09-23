@@ -1,500 +1,338 @@
 # plan 012 -- shell completion for zsh and bash
 
-Status: **PLANNED (2026-09-23). Nothing implemented.**
+Status: **DONE (2026-09-23).** `make check` and `make test` green; `nix build .#csb`
+ships the scripts under `share/`, and live zsh completion is verified on the host.
 
-The premise the work started from -- "give csb-config an autocomplete mode" --
-turned out to be half right. csb-config is the right oracle, but it needs no new
-mode: cmdliner 2.1.1, which the devShell already pins and csb-config already
-links against, implements a full shell-completion protocol, and that protocol
-already reaches the operator through `bin/csb` today, unmodified:
-
-```sh
-./bin/csb --__complete '--__complete=--par'   # -> 1 / group / Options / item / --paranoid ...
-```
-
-So this is not a "build a completion system" plan. It is: fix the two places
-csb's own argv pre-pass corrupts the protocol, attach value completions to the
-converters, hand csb-config the one class of candidate it refuses to compute
-(anything from git), and install the scripts.
+csb-config is the completion oracle, and it needs no new mode: cmdliner 2.1.1,
+which the devShell pins and csb-config links against, implements a versioned
+shell-completion protocol. The work is: make csb's argv pre-pass respect that
+protocol, attach value completions to the converters, hand csb-config the one
+class of candidate it refuses to compute (anything from git), and install the
+scripts.
 
 Decided (operator, 2026-09-23):
 
-- The namespace root moves INTO OCaml (section 4b): more logic where the type
-  checker can see it. csb-config also emits it, so bash stops carrying a second
-  copy of the path.
+- The namespace root moves INTO OCaml (section 4b), and rides the emit seam to
+  bin/csb so bash stops carrying a second copy of the path.
 - Arguments after `--` complete against the resolved launch mode (section 4c):
   `restart` in shell mode, the agent adapter's own flag row in agent mode.
-- The whole plan lands, sections 5 through 9, rather than only the OCaml half.
+- The whole plan lands at once; commit boundaries are not a concern.
 
-No decisions remain open. One implementation spike (section 4d) must run first,
-because it decides how section 4c is written.
+Every cmdliner claim below was read from the 2.1.1 sources in the devShell.
+With
 
-Everything in sections 1 through 3 was verified against cmdliner 2.1.1 in this
-repo's devShell on 2026-09-23; the verification command is given with each
-claim.
+```sh
+C=$(echo "$OCAMLPATH" | tr : '\n' | grep -m1 cmdliner | sed 's|/lib/.*||')
+L=$(echo "$C"/lib/ocaml/*/site-lib/cmdliner)
+```
+
+the files are `$L/cmdliner_completion.ml`, `$L/cmdliner_cline.ml`,
+`$L/cmdliner_arg.ml` and the generated scripts under `$C/share`.
 
 
 ## 0. The question, and the answer's shape
 
-An operator types `csb`, not `csb-config`. But `csb` is 2600 lines of bash that
-deliberately knows nothing about the flag grammar: csb-config owns the options,
-their values, the profiles, the precedence and the validation, and bin/csb
-consumes a resolved answer over the emit seam (PLAN-009 section 9). A completion
-implementation that re-listed the flags in a zsh function would be a second,
-silently drifting copy of exactly the thing that seam exists to keep singular.
-
-So completion must be answered by csb-config. The only question was what shape
-that answer takes -- and cmdliner has already decided it, which turns most of
-this plan into wiring rather than design.
+An operator types `csb`, not `csb-config`. But bin/csb deliberately knows
+nothing about the flag grammar: csb-config owns the options, their values, the
+profiles, the precedence and the validation (PLAN-009 section 9). A zsh function
+re-listing the flags would be a second, silently drifting copy of exactly what
+that seam keeps singular. So completion is answered by csb-config, in the shape
+cmdliner already defines.
 
 
-## 1. What cmdliner 2.1.1 already provides
+## 1. What cmdliner 2.1.1 provides
 
-cmdliner 2.0 introduced completion; the devShell pins 2.1.1:
-
-```sh
-echo "$OCAMLPATH" | tr : '\n' | grep cmdliner   # -> .../cmdliner-2.1.1/...
-```
-
-**The protocol.** A per-shell generic script rewrites the command line and calls
-the tool back:
-
-- `argv[1]` becomes the literal `--__complete`. This is a marker, not an option:
-  it tells the parser to run in completion mode, and it is needed as a separate
-  argument precisely because the completed token can sit after `--`.
-- The token under the cursor is replaced by exactly `--__complete=<partial>`.
-- The tool prints a versioned directive stream on stdout and exits.
-
-The stream is a version line (`1`), then directives: `group` (a named heading)
-followed by `item` records (a completion value plus a doc block), or one of
-`files`, `dirs`, `restart`, `message`. Full grammar in cmdliner's `cli.mld`,
+**The protocol.** A per-shell script rewrites the command line and calls the
+tool back: `argv[1]` becomes the literal marker `--__complete`, and the word
+under the cursor becomes `--__complete=<partial>`. The tool prints a version
+line (`1`) and directives -- `group` + `item`s, `files`, `dirs`, `restart`,
+`message` -- and exits. Grammar: `$C/share/doc/cmdliner/odoc-pages/cli.mld`,
 section `completion_protocol`.
 
-**The scripts.** cmdliner ships a generic script per shell plus a three-line
-per-tool script that binds a tool name to the generic one:
+**Option names complete for free**, with each `~doc` string as the zsh
+description, filtered by prefix.
 
-```sh
-C=$(echo "$OCAMLPATH" | tr : '\n' | grep -m1 cmdliner | sed 's|/lib/.*||')
-ls "$C"/share/zsh/site-functions "$C"/share/bash-completion/completions
-cat "$C"/share/bash-completion/completions/cmdliner     # the 3-line tool script
-```
+**Value completions** come from the converter: `Arg.Conv.of_conv ~completion`,
+with `Arg.Completion.make ?context f`. Four properties of that API shape this
+plan:
 
-zsh, bash and PowerShell are covered. The generic scripts are ~80 lines each and
-are generated by the `cmdliner` binary, which is on PATH in the devShell
-(`command -v cmdliner`).
+1. **Values are NOT prefix-filtered by cmdliner.** The Options group is; value
+   items pass straight through. zsh's `_describe` hides this, but bash's script
+   does `COMPREPLY+=($item)` unfiltered. Every completion function filters by
+   the token itself.
+2. **Every value item lands in a group literally named `Values`.** Both scripts
+   special-case that name to reassemble glued forms: zsh turns item `foo` into
+   `${prefix%=*}=foo` when the prefix starts with `--`, so `--ns=<TAB>` and
+   `-N<TAB>` work. It also means a value item `--model` completed from the
+   prefix `--mo` becomes `--mo=--model`. The only escape is
+   `Completion.raw`, which prints the whole protocol verbatim.
+3. **A context term that fails is silently `None`.** cmdliner evaluates it
+   against the parsed command line and maps both `Error _` and any exception to
+   `None`. A context built from RE-DECLARED `Arg.info`s therefore never raises;
+   it just never evaluates. It must share the main term's own `Arg.t` values.
+4. **The function is told the token, not whether it follows `--`.** cmdliner
+   honours a `restart` only after `--` and drops it otherwise, but anything else
+   that depends on the `--` must be learned elsewhere.
 
-**What this buys for free.** Option NAMES already complete, with each flag's
-`~doc` string rendered as the zsh description. csb's doc strings are long and
-good, so this is immediately worth having.
+The completion function itself runs OUTSIDE cmdliner's exception guard, and
+`Cli.eval` uses `~catch:false`, so it must be total.
 
-**Reserved names.** `--__complete` and `--cmdliner` are reserved by the library.
-csb uses neither, and `--cmdliner` currently reports `unknown option` because csb
-does not opt into cmdliner's tool-support features; nothing here changes that.
+**The scripts** are generated by the `cmdliner` binary, which is on PATH in the
+devShell. `cmdliner install tool-completion --standalone-completion csb DIR`
+writes one self-contained script per shell (`zsh/site-functions/_csb`,
+`bash-completion/completions/csb`, a PowerShell one) with the generic code
+inlined. Standalone matters for bash: the non-standalone per-tool script calls
+`_completion_loader _cmdliner_generic`, which searches bash-completion's own
+directories, not ours, and it would also collide with any other cmdliner tool's
+`_cmdliner_generic` on `FPATH`.
+
+**Reserved names.** `--__complete` and `--cmdliner`; csb uses neither.
 
 
-## 2. What already works, end to end
+## 2. What worked before this plan, by accident
 
 ```sh
 ./bin/csb --__complete '--__complete=--par'
 ```
 
-prints the three `--paranoid*` options with their docs, exits 0, in ~71ms
-(`time ./bin/csb --__complete '--__complete=--par'`).
-
-It works because `resolve_config` passes argv through verbatim and csb-config
-streams the directives to stdout before exiting 2 -- the "csb-config answered the
-operator itself" arm -- which bin/csb already maps to a clean `exit 0`. Nothing
-about that is intentional, which is why section 6 replaces it with an explicit
-dispatch.
-
-Completion is also robust against half-typed lines, which matters: a Tab press
-must never print an error. All of these complete cleanly, because cmdliner does
-not evaluate the term in completion mode:
-
-```sh
-B=./ocaml/_build/default/bin/csb_config_cli.exe
-"$B" --__complete --bogus            '--__complete=--par'   # unknown flag earlier
-"$B" --__complete --agent bogus      '--__complete=--par'   # invalid value earlier
-"$B" --__complete --paranoid --no-paranoid '--__complete=--fil'  # a refused pair
-```
+prints the three `--paranoid*` options, because `resolve_config` passes argv
+through verbatim and csb-config's `Ok \`Help` arm exits 2, which bin/csb maps to
+`exit 0`. Section 6 replaces that with an explicit dispatch.
 
 
-## 3. The three gaps
+## 3. The gaps
 
 ### 3a. `Cli.prepass` corrupts the protocol
 
-The pre-pass (`ocaml/lib/cli.ml`) rewrites argv before cmdliner sees it, for two
-shapes cmdliner cannot express. Both rewrites are wrong in completion mode.
-
-**It drops everything after `--`, including the completion token.** cmdliner then
-sees a `--__complete` marker with no `--__complete=ARG` anywhere:
+It drops everything after `--`, including the completion token, and cmdliner
+then hits an `assert false` in `Cmdliner_cline.create`:
 
 ```sh
 ./ocaml/_build/default/bin/csb_config_cli.exe --__complete --here -- '--__complete=cla'
 # Fatal error: exception File "cmdliner_cline.ml", line 325: Assertion failed
 ```
 
-This is csb's, not cmdliner's -- the stock binary handles the same shape fine:
-
-```sh
-C=$(echo "$OCAMLPATH" | tr : '\n' | grep -m1 cmdliner | sed 's|/lib/.*||')
-"$C"/bin/cmdliner --__complete tool-completion -- '--__complete=x'   # -> 1, exit 0
-```
-
-**It dies on a half-typed `-E=`:**
+And it dies on a half-typed `-E=`:
 
 ```sh
 ./ocaml/_build/default/bin/csb_config_cli.exe --__complete -E= '--__complete=--par'
 # csb: -E=/--ephemeral= requires a NAME (use bare -E for a random throwaway)
 ```
 
-A diagnostic where the shell expected a directive stream. `-E=<TAB>` is an
-entirely reasonable thing to type.
+### 3b. No value completes
 
-### 3b. No value completes to anything
-
-Every converter is a plain `string`, and `Arg.string` carries no completion, so
-every value position is silent:
-
-```sh
-B=./ocaml/_build/default/bin/csb_config_cli.exe
-"$B" --__complete -p          '--__complete='     # -> just "1"
-"$B" --__complete --agent     '--__complete='     # -> just "1"
-"$B" --__complete --deny-read '--__complete='     # -> just "1"
-"$B" --__complete             '--__complete=mai'  # BRANCH: just "1"
-```
-
-This is the bulk of the work, and section 5 is its table.
+Every converter is a plain `string`, which carries no completion.
 
 ### 3c. `BRANCH` needs git, and csb-config has none
 
-csb-config is "a pure function of (argv, config files, env): no git, no nix, no
-exec" (its own header comment). Branch names and the `.worktrees/` inventory are
-the one class of candidate it cannot produce. Section 6 resolves this without
-weakening the rule.
+csb-config is a pure function of (argv, config files, env). Branch names and
+the `.worktrees/` inventory travel in from bin/csb (section 6).
+
+### 3d. Completion writes to stderr
+
+`Config_file.load` warns "no git repository here" outside a repository, and the
+generic scripts `eval` the line with no redirect, so the warning would land in
+the terminal mid-completion.
 
 
-## 4. Design decisions
+## 4. Design
 
-### 4a. The seam rule, restated for completion
+### 4a. The seam rule, restated
 
-Unchanged from PLAN-009 section 9: the grammar, the precedence and every
-candidate derivable from argv, the config files and the environment belong to
-csb-config. bash contributes only facts it already computes for other reasons and
-that csb-config is forbidden to compute -- today `CSB_MAIN_ROOT` (git) and
-`CSB_PLATFORM` (uname). Completion adds candidates to that same channel and
-introduces no new kind of traffic.
+Unchanged from PLAN-009 section 9: every candidate derivable from argv, the
+config files and the environment belongs to csb-config. bash contributes only
+what csb-config is forbidden to compute -- today `CSB_MAIN_ROOT` (git) and
+`CSB_PLATFORM` (uname), and now the git candidates.
 
-### 4b. The namespace root moves into OCaml -- DECIDED
+### 4b. The namespace root moves into OCaml
 
-`-N/--ns` completion needs `~/.csb/agents`, which today only bin/csb knows
-(`CSB_NS_ROOT`, plus `CSB_NS_ROOT_LEGACY` for the pre-0.3 layout). Two ways to
-give csb-config that path: derive it there from `env.home`, or pass it in the way
-`CSB_MAIN_ROOT` is passed.
+`Env.ns_root` and `Env.ns_root_legacy` derive `~/.csb/agents` and
+`~/.csb/claudes` from HOME, beside `Env.profiles_dir`. The emit seam carries both
+as scalars; bin/csb reads `CSB_NS_ROOT` / `CSB_NS_ROOT_LEGACY` from it and lists
+both in `csb_config_scalars`, so a version skew that drops them is loud. That is
+safe because nothing before `resolve_config` reads either variable.
 
-Deriving it in OCaml is chosen -- it is a pure function of HOME, exactly like
-`Env.config_dir` and `Env.profiles_dir` beside it, and it type-checks. But
-deriving it there while bash keeps its own literal creates a second source of
-truth for a path that appears eleven times in bin/csb, which is the drift the
-seam exists to prevent. So:
+They are emit-only: an internal path, not an operator knob, so `--dump-config`
+is unchanged. `CSB_TOOLS_DIR` stays a bash literal -- it is how csb-config is
+found.
 
-- `Env.ns_root` and `Env.ns_root_legacy` are added, next to `profiles_dir`.
-- `Resolve` carries both into the emitted configuration as scalars `ns_root`
-  and `ns_root_legacy`.
-- bin/csb assigns `CSB_NS_ROOT` / `CSB_NS_ROOT_LEGACY` from the emit records
-  instead of from literals, and adds both names to `csb_config_scalars`, so a
-  version skew that drops them is loud rather than silently relocating every
-  launch HOME.
+### 4c. After `--`
 
-The emit half is separable: it is a one-commit cleanup that the completion work
-does not block on. It is in scope here because leaving the duplicate behind is
-how the next reader ends up with two answers.
+**Shell mode.** bin/csb execs those tokens as a command line, so `restart` is
+exact: zsh shifts past the leftmost `--` and calls `_normal`, bash calls
+`_command_offset`. `csb -s -- git sta<TAB>` gets git's own completion.
 
-Cost: `--dump-config` gains two keys, so the Tier-2 goldens need
-`make test-update` and a reviewed diff.
+**Agent mode.** The tokens are the agent's argv with the binary implicit, so
+`restart` would complete the first one as a command name. Instead
+`Agent.argv_flags` is a curated (flag, doc) row per agent, and the yolo flag in
+it is `yolo_flag a`, not a second literal. It is emitted through
+`Completion.raw` under a group named for the agent (section 1, property 2),
+followed by `files` when the token does not start with `-`. The row lags
+upstream by design: csb-config execs nothing, so it cannot ask `claude --help`.
 
-### 4c. After `--`: restart in shell mode, adapter flags in agent mode -- DECIDED
+**Which mode** comes from the resolved configuration, so a profile with
+`shell=true` completes as a shell.
 
-The tokens after `--` mean two different things, and the correct completion
-differs accordingly.
+### 4d. The completion context
 
-**Shell mode** (`-s/--shell`, from any layer). bin/csb execs those tokens as a
-command line (`cmd=("${agent_args[@]}")`). cmdliner's `restart` directive is an
-exact fit: the generic scripts shift past the leftmost `--` and hand over to the
-shell's ordinary command completion -- zsh calls `_normal`, bash calls
-`_command_offset`. So `csb -s -- git sta<TAB>` gets git's own completion, for
-free, forever.
+The context is NARROW -- `-s`, `--no-shell`, `--agent`, `--no-agent`, `-p`, `-d`
+-- built from the same `Arg.t` values the main term uses (section 1, property
+3). A full-term context is rejected twice over: it is circular (BRANCH's
+converter would need a term containing BRANCH), and it is fragile, because the
+term body validates everything -- `csb -s --deny-read foo -- git<TAB>` would die
+on the relative path and complete as an agent.
 
-**Agent mode.** The tokens are the agent binary's argv with the binary name
-implicit, so `restart` is wrong: the shell would try to complete the first token
-as a command name. Instead the agent adapter grows a row -- `argv_flags`, a list
-of (flag, doc) pairs -- and csb-config emits those as items under a group named
-for the agent. This is the shape `ocaml/lib/agent.ml` already has: its rows are
-deliberately DATA, and it already hard-codes per-agent flags (`yolo_flag`).
-`--dangerously-skip-permissions` simply becomes one entry in the new row.
+Narrow does not mean duplicated. The precedence it needs has one
+implementation:
 
-The row is curated, not discovered -- csb-config execs nothing, so it cannot ask
-`claude --help`. It will lag upstream, and that is acceptable: a missing entry
-means one flag is not suggested, never that a launch breaks. Treat it as
-documentation with a completion side effect.
+- `Layers` (new, below `Cli`) owns the profile fold that was in
+  `csb_config_cli.ml` -- `one_profile`, `profile_layers` -- plus the two axis
+  folds `shell` and `agent`, which `Resolve.resolve` now calls.
+- `Complete` (new, below `Cli`) holds the candidate functions. `Cli` attaches
+  them to converters; `Resolve` still depends on `Cli`, so nothing cycles.
 
-When the token does not start with `-`, also emit `files`: agent arguments are
-commonly paths.
+The `--` question (section 1, property 4) is answered by the pre-pass, which
+sees raw argv. `Cli.prepass` returns a sum:
 
-**Which mode** comes from the resolved configuration, not from scanning argv for
-`-s`, so a profile that sets `shell=true` completes correctly:
-`csb -p myshell -- <TAB>` restarts. This is the reason for the spike below.
+```ocaml
+type prepassed = Launch of pre | Complete of { opts : string list; after_dashdash : bool }
+```
 
-### 4d. The spike: giving the completion function a resolved context -- DO FIRST
+so a completion run has no agent argv and no `-E=` diagnostic to carry.
 
-`Arg.Completion.make ?context f` takes a term whose value is passed to the
-completion function as `'ctx option`. Two ways to use it, and the choice shapes
-section 4c's code:
-
-1. **Full resolution as context.** Pass `Cli.term`'s own value, then run the
-   same `Resolve.resolve` pipeline `csb_config_cli.run` uses. Completion answers
-   then come from the identical precedence the launch would use -- no second
-   implementation of "is this a shell run", "which agent".
-2. **A narrow context term.** A small term reading only `-s`, `--no-shell`,
-   `--agent`, `--no-agent` and `-p`, with the profile fold done inside the
-   completion function.
-
-Option 1 is better if it is legal. The risk is cmdliner's rule that "defining the
-same option or command name via two different arguments or terms is illegal and
-raises `Invalid_argument`" -- a context term that re-declares the same `Arg.info`
-values would trip it. Sharing the *same* `Arg.t` bindings between the main term
-and the context term should be fine, but `Cli.term` is currently one large
-`let+ ... and+ ...` applicative with no named bindings to share, and it cannot
-reference itself.
-
-The spike: pull four arguments out of the applicative into named `let` bindings,
-build a context term from those same bindings, and confirm cmdliner accepts it.
-If it does, option 1; if it raises, option 2 with the fold duplicated in one
-small function.
-
-Either way the completion function must be total. It runs on half-typed lines,
-so every call into `Resolve`, `Config_file` or `Profile` is wrapped:
-`try ... with Err.Die _ -> <agent-mode default>`. `'ctx option` being `None` --
-cmdliner could not evaluate the context -- takes the same default.
+Every completion function goes through one `total` wrapper that turns
+`Err.Die`, `Sys_error` and `Unix_error` into "no candidates". A layer fold that
+dies falls back to the command line alone.
 
 
 ## 5. The completion table
 
-Every value position, its candidates and where they come from. All sources are
-already reachable from csb-config.
+| flag | candidates |
+| --- | --- |
+| `-p/--profile` | regular files under `Env.profiles_dir` that are valid profile names and not `*.local`, plus `[profile NAME]` blocks from `Config_file.load` (skipped if the config does not parse) |
+| `--agent` | `Agent.all` -- which also derives the "unknown agent" message |
+| `--accent` | `Validate.accent_names` |
+| `-N/--ns` | `@NAME` dirs under `Env.ns_root`, spelled with or without the `@` to match the token |
+| `--deny-read`, `--allow-write`, `--allow-socket`, `--paranoid-deny-read`, `--paranoid-allow-read` | `files` once the token starts with `/` or `~`; before that, a `message` saying the path must be absolute or `~/`, since `Validate.list_path` refuses a relative one |
+| `--seed-home`, `--tmpdir` | `dirs` |
+| `-k/--keep`, `--token-env` | environment variable names |
+| `BRANCH` (launch) | `CSB_COMPLETE_BRANCHES` |
+| `BRANCH` (with `-d`) | `CSB_COMPLETE_WORKTREES` |
+| after `--` | section 4c |
 
-| flag | candidates | source |
-| --- | --- | --- |
-| `-p/--profile` | profile names | `Env.profiles_dir` listing, plus `[profile NAME]` blocks from `Config_file.load` -- csb-config already reads both, and already refuses a name defined twice |
-| `--agent` | `claude`, `opencode` | `Agent` -- replace the hand-written `known` string with a list and derive both the message and the completion from it |
-| `--accent` | color names | `Validate.accent_names` |
-| `-N/--ns` | existing `@NAME` dirs | `Env.ns_root` (section 4b) |
-| `--deny-read`, `--allow-write`, `--allow-socket`, `--paranoid-deny-read`, `--paranoid-allow-read` | paths | `Completion.complete_paths` |
-| `--seed-home`, `--tmpdir` | directories | `Completion.complete_dirs` |
-| `--allow-host` | hosts already in the allowlist | `Hosts_file.read`, selected per agent via the context |
-| `--keep`, `--token-env` | environment variable names | the process environment |
-| `--setenv`, `--setenv-cmd` | `VAR=` from the environment, then nothing | two-part; complete the name before `=` only |
-| `--seed-merge` | `DEST=` then files | two-part; `files` once past the `=` |
-| `--nix-target`, `--nix-target-shell`, `--nix-target-agent` | none | needs `nix eval` of the repo flake. Out of scope -- see section 10 |
-| `BRANCH` (launch) | branch names | `CSB_COMPLETE_BRANCHES`, section 6 |
-| `BRANCH` (with `-d`) | csb-created worktrees | `CSB_COMPLETE_WORKTREES`, section 6 |
-| after `--` | restart, or agent flags | section 4c |
-
-**Trap: the group name is load-bearing.** The generic scripts special-case a
-group literally named `Values` to reassemble glued forms -- zsh turns item `foo`
-into `--opt=foo` when the prefix starts with `--`, and into `-Nfoo` when it
-starts with a single dash. Value completions must therefore use the group name
-`Values` so that `--ns=<TAB>` and `-N<TAB>` work. The post-`--` agent flags must
-NOT, or `--mo<TAB>` would be mangled into `--mo=--model`; give them a descriptive
-group name instead.
+Everything else completes nothing: see section 10.
 
 
-## 6. bin/csb: an explicit dispatch, and the git candidates
+## 6. bin/csb: an explicit dispatch
 
-Replace today's accidental pass-through with a deliberate one. Immediately before
-`resolve_config "$@"` -- which is the first top-level statement in the script
-that does anything, everything above it being function definitions and variable
-initialization:
+Immediately before `resolve_config "$@"` (everything above it is function
+definitions and variable initialization):
 
 ```sh
-# Completion (docs/PLAN-012-completion.md): cmdliner's protocol puts its marker
-# in argv[1], so this dispatches before any side effect. git stays on this side
-# of the seam, so the candidates it derives travel as environment, the way
-# CSB_MAIN_ROOT and CSB_PLATFORM already do.
 if [[ "${1-}" == "--__complete" ]]; then
-  export CSB_MAIN_ROOT="${CSB_MAIN_ROOT-$(main_checkout_root)}"
-  export CSB_PLATFORM="$(uname -s)"
-  export CSB_COMPLETE_BRANCHES="$(complete_branches)"
-  export CSB_COMPLETE_WORKTREES="$(complete_worktrees)"
-  exec -a "$PROG" "$(csb_config_bin)" "$@"
+  complete_dispatch "$@"
 fi
 ```
 
-What this fixes beyond tidiness: a Tab press no longer creates and unlinks a
-`mktemp` emit file, and no longer runs the janitor's reap pass.
+`complete_dispatch` exports `CSB_COMPLETE_BRANCHES` and
+`CSB_COMPLETE_WORKTREES`, then hands off to `exec_csb_config` -- the function
+`resolve_config` also uses, which exports `CSB_MAIN_ROOT` (inherited value
+honoured) and `CSB_PLATFORM` and `exec -a "$PROG"`s csb-config -- with stderr
+discarded (3d). A Tab press therefore creates no emit file and runs no janitor.
 
-`complete_branches` is `git for-each-ref --format='%(refname:short)' refs/heads`;
-`complete_worktrees` is the same inventory `-l` prints, so it must share that
-code rather than re-deriving it. Both must be silent and exit 0 outside a
-repository -- completion has no business failing there.
+- Branches: `git for-each-ref --format='%(refname:short)' refs/heads`.
+- Worktrees: the BRANCH names of the worktrees under `$main_root/.worktrees/`,
+  from `git worktree list --porcelain`, skipping detached ones. `-l` prints
+  paths, not branches, so this is its own helper rather than a reuse.
 
-The transport is newline-separated, not NUL-separated like the emit seam: a
-branch name cannot contain a newline (git refuses it), so the cheaper format is
-sound here. Say so in the comment, because the emit seam's NUL choice is
-documented as deliberate and the difference will otherwise read as an oversight.
-
-On the OCaml side these are two more `Env.t` fields beside `main_root` and
-`platform`, with the same "absent is fine" treatment.
+Both are silent outside a repository. The transport is newline-separated,
+unlike the emit seam's NUL: git refuses a newline in a ref name, so the cheaper
+format is sound. On the OCaml side they are `Env.t` fields beside `main_root`.
 
 
-## 7. Install, and what the operator has to do once
-
-`make install` copies `bin/csb` into `BIN_DIR` and `csb-config` into
-`TOOLS_DIR`. Completion scripts are a third kind of artifact -- neither portable
-content nor a per-platform binary -- so they get a third destination,
-`$HOME/.csb/share`, following the FHS layout the generic scripts expect.
-
-New target, and `install` depends on it:
+## 7. Install
 
 ```make
 SHARE_DIR ?= $(HOME)/.csb/share
-
-install-completion:
-	cmdliner install generic-completion $(SHARE_DIR)
-	cmdliner install tool-completion csb $(SHARE_DIR)
 ```
 
-with the same `command -v ... || nix develop --command ...` fallback every other
-target uses.
+`make install-completion` runs
+`cmdliner install tool-completion --standalone-completion csb $(SHARE_DIR)`
+with the usual `nix develop` fallback; `install` depends on it and prints the rc
+lines; `uninstall` removes the three files. Generate, never vendor: the script
+and the binary come from the same flake's cmdliner, so their protocol versions
+move together.
 
-**Generate, do not vendor.** cmdliner states the protocol is versioned and can
-change between minor versions. Generating the scripts from the devShell's
-cmdliner -- the same one csb-config links against, since both come from the
-flake -- keeps the two ends in step by construction. A vendored copy would drift
-into a silent mismatch.
+- zsh: `fpath=("$HOME/.csb/share/zsh/site-functions" $fpath)` BEFORE
+  `compinit`, then delete `~/.zcompdump` once so compinit rescans.
+- bash: `source "$HOME/.csb/share/bash-completion/completions/csb"`, with
+  bash-completion loaded (the script uses `_get_comp_words_by_ref`).
 
-`install` should print the one line the operator's rc file needs, since neither
-shell finds the scripts on its own:
+**The flake.** `packages.csb` becomes a `symlinkJoin` of the
+`writeShellApplication` script and a `runCommand` that runs the same cmdliner
+install into `$out/share`, so a `nix profile install` gets completion.
 
-- zsh: `FPATH="$HOME/.csb/share/zsh/site-functions:$FPATH"`, and it must come
-  BEFORE `compinit`. Worth stating explicitly; it is the usual failure.
-- bash: source `$HOME/.csb/share/bash-completion/completions/csb`, which needs
-  `_completion_loader` (bash-completion < 2.12) or `_comp_load` to find the
-  generic script. The devShell already ships `bash-completion`.
-
-**The flake.** `packages.csb` is a `writeShellApplication`, so a
-`nix profile install` gets no completion at all today. Add the same two script
-sets to `$out/share`, which is where a nix-profile shell's `FPATH` and
-`XDG_DATA_DIRS` already look. This is what makes completion work for an install
-that never ran `make`.
-
-README gets a section under the existing installation material: the protocol in
-three sentences, the rc lines, and how to check it is live
-(`csb --__complete '--__complete=--par'` printing directives).
+README: the protocol in brief, the rc lines, and the liveness check
+`csb --__complete '--__complete=--par'`.
 
 
 ## 8. Tests
 
-A new `test/completion.bats`, Tier 1, driven exactly like the `--dump-config`
-seam -- invoke, assert on the directive stream. Completion is a pure function of
-argv plus files plus env, so it needs no launch and no sandbox.
+`test/completion.bats`, Tier 1, joins `OCAML_ORACLE`. The arms that need
+bin/csb's dispatch (git candidates, stderr) are tagged `needs-bin-csb`, and the
+oracle filter becomes `--filter-tags '!dump-sandbox,!needs-bin-csb'` (a comma is
+AND in bats).
 
-Coverage, in the order the gaps were found:
-
-- **Regressions for 3a**: completion after `--` returns directives and exit 0,
-  not an assertion failure; `-E=<TAB>` returns directives, not a diagnostic.
-  These two are the reason the file exists.
-- **Robustness**: an unknown flag, an invalid `--agent` value and a refused
-  `--paranoid --no-paranoid` pair all still complete. These pass today; pin them,
-  because the prepass fix is what could break them.
-- **Protocol shape**: first line is exactly `1`; every `item` is closed by
-  `item-end`; the value group is named `Values` and the post-`--` agent group is
-  not (section 5's trap, asserted rather than commented).
-- **Each value position** in section 5's table, against a fixture config dir:
-  `-p` lists both file profiles and `[profile NAME]` blocks; `--ns` lists the
-  `@` dirs under a fixture `ns_root`; `--agent` lists exactly the adapter's
-  agents; `--accent` lists the color names.
-- **Mode-dependent `--`**: `-s --` emits `restart`; a bare `--` emits the agent
-  group; `-p <profile with shell=true> --` emits `restart`, which is the case
-  that proves completion reads the resolved configuration rather than scanning
-  argv.
-- **Prefix filtering**: `--__complete=--par` returns the three paranoid options
-  and nothing else.
-
-Most arms run against both `bin/csb` and `csb-config` unchanged, so the file
-joins `OCAML_ORACLE` in the Makefile. The git-candidate arms cannot: they need
-bin/csb to populate `CSB_COMPLETE_*`. Tag those `# bats test_tags=needs-bin-csb`
-and extend the oracle filter to `--filter-tags '!dump-sandbox,!needs-bin-csb'`,
-reusing the mechanism `dump-sandbox` already established.
-
-`make check` covers the new bash helpers. The `ns_root` emit keys (4b) require
-`make test-update` and a reviewed golden diff.
+- the 3a regressions: after `--`, and `-E=`, both return directives, exit 0;
+- robustness: an unknown flag, an invalid `--agent`, a refused
+  `--paranoid --no-paranoid` pair all still complete;
+- protocol shape: first line `1`, every `item` closed by `item-end`, value group
+  `Values`, the post-`--` agent group not;
+- each value position of section 5, including the `.local` exclusion and the
+  `@` spelling;
+- prefix filtering on a VALUE position, not only on option names;
+- mode-dependent `--`: `-s --` restarts, bare `--` gives the agent group,
+  `-p <shell=true profile> --` restarts -- the case that proves the context
+  shares the main term's arguments;
+- through bin/csb: branch and `-d` worktree candidates from a fake repo, and an
+  empty stderr outside a repository.
 
 
-## 9. Implementation order
+## 9. Order
 
-Four commits. Each is independently useful and independently revertable.
+1. `Cli.prepass` returns the sum type; csb-config dispatches on it.
+2. `Layers`: the profile fold and the two axis folds, used by csb-config and
+   `Resolve`.
+3. `Complete`, the converters, `Agent.all` / `Agent.argv_flags`, the raw arm,
+   `Env.ns_root` and the `CSB_COMPLETE_*` fields.
+4. bin/csb: the dispatch, the git helpers, `ns_root` from the emit seam.
+5. `test/completion.bats` and the Makefile oracle filter.
+6. `make install-completion`, the flake output, the README section.
 
-**1. Make the protocol safe.** Teach `prepass` about completion mode: when
-`argv[1] = "--__complete"`, do not die on `-E=` and do not swallow the tokens
-after `--`. Add `test/completion.bats` with the 3a regressions and the
-robustness and protocol-shape arms. After this commit, option-name completion --
-which already works by accident -- works on purpose, on every command line.
-
-**2. Value completions.** Run the 4d spike, then section 5's table minus the two
-git rows, plus the `Env.ns_root` half of 4b. All OCaml, all covered by the oracle.
-
-**3. The `--` behaviour and the agent row.** Section 4c: `argv_flags` in
-`agent.ml` for claude and opencode, the mode-dependent directive, its tests.
-Depends on 2 for the resolved context.
-
-**4. bash, install and docs.** Section 6's dispatch and `CSB_COMPLETE_*`, the
-`ns_root` emit keys and their golden update, `make install-completion`, the flake
-`$out/share` outputs, and the README section.
-
-`make ci` at the end of each, on the host -- Tier 3 refuses to run inside csb.
+`make check` and `make test` at the end; `make ci` on the host.
 
 
 ## 10. Known gaps, accepted
 
-- **`--nix-target*` values do not complete.** The candidates are
-  `devShells.<system>.*` in the consuming repo's flake, which needs `nix eval`:
-  slow enough to be felt on a Tab press, and outside what csb-config may do. The
-  env channel of section 6 could carry them, but bash would have to evaluate the
-  flake on EVERY completion, not only when that flag is being completed, since it
-  cannot know which token is under the cursor. Revisit only if it is missed.
-- **`-E=NAME` does not complete its value.** `-E=` is csb's own invention,
-  removed in the pre-pass before cmdliner sees it, so cmdliner has no argument to
-  attach a completion to. `-E=<TAB>` will offer option names. Harmless once
-  commit 1 stops it dying; a real fix means teaching the pre-pass to synthesize a
-  completion, which is not worth it for one flag.
-- **The agent flag row lags upstream.** Section 4c. A curated list, refreshed
-  when someone notices, degrading to "one flag is not suggested".
-- **bash shows no doc strings.** A generic-script limitation, noted in their own
-  source: bash's completion has nowhere to put them. zsh shows them.
-- **Protocol version coupling.** If a future cmdliner bumps the protocol past
-  `1`, the generated scripts and the binary move together (section 7), but an
-  operator with stale scripts in `~/.csb/share` and a fresh binary sees
-  "Unsupported cmdliner completion protocol". `make install` regenerating both
-  is what keeps that from happening.
-
-
-## 11. Source notes
-
-Verified 2026-09-23 against cmdliner 2.1.1 as pinned by this repo's devShell.
-The protocol, the directive grammar and the `Arg.Completion` API are documented
-in the package itself:
-
-```sh
-C=$(echo "$OCAMLPATH" | tr : '\n' | grep -m1 cmdliner | sed 's|/lib/.*||')
-"$C"/share/doc/cmdliner/odoc-pages/cli.mld            # sections cli_completion, completion_protocol
-"$C"/lib/ocaml/*/site-lib/cmdliner/cmdliner_arg.mli   # module Completion, module Conv
-"$C"/share/zsh/site-functions/_cmdliner_generic       # restart, and the "Values" group special case
-"$C"/share/bash-completion/completions/_cmdliner_generic
-```
-
-The `restart` semantics in section 4c were read from those two scripts rather
-than from the prose: zsh shifts `words` past the leftmost `--` and calls
-`_normal`; bash finds the `--` index and calls `_command_offset`. Both therefore
-treat the first token after `--` as a command NAME, which is what makes restart
-right for `-s` and wrong for an agent launch.
+- **`--nix-target*` values do not complete.** The candidates need `nix eval` of
+  the consuming repo's flake -- too slow for a Tab press, and bash could not
+  know to run it only when that flag is being completed.
+- **`-E=NAME`, `--setenv`, `--setenv-cmd`, `--seed-merge` values do not
+  complete.** `-E=` is removed by the pre-pass before cmdliner sees it. The
+  other three are `A=B` pairs, and the generic scripts only split a prefix off
+  a `files` completion when the word starts with `-`, so `DEST=<TAB>` cannot
+  complete a file, and zsh would append a space after a completed `VAR=`.
+- **`--allow-host` does not complete.** The only local candidates are hosts
+  already allowed, and naming one again changes nothing.
+- **The agent flag row lags upstream** (4c): one flag not suggested, never a
+  broken launch.
+- **The raw arm is a second protocol-v1 writer.** A cmdliner protocol bump
+  breaks it; the protocol-shape test is what notices.
+- **bash shows no doc strings**, a generic-script limitation.
+- **Tab evaluates the typed line.** The generic scripts `eval` the command
+  line, so a `$(...)` already typed on it runs, unsandboxed, when Tab is
+  pressed. That is cmdliner's behaviour for every tool; fixing it means
+  vendoring the scripts, which section 7 rejects.
+- **Stale scripts.** An operator with old scripts and a new binary after a
+  protocol bump sees "Unsupported cmdliner completion protocol";
+  `make install` regenerating both is the fix.

@@ -31,7 +31,7 @@ let seed_records prefix xs =
         (prefix ^ "_dest", s.dest) ])
     xs
 
-let records c =
+let records env c =
   let b v = [ string_of_bool v ] in
   let s v = [ v ] in
   let setenv_words = List.map (fun (k, v) -> k ^ "=" ^ v) c.setenv in
@@ -83,6 +83,8 @@ let records c =
       ("aws_region_var", if c.aws_profile = None then [] else Aws.region_vars);
       ("filter_egress", b c.filter_egress);
       ("allow_loopback", b c.allow_loopback);
+      ("ns_root", s (Env.ns_root env));
+      ("ns_root_legacy", s (Env.ns_root_legacy env));
       ("agent_args", c.agent_args);
       ("keep", c.keep);
       ("setenv", setenv_words);
@@ -100,9 +102,9 @@ let records c =
 
 (* The file carries token_cmd, so it is created private and the caller unlinks
    it once read. *)
-let to_file path c =
+let to_file env path c =
   let fd = Unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
   let oc = Unix.out_channel_of_descr fd in
   Fun.protect
     ~finally:(fun () -> close_out oc)
-    (fun () -> List.iter (fun (k, v) -> Printf.fprintf oc "%s=%s\000" k v) (records c))
+    (fun () -> List.iter (fun (k, v) -> Printf.fprintf oc "%s=%s\000" k v) (records env c))

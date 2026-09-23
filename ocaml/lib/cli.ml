@@ -62,7 +62,11 @@ type t = {
    - `-E=NAME` / `--ephemeral=NAME` gives one flag an optional value. Declaring
      it that way (~vopt) makes `-E feature/foo` swallow the BRANCH positional,
      which is a real invocation. Extracting the =NAME form here leaves a plain
-     flag behind, so BRANCH survives. *)
+     flag behind, so BRANCH survives.
+
+   A completion run (argv[1] is cmdliner's `--__complete` marker) keeps `--`
+   and everything after it, since the token being completed may be there, and
+   only records which side of `--` that token is on. *)
 
 let value_taking =
   [ "-N"; "--ns"; "--agent"; "--nix-target"; "--nix-target-shell";
@@ -88,7 +92,28 @@ type pre = {
   eph_name : string option;
 }
 
-let prepass argv =
+type prepassed =
+  | Launch of pre
+  | Complete of { opts : string list; after_dashdash : bool }
+
+let complete_marker = "--__complete"
+
+let is_complete_token = String.starts_with ~prefix:(complete_marker ^ "=")
+
+let complete_prepass argv =
+  let rec loop acc = function
+    | [] -> Complete { opts = List.rev acc; after_dashdash = false }
+    | "--" :: rest ->
+        Complete
+          { opts = List.rev_append acc ("--" :: rest);
+            after_dashdash = List.exists is_complete_token rest }
+    | tok :: value :: rest when List.mem tok value_taking -> loop (value :: tok :: acc) rest
+    | tok :: rest when ephemeral_named tok <> None -> loop acc rest
+    | tok :: rest -> loop (tok :: acc) rest
+  in
+  loop [] argv
+
+let launch_prepass argv =
   let rec loop acc name = function
     | [] -> { opts = List.rev acc; rest = None; eph_name = name }
     | "--" :: rest -> { opts = List.rev acc; rest = Some rest; eph_name = name }
@@ -104,15 +129,26 @@ let prepass argv =
   in
   loop [] None argv
 
+let prepass = function
+  | m :: _ as argv when m = complete_marker -> complete_prepass argv
+  | argv -> Launch (launch_prepass argv)
+
+let opts = function Launch p -> p.opts | Complete c -> c.opts
+
 (* --- option values ---------------------------------------------------------- *)
 
 (* string option option: None when absent, Some None when named with no value. *)
-let opt_str ?docs names ~docv ~doc =
-  Arg.(value & opt ~vopt:(Some None) (some (some string)) None
+let completing = function
+  | None -> Arg.string
+  | Some completion -> Arg.Conv.of_conv Arg.string ~completion
+
+let opt_str ?docs ?complete names ~docv ~doc =
+  Arg.(value & opt ~vopt:(Some None) (some (some (completing complete))) None
        & info names ?docs ~docv ~doc)
 
-let opt_str_all ?docs names ~docv ~doc =
-  Arg.(value & opt_all ~vopt:None (some string) [] & info names ?docs ~docv ~doc)
+let opt_str_all ?docs ?complete names ~docv ~doc =
+  Arg.(value & opt_all ~vopt:None (some (completing complete)) []
+       & info names ?docs ~docv ~doc)
 
 let flag ?docs names ~doc = Arg.(value & flag_all & info names ?docs ~doc)
 
@@ -220,14 +256,77 @@ let term env pre =
       (Validate.list_path env ~where:flag_name)
       (need_all ~msg:(flag_name ^ " requires a PATH") vs)
   in
-  let+ delete =
+  let delete_a =
     flag [ "d"; "delete" ]
       ~doc:
         "Delete mode: run .worktreesetup.sh's sandboxed 'down' teardown, if any, \
          then remove BRANCH's worktree, keeping the branch. Only worktrees csb \
          created, under .worktrees/, are ever torn down or removed. The launch \
          HOME is NOT removed: it is per-repo, or a shared @-namespace, and not \
-         tied to one branch. Retire a namespace deliberately with rm -rf."
+         tied to one branch. Retire a namespace deliberately with rm -rf." in
+  let shell_a =
+    flag [ "s"; "shell" ]
+      ~doc:
+        "Drop into an interactive bash -- or run the arguments after -- as a \
+         command -- instead of the agent, in the exact environment the agent \
+         would get: same worktree, devShell, environment scrub, HOME redirection \
+         and deny-list." in
+  let no_shell_a =
+    flag [ "no-shell" ] ~docs:s_negate ~doc:"Cancel a profile shell=true." in
+  let agent_a =
+    opt_str [ "agent" ] ~complete:Complete.agents ~docv:"NAME"
+      ~doc:
+        "Which agent CLI to launch. csb supplies its binary from its own flake, \
+         and the agent decides the credential variable, the yolo flag, the \
+         onboarding seed and the egress allowlist file. Only 'claude' for now, \
+         which is the default." in
+  let no_agent_a =
+    flag [ "no-agent" ] ~docs:s_negate
+      ~doc:"Cancel a configured agent= and use the default, claude." in
+  let profile_a =
+    opt_str_all [ "p"; "profile" ] ~complete:(Complete.profiles env) ~docv:"NAME"
+      ~doc:
+        "Load launch defaults from ~/.config/csb/profiles/NAME, or from a \
+         [profile NAME] block in the config file -- one or the other, never \
+         both. A gitignored NAME.local is layered on top for host-specific \
+         values, and its values win; explicit CLI flags beat both, and both beat \
+         the config sections. Repeatable: each -p is its own layer, folded left \
+         to right, so the last one to answer a scalar wins and their lists \
+         union. Like any launch naming no BRANCH, 'csb -p NAME' runs --here. See \
+         the CONFIGURATION section for the keys."
+ in
+  let shell_of ~shell ~no_shell =
+    pair ~pos:"-s/--shell" ~neg:"--no-shell" (given shell) (given no_shell)
+  in
+  let agent_of ~agent ~no_agent =
+    Layer.map
+      (Agent.of_string ~where:"--agent")
+      (setting ~pos:"--agent" ~neg:"--no-agent" ~cleared:(given no_agent)
+         (need ~msg:"--agent requires a NAME (--no-agent resets to claude)" agent))
+  in
+  let profiles_of profile =
+    List.map
+      (Validate.profile_name ~where:"--profile")
+      (need_all ~msg:"--profile requires a non-empty NAME" profile)
+  in
+  let context =
+    let+ shell = shell_a
+    and+ no_shell = no_shell_a
+    and+ agent = agent_a
+    and+ no_agent = no_agent_a
+    and+ profile = profile_a
+    and+ delete = delete_a in
+    { Complete.shell = shell_of ~shell ~no_shell;
+      agent = agent_of ~agent ~no_agent;
+      profiles = profiles_of profile;
+      delete = given delete }
+  in
+  let after_dashdash, rest, eph_name =
+    match pre with
+    | Complete c -> (c.after_dashdash, None, None)
+    | Launch p -> (false, p.rest, p.eph_name)
+  in
+  let+ delete = delete_a
   and+ list_wt =
     flag [ "l"; "list" ]
       ~doc:
@@ -334,14 +433,8 @@ let term env pre =
   and+ no_here =
     flag [ "no-here" ] ~docs:s_negate
       ~doc:"Cancel a profile here=true and the bare -p implication."
-  and+ shell =
-    flag [ "s"; "shell" ]
-      ~doc:
-        "Drop into an interactive bash -- or run the arguments after -- as a \
-         command -- instead of the agent, in the exact environment the agent \
-         would get: same worktree, devShell, environment scrub, HOME redirection \
-         and deny-list."
-  and+ no_shell = flag [ "no-shell" ] ~docs:s_negate ~doc:"Cancel a profile shell=true."
+  and+ shell = shell_a
+  and+ no_shell = no_shell_a
   and+ ephemeral =
     flag [ "E"; "ephemeral" ] ~docs:s_home
       ~doc:
@@ -412,9 +505,7 @@ let term env pre =
   and+ no_token_env =
     flag [ "no-token-env" ] ~docs:s_negate
       ~doc:"Cancel a configured token_env= and use the agent's own variable."
-  and+ no_agent =
-    flag [ "no-agent" ] ~docs:s_negate
-      ~doc:"Cancel a configured agent= and use the default, claude."
+  and+ no_agent = no_agent_a
   and+ no_aws =
     flag [ "no-aws" ] ~docs:s_negate
       ~doc:"Cancel a configured aws_profile= and launch with no AWS credentials."
@@ -442,15 +533,9 @@ let term env pre =
   and+ nix_target_agent =
     opt_str [ "nix-target-agent" ] ~docv:"NAME"
       ~doc:"As --nix-target, for agent runs only; it beats --nix-target for those runs."
-  and+ agent =
-    opt_str [ "agent" ] ~docv:"NAME"
-      ~doc:
-        "Which agent CLI to launch. csb supplies its binary from its own flake, \
-         and the agent decides the credential variable, the yolo flag, the \
-         onboarding seed and the egress allowlist file. Only 'claude' for now, \
-         which is the default."
+  and+ agent = agent_a
   and+ ns =
-    opt_str [ "N"; "ns" ] ~docv:"NAME" ~docs:s_home
+    opt_str [ "N"; "ns" ] ~complete:(Complete.namespaces env) ~docv:"NAME" ~docs:s_home
       ~doc:
         "Use a shared, cross-repo HOME at ~/.csb/agents/@NAME instead of the \
          per-repo-per-agent default. NAME and @NAME are equivalent; the @ is \
@@ -458,7 +543,7 @@ let term env pre =
          naming one is already a sharing decision, and '-N work-codex' is how \
          you keep them apart. Persistent, and never auto-removed by -d."
   and+ seed_home =
-    opt_str [ "seed-home" ] ~docv:"DIR" ~docs:s_seed
+    opt_str [ "seed-home" ] ~complete:Arg.Completion.complete_dirs ~docv:"DIR" ~docs:s_seed
       ~doc:
         "Seed the launch HOME, without overwriting, from template DIR: the \
          user-level files -- an agent's instructions file, settings, rules/ -- \
@@ -469,7 +554,7 @@ let term env pre =
       ~doc:
         "Run CMD on the host, outside the sandbox, and pass its first line into          the launch as the agent's credential variable (see --token-env) -- a          secrets-manager read such as 'op read op://vault/claude/token'. The          command is the configuration, never the token, so it is safe in a          config file; note that a value given here reaches ps(1) and the shell          history, which a config or profile key does not."
   and+ token_env =
-    opt_str [ "token-env" ] ~docv:"VAR"
+    opt_str [ "token-env" ] ~complete:Complete.var_names ~docv:"VAR"
       ~doc:
         "The variable --token-cmd's output is exported into, and which the env \
          scrub keeps. Defaults to the agent's own (claude: \
@@ -488,7 +573,7 @@ let term env pre =
          only AWS access the launch has, and it does NOT refresh -- re-launch \
          when it expires."
   and+ tmpdir =
-    opt_str [ "tmpdir" ] ~docv:"DIR"
+    opt_str [ "tmpdir" ] ~complete:Arg.Completion.complete_dirs ~docv:"DIR"
       ~doc:
         "Use DIR as the launch's TMPDIR, the base for an -E throwaway HOME, and a          write root. Must already exist. Overrides CSB_TMPDIR."
   and+ setenv =
@@ -516,38 +601,28 @@ let term env pre =
          path portably), substituted per launch. Repeatable; applied after the \
          agent's own seed, so it can override that too."
   and+ accent =
-    opt_str [ "accent" ] ~docv:"COLOR"
+    opt_str [ "accent" ] ~complete:Complete.accents ~docv:"COLOR"
       ~doc:
         "Tint the statusline repo name so profiles are tellable at a glance, \
          personal versus work say. COLOR is a name -- black, red, green, yellow, \
          blue, magenta, cyan, white, gray/grey, or a bright-* variant -- or raw \
          ANSI SGR parameters such as 38;5;208."
-  and+ profile =
-    opt_str_all [ "p"; "profile" ] ~docv:"NAME"
-      ~doc:
-        "Load launch defaults from ~/.config/csb/profiles/NAME, or from a \
-         [profile NAME] block in the config file -- one or the other, never \
-         both. A gitignored NAME.local is layered on top for host-specific \
-         values, and its values win; explicit CLI flags beat both, and both beat \
-         the config sections. Repeatable: each -p is its own layer, folded left \
-         to right, so the last one to answer a scalar wins and their lists \
-         union. Like any launch naming no BRANCH, 'csb -p NAME' runs --here. See \
-         the CONFIGURATION section for the keys."
+  and+ profile = profile_a
   and+ keep =
-    opt_str_all [ "k"; "keep" ] ~docv:"VAR"
+    opt_str_all [ "k"; "keep" ] ~complete:Complete.var_names ~docv:"VAR"
       ~doc:"Also keep environment variable VAR across the scrub. Repeatable."
   and+ deny_read =
-    opt_str_all [ "deny-read" ] ~docv:"PATH" ~docs:s_policy
+    opt_str_all [ "deny-read" ] ~complete:Complete.list_paths ~docv:"PATH" ~docs:s_policy
       ~doc:
         "Also read-DENY PATH, in both modes, adding to the built-in floor. \
          Repeatable."
   and+ allow_write =
-    opt_str_all [ "allow-write" ] ~docv:"PATH" ~docs:s_policy
+    opt_str_all [ "allow-write" ] ~complete:Complete.list_paths ~docv:"PATH" ~docs:s_policy
       ~doc:
         "Also make PATH writable, and thus readable under --paranoid, in both \
          modes. Repeatable."
   and+ allow_socket =
-    opt_str_all [ "allow-socket" ] ~docv:"PATH" ~docs:s_policy
+    opt_str_all [ "allow-socket" ] ~complete:Complete.list_paths ~docv:"PATH" ~docs:s_policy
       ~doc:
         "Also allow connecting to the unix socket at PATH; a directory allows \
          the sockets under it. For a dev service the sandbox must reach over a \
@@ -569,16 +644,23 @@ let term env pre =
          dev server, or postgres over TCP -- traffic the CONNECT proxy cannot \
          carry. Repeatable."
   and+ paranoid_deny_read =
-    opt_str_all [ "paranoid-deny-read" ] ~docv:"PATH" ~docs:s_policy
+    opt_str_all [ "paranoid-deny-read" ] ~complete:Complete.list_paths ~docv:"PATH" ~docs:s_policy
       ~doc:
         "Under --paranoid only, additionally read-deny PATH, for example a tree \
          outside HOME like /Volumes. Repeatable."
   and+ paranoid_allow_read =
-    opt_str_all [ "paranoid-allow-read" ] ~docv:"PATH" ~docs:s_policy
+    opt_str_all [ "paranoid-allow-read" ] ~complete:Complete.list_paths ~docv:"PATH" ~docs:s_policy
       ~doc:
         "Under --paranoid only, re-expose PATH read-only WITHOUT granting write. \
          Rejected if it overlaps a deny. Repeatable."
-  and+ positional = Arg.(value & pos_all string [] & info [] ~docv:"BRANCH") in
+  and+ positional =
+    Arg.(value
+         & pos_all
+             (Conv.of_conv string
+                ~completion:(Complete.branch env ~after_dashdash context))
+             []
+         & info [] ~docv:"BRANCH")
+  in
   {
     mode =
       mode ~delete:(given delete) ~list_ns:(given list_ns) ~list_wt:(given list_wt)
@@ -587,12 +669,9 @@ let term env pre =
     no_launch = given no_launch;
     reseed = given reseed;
     branch = branch_of positional;
-    agent_args = pre.rest;
-    profiles =
-      List.map
-        (Validate.profile_name ~where:"--profile")
-        (need_all ~msg:"--profile requires a non-empty NAME" profile);
-    shell = pair ~pos:"-s/--shell" ~neg:"--no-shell" (given shell) (given no_shell);
+    agent_args = rest;
+    profiles = profiles_of profile;
+    shell = shell_of ~shell ~no_shell;
     yolo = pair ~pos:"-y/--yolo" ~neg:"--no-yolo" (given yolo) (given no_yolo);
     paranoid =
       pair ~pos:"--paranoid" ~neg:"--no-paranoid" (given paranoid) (given no_paranoid);
@@ -624,16 +703,12 @@ let term env pre =
           (Option.map (Validate.nix_target ~where:"--nix-target-agent")
              (need ~msg:"--nix-target-agent requires a NAME" nix_target_agent))
         ~cleared:(given no_nix_target);
-    agent =
-      Layer.map
-        (Agent.of_string ~where:"--agent")
-        (setting ~pos:"--agent" ~neg:"--no-agent" ~cleared:(given no_agent)
-           (need ~msg:"--agent requires a NAME (--no-agent resets to claude)" agent));
+    agent = agent_of ~agent ~no_agent;
     home =
       home_of
         ~ns:
           (need ~msg:"--ns requires a non-empty NAME (--per-repo resets to the default)" ns)
-        ~ephemeral:(given ephemeral || pre.eph_name <> None) ~eph_name:pre.eph_name
+        ~ephemeral:(given ephemeral || eph_name <> None) ~eph_name
         ~real_home:(given real_home)
         ~per_repo:(given per_repo);
     seed_home =
