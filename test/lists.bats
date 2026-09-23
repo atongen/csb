@@ -121,12 +121,13 @@ load helpers
 }
 
 @test "a seed_merge source keeps its placeholders for bin/csb to substitute" {
-  # ${CSB_WORKTREE} and ${CSB_HOME} are resolved at LAUNCH, by the only side
-  # that knows either value, so they must survive resolution untouched.
-  printf '{"cwd":"${CSB_WORKTREE}","home":"${CSB_HOME}"}\n' > "$TEST_TMP/ph.json"
+  # All three are resolved at LAUNCH, by the only side that knows their values,
+  # so they must survive resolution untouched.
+  printf '{"cwd":"${CSB_WORKTREE}","home":"${CSB_HOME}","real":"${CSB_REAL_HOME}"}\n' \
+    > "$TEST_TMP/ph.json"
   emit_records --here --seed-merge ".claude/x.json=$TEST_TMP/ph.json"
   assert_success
-  assert_line 'seed_arg={"cwd":"${CSB_WORKTREE}","home":"${CSB_HOME}"}'
+  assert_line 'seed_arg={"cwd":"${CSB_WORKTREE}","home":"${CSB_HOME}","real":"${CSB_REAL_HOME}"}'
 }
 
 @test "a multi-line seed_merge source crosses whole" {

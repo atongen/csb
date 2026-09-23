@@ -869,6 +869,33 @@ none
   assert_output --partial "not an absolute or ~/ path"
 }
 
+@test "a spaced seed_merge = DEST = FILE parses like the unspaced form" {
+  # The outer KEY=VALUE split trims, so the inner DEST=FILE one does too --
+  # otherwise the spaced style the config files use elsewhere yields a source
+  # with a leading space, which is neither absolute nor '~/'.
+  printf '{}\n' > "$TEST_TMP/m.json"
+  write_profile p "seed_merge = .claude/x.json = $TEST_TMP/m.json"
+  dump_config --here -p p
+  assert_success
+  assert_line "seed_merge=.claude/x.json=$TEST_TMP/m.json"
+}
+
+@test "a spaced setenv = VAR = value parses like the unspaced form" {
+  # --dump-config reports setenv NAMES only, so the value is asserted through
+  # the emit seam, which is the one that carries it.
+  write_profile p "setenv = FOO = bar"
+  emit_records --here -p p
+  assert_success
+  assert_line "setenv=FOO=bar"
+}
+
+@test "a spaced setenv_cmd = VAR = command parses like the unspaced form" {
+  write_profile p "setenv_cmd = FOO = echo hi"
+  emit_records --here -p p
+  assert_success
+  assert_line "setenv_cmd=FOO=echo hi"
+}
+
 @test "a seed_merge source that does not exist is fatal" {
   dump_config --seed-merge ".claude/x.json=$TEST_TMP/missing.json"
   assert_failure

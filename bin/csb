@@ -396,23 +396,29 @@ json_escape() {
   printf '%s' "$s"
 }
 
-# Echo $1 with the launch's placeholders resolved. Only a launch knows either
-# value: the worktree is resolved after config resolution (and reuse can hand
-# back an already-registered path), and an -E HOME is mktemp'd. $2 = "json"
-# escapes the substituted values, so a path holding a quote or a backslash
-# cannot break the document it lands in.
+# Echo $1 with the launch's placeholders resolved. Only a launch knows the first
+# two: the worktree is resolved after config resolution (and reuse can hand back
+# an already-registered path), and an -E HOME is mktemp'd. CSB_REAL_HOME is the
+# HOST's home, which the sandbox cannot derive for itself -- $HOME in there is
+# the redirected one -- and which a seeded config needs to name a host-side path
+# portably, since it is /Users/<user> on macOS and /home/<user> elsewhere.
+# $2 = "json" escapes the substituted values, so a path holding a quote or a
+# backslash cannot break the document it lands in.
 # The replacements are QUOTED inside the substitution: an unquoted one is
 # backslash-processed, which would undo json_escape's own doubling.
 seed_expand() {
-  local s="$1" wt="$worktree" home="$agent_home"
+  local s="$1" wt="$worktree" home="$agent_home" real="$HOME"
   if [[ "${2:-}" == "json" ]]; then
     wt="$(json_escape "$wt")"
     home="$(json_escape "$home")"
+    real="$(json_escape "$real")"
   fi
   # shellcheck disable=SC2016  # replacing the LITERAL strings, as .worktreeenv does
   s="${s//'${CSB_WORKTREE}'/"$wt"}"
   # shellcheck disable=SC2016
   s="${s//'${CSB_HOME}'/"$home"}"
+  # shellcheck disable=SC2016
+  s="${s//'${CSB_REAL_HOME}'/"$real"}"
   printf '%s' "$s"
 }
 

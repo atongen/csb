@@ -794,16 +794,33 @@ seed_merge = .claude/.claude.json = ~/.config/csb/seed/mcp.json
 
 ```json
 { "mcpServers": { "project-rag": {
-    "command": "/Users/you/.config/csb/shared/bin/project-rag",
+    "command": "${CSB_REAL_HOME}/.config/csb/shared/bin/project-rag",
     "args": ["--root", "${CSB_WORKTREE}"] } } }
 ```
 
-`${CSB_WORKTREE}` and `${CSB_HOME}` are substituted per launch, JSON-escaped, by
-the only side that knows either value. csb reads `FILE` **host-side at config
-resolution**, so the launch carries the bytes rather than a path the sandbox
-would have to reach -- and a missing, empty, or NUL-bearing source is fatal
-before anything is provisioned. `DEST` is relative to the launch HOME and may
-not contain `..`.
+Three placeholders are substituted per launch, JSON-escaped, by the only side
+that knows their values:
+
+| placeholder | is |
+|---|---|
+| `${CSB_WORKTREE}` | the resolved worktree, which reuse can hand back already registered |
+| `${CSB_HOME}` | the launch HOME, mktemp'd under `-E` |
+| `${CSB_REAL_HOME}` | the **host's** home -- `/Users/you` on macOS, `/home/you` elsewhere |
+
+`${CSB_REAL_HOME}` is what makes one seed file portable across hosts: the
+sandbox cannot derive the host's home for itself (`$HOME` in there is the
+redirected one), so a config naming a host-side path -- an MCP server binary,
+say -- would otherwise have to be written per machine. A binary that differs per
+platform can sit in `uname`-keyed subdirectories behind one wrapper script, so
+the path above stays a single string.
+
+csb reads `FILE` **host-side at config resolution**, so the launch carries the
+bytes rather than a path the sandbox would have to reach -- and a missing,
+empty, or NUL-bearing source is fatal before anything is provisioned. `DEST` is
+relative to the launch HOME and may not contain `..`.
+
+Both `KEY = VALUE` and `KEY=VALUE` spacing work, at both levels: the `DEST=FILE`
+split trims like the outer one does.
 
 Repeatable, and applied **after** the agent's own seed instructions, so an
 operator key wins the merge. It needs `jq` on the host; without it csb warns and

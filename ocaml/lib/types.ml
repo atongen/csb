@@ -33,8 +33,8 @@ type agent =
 (* One seed step, deferred to bin/csb because it needs facts csb-config does not
    have: the resolved worktree path, the launch HOME, the macOS keychain. `arg`
    is the source -- a host path, a keychain service name, or file content --
-   and `dest` is relative to the launch HOME. Content carries ${CSB_WORKTREE}
-   and ${CSB_HOME} placeholders bin/csb substitutes. *)
+   and `dest` is relative to the launch HOME. Content carries ${CSB_WORKTREE},
+   ${CSB_HOME} and ${CSB_REAL_HOME} placeholders bin/csb substitutes. *)
 type seed_verb =
   | Copy        (* host file -> dest, 0600 *)
   | Keychain    (* macOS `security -w <service>` -> dest, 0600 *)

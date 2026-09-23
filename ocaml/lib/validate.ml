@@ -94,21 +94,31 @@ let is_var_name v =
 let keep_var ~msg v =
   if is_var_name v then v else Err.die "%s: '%s'" msg v
 
-(* A profile setenv= value: VAR=value, split on the first '='. *)
-let setenv ~where v =
+(* The compound values -- VAR=value, DEST=FILE -- split on their FIRST '=', and
+   both halves are trimmed because the outer KEY=VALUE split already is
+   (Profile.split_kv). Without this, `seed_merge = DEST = FILE` written in the
+   spaced style the config files use elsewhere yields ' FILE' with a leading
+   space, which is neither absolute nor '~/'. *)
+let split_pair v =
   match String.index_opt v '=' with
-  | Some i when is_var_name (String.sub v 0 i) ->
-      (String.sub v 0 i, String.sub v (i + 1) (String.length v - i - 1))
+  | None -> None
+  | Some i ->
+      Some
+        ( String.trim (String.sub v 0 i),
+          String.trim (String.sub v (i + 1) (String.length v - i - 1)) )
+
+(* A profile setenv= value: VAR=value. *)
+let setenv ~where v =
+  match split_pair v with
+  | Some (var, value) when is_var_name var -> (var, value)
   | _ -> Err.die "%s: setenv needs VAR=value: '%s'" where v
 
 (* A setenv_cmd= value: VAR=command. The command is what gets configured and its
    stdout is what reaches the sandbox, so an empty one has nothing to inject. *)
 let setenv_cmd ~where v =
-  match String.index_opt v '=' with
-  | Some i when is_var_name (String.sub v 0 i) ->
-      let cmd = String.sub v (i + 1) (String.length v - i - 1) in
-      if cmd = "" then Err.die "%s: setenv_cmd needs a command: '%s'" where v
-      else (String.sub v 0 i, cmd)
+  match split_pair v with
+  | Some (var, cmd) when is_var_name var ->
+      if cmd = "" then Err.die "%s: setenv_cmd needs a command: '%s'" where v else (var, cmd)
   | _ -> Err.die "%s: setenv_cmd needs VAR=command: '%s'" where v
 
 (* A seed destination is joined onto the launch HOME and onto nothing else, so an
@@ -128,11 +138,9 @@ let seed_dest ~where v =
 (* A seed_merge= value: DEST=FILE, the launch-HOME destination first so it reads
    like setenv's target=source. FILE is a host path read at resolution time. *)
 let seed_merge env ~where v =
-  match String.index_opt v '=' with
+  match split_pair v with
   | None -> Err.die "%s: seed_merge needs DEST=FILE: '%s'" where v
-  | Some i ->
-      let dest = String.sub v 0 i in
-      let src = String.sub v (i + 1) (String.length v - i - 1) in
+  | Some (dest, src) ->
       if src = "" then Err.die "%s: seed_merge needs a source FILE: '%s'" where v
       else (seed_dest ~where dest, list_path env ~where src)
 
