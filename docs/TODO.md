@@ -287,3 +287,15 @@
       four). RUNTIME still unmeasured: `make test-escape` plus a `curl` through
       the proxy is what settles it, and the proxy path is what breaks if the
       forwarding is wrong.
+- [ ] zsh/bash completion. PLANNED 2026-09-23 in docs/PLAN-012-completion.md.
+      Not a new csb-config mode: cmdliner 2.1.1 already implements a completion
+      protocol, and `csb --__complete '--__complete=--par'` already answers with
+      it today. Four commits: make `Cli.prepass` completion-safe (it currently
+      drops the completion token after `--`, crashing cmdliner, and dies on a
+      half-typed `-E=`), attach completions to the converters, make the tokens
+      after `--` restart in shell mode and offer the agent adapter's own flag
+      row otherwise, then the bin/csb dispatch that supplies the git-derived
+      candidates plus `make install-completion`. Two riders decided with it:
+      `~/.csb/agents` moves into `Env` and is emitted, so bash stops carrying a
+      second copy of the path; `--nix-target` values stay uncompleted, since
+      their candidates need a `nix eval` on every Tab.
