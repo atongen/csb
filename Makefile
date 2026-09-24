@@ -25,11 +25,10 @@
 # the config oracle re-runs a subset against csb-config. `make ci` is the one
 # that runs all of them.
 #
-# `check` and the bats targets prefer a tool already on PATH and fall back to
-# csb's own devShell (nix develop), so they work with only Nix installed.
-# `ocaml-build` and `install-completion` ALWAYS use the devShell's toolchain
-# (NIX_RUN): a host dune would link a host cmdliner, and a host cmdliner binary
-# would generate scripts for a protocol the flake's csb-config may not speak.
+# Every tool comes from csb's own devShell (NIX_RUN), never from the host PATH,
+# so the targets need only Nix and a host toolchain cannot leak into a build: a
+# host dune would link a host cmdliner, and a host cmdliner binary would
+# generate scripts for a protocol the flake's csb-config may not speak.
 
 # Empty inside the devShell (nix develop sets IN_NIX_SHELL), so it never nests.
 NIX_RUN := $(if $(IN_NIX_SHELL),,nix develop --command)
@@ -132,34 +131,18 @@ SHELLSCRIPTS := bin/csb templates/home/.claude/statusline.sh \
                 test/escape/loopback-probe.sh
 
 check: ## Lint the shell scripts with shellcheck
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck $(SHELLSCRIPTS); \
-	else \
-		nix develop --command shellcheck $(SHELLSCRIPTS); \
-	fi
+	@$(NIX_RUN) shellcheck $(SHELLSCRIPTS)
 	@echo "check: shellcheck clean"
 
 test: ocaml-build ## Run the bats test suite (test/)
-	@if command -v bats >/dev/null 2>&1; then \
-		bats test/; \
-	else \
-		nix develop --command bats test/; \
-	fi
+	@$(NIX_RUN) bats test/
 
 test-escape: ## Tier 3: real launches asserting the PLAN-007 escapes stay closed
 	@echo "test-escape: real launches (needs nix + network); run OUTSIDE csb"
-	@if command -v bats >/dev/null 2>&1; then \
-		bats test/escape/; \
-	else \
-		nix develop --command bats test/escape/; \
-	fi
+	@$(NIX_RUN) bats test/escape/
 
 test-update: ## Regenerate the Tier 2 snapshot goldens for THIS platform
-	@if command -v bats >/dev/null 2>&1; then \
-		SNAPSHOT_UPDATE=1 bats test/; \
-	else \
-		nix develop --command env SNAPSHOT_UPDATE=1 bats test/; \
-	fi
+	@$(NIX_RUN) env SNAPSHOT_UPDATE=1 bats test/
 	@echo "test-update: regenerated test/snapshots/$$(uname -s | tr 'A-Z' 'a-z')/ - review the diff"
 
 ocaml-build: ## Build csb-config + csb-proxy (dune, ocaml/)
@@ -176,11 +159,7 @@ proxy-run: ocaml-build ## Run csb-proxy in the foreground (port on stdout, decis
 	@exec $(CSB_PROXY) "$(PROXY_ALLOW)" --log-file "$(PROXY_LOG)"
 
 test-proxy: ocaml-build ## Egress-proxy tests (real proxy + curl; not in `make test`)
-	@if command -v bats >/dev/null 2>&1; then \
-		bats test/proxy/; \
-	else \
-		nix develop --command bats test/proxy/; \
-	fi
+	@$(NIX_RUN) bats test/proxy/
 
 # Every Tier-1 test that reaches csb only through --dump-config. The
 # dump-sandbox tag marks the rest: those need the profile generator, which
@@ -190,11 +169,7 @@ OCAML_ORACLE := --filter-tags '!dump-sandbox,!needs-bin-csb' test/precedence.bat
                 test/completion.bats
 
 ocaml-test: ocaml-build ## Config-layer oracle: the bats config tests against csb-config
-	@if command -v bats >/dev/null 2>&1; then \
-		CSB=$(CSB_CONFIG) bats $(OCAML_ORACLE); \
-	else \
-		nix develop --command env CSB=$(CSB_CONFIG) bats $(OCAML_ORACLE); \
-	fi
+	@$(NIX_RUN) env CSB=$(CSB_CONFIG) bats $(OCAML_ORACLE)
 
 build: ## Build the csb package from the flake (nix build .#csb)
 	@nix build .#csb
