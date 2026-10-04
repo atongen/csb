@@ -161,6 +161,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
         && p_here <> Some false)
   in
 
+  let flake = Layer.value (Layer.over cli.flake (pf (fun p -> p.flake))) in
   let seed_home = Layer.value (Layer.over cli.seed_home (pf (fun p -> p.seed_home))) in
   let token_cmd = Layer.value (Layer.over cli.token_cmd (pf (fun p -> p.token_cmd))) in
   let aws_profile = Layer.value (Layer.over cli.aws_profile (pf (fun p -> p.aws_profile))) in
@@ -317,6 +318,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     reseed = cli.reseed;
     seed_creds;
     nix_targets;
+    flake;
     profiles = cli.profiles;
     token_cmd;
     token_env;

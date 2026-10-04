@@ -142,6 +142,56 @@ load helpers
   assert_line "nix_target_effective=dev"
 }
 
+# --- flake (the devShell flake, instead of the repo's own) -------------------
+
+@test "flake defaults empty, leaving the repo's own devShell" {
+  dump_config
+  assert_success
+  assert_line "flake="
+}
+
+@test "a config section's flake= applies, ~/ expanded" {
+  write_config config "[*]" "flake=~/.config/csb/flakes/api"
+  export CSB_MAIN_ROOT="/src/work/myrepo"
+  dump_config
+  assert_success
+  assert_line "flake=$HOME/.config/csb/flakes/api"
+}
+
+@test "CLI --flake beats a profile flake=" {
+  write_profile p "flake=github:me/shells"
+  dump_config -p p --flake github:me/other
+  assert_success
+  assert_line "flake=github:me/other"
+}
+
+@test "--no-flake cancels a configured flake=" {
+  write_profile p "flake=github:me/shells"
+  dump_config -p p --no-flake
+  assert_success
+  assert_line "flake="
+}
+
+@test "an empty flake= retracts the layer below" {
+  write_config config "[*]" "flake=github:me/shells"
+  write_profile p "flake="
+  export CSB_MAIN_ROOT="/src/work/myrepo"
+  dump_config -p p
+  assert_success
+  assert_line "flake="
+}
+
+@test "the wire carries flake_dir for a local flake only" {
+  emit_records --here --flake /opt/flakes/api
+  assert_success
+  assert_line "flake=/opt/flakes/api"
+  assert_line "flake_dir=/opt/flakes/api"
+  emit_records --here --flake "github:me/shells?dir=api"
+  assert_success
+  assert_line "flake=github:me/shells?dir=api"
+  assert_line "flake_dir="
+}
+
 # --- sandbox (--no-sandbox / profile sandbox=) -------------------------------
 
 @test "CLI --sandbox beats profile sandbox=false" {

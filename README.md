@@ -644,6 +644,7 @@ sandbox=false                             # as --no-sandbox (shell only; drops t
 nix_target=release                        # as --nix-target: devShells.<system>.NAME
 nix_target_shell=dev                      # as --nix-target-shell; beats nix_target for -s runs
 nix_target_agent=ci                       # as --nix-target-agent; beats nix_target for agent runs
+flake=~/.config/csb/flakes/api            # as --flake: the devShell flake, instead of the repo's
 real_home=true                            # as --real-home; excludes ns=/ephemeral= (HOME axis)
 here=true                                 # as --here; an explicit BRANCH wins (with a warning)
 ephemeral=true                            # as -E; excludes ns= in the same profile
@@ -1360,6 +1361,40 @@ csb --nix-target ci feature/foo            # both modes in devShells.<system>.ci
 csb --nix-target-shell dev --nix-target-agent ci feature/foo
 ```
 
+### A flake from somewhere else (`flake=`)
+
+When the repo's own flake does not suit csb, or the repo has none and you
+cannot add one, `--flake REF` (key `flake=`) takes the devShell from REF
+instead: an absolute or `~/` directory, or a remote ref such as
+`github:OWNER/REPO` or `git+https://...?dir=shells`. A config section is how
+it becomes per-repo:
+
+```ini
+# ~/.config/csb/config
+[/Volumes/src/work/api]
+flake = ~/.config/csb/flakes/api
+
+[*/vendor-*]
+flake = github:me/devshells
+```
+
+The order is then `flake=`, the repo's own flake, csb's fallback. The target
+still comes from `nix_target` (`devShells.<system>.NAME`, `default` when
+unset), and an external flake without it fails the launch rather than falling
+back. `--no-flake` (or an empty `flake=`) returns to the repo's own.
+`.worktreesetup.sh` runs in the same devShell.
+
+nix evaluates the flake and runs its `shellHook` on the host, so a local
+`flake=` directory the sandbox can write is **refused**: the launch repo and
+its worktrees, every namespace HOME under `~/.csb/agents`, the temp dirs,
+`tmpdir=` and every `allow_write=`. Keep it somewhere like
+`~/.config/csb/flakes/`. That makes an external flake the safer shape: unlike
+the repo's tracked `flake.nix`, the agent cannot edit it (see
+[Threat model](#threat-model)). Two nix notes: a directory inside a git repo
+(your dotfiles, say) sees only its tracked files, and the first launch writes a
+`flake.lock` beside it. The flake's `self` is that directory, not the repo, so
+it suits a toolchain shell, not one that builds the repo's sources.
+
 Each flag is repeatable; profile vars accumulate across `NAME` + `NAME.local`.
 The host tmp/scratch dir is the `CSB_TMPDIR` env var (see [Quickstart](#quickstart)).
 
@@ -1476,7 +1511,9 @@ Named trade-offs, accepted deliberately (see `docs/PLAN-002.md`):
   dirty worktree -- no commit required -- so an agent could get host execution
   on your **next launch** of that branch by editing either. Don't point csb at
   a repo you don't trust, and review agent changes to `flake.nix`/`shellHook`
-  before relaunching a branch an agent has worked on. `.git/hooks` / `config` /
+  before relaunching a branch an agent has worked on -- or move the devShell
+  out of the agent's reach with [`flake=`](#a-flake-from-somewhere-else-flake),
+  which refuses a directory the sandbox can write. `.git/hooks` / `config` /
   `config.worktree` are write-denied even when absent, closing that adjacent
   host-exec path.
 - **Single layer, and it is a *filesystem* layer.** The seatbelt/bwrap profile
@@ -1599,7 +1636,8 @@ order of leverage:
 
 ## What a repo needs
 
-Nothing. If the repo has no `flake.nix` (or one without a `devShells.default`
+Nothing -- and [`flake=`](#a-flake-from-somewhere-else-flake) supplies a
+devShell from outside the repo when its own will not do. If the repo has no `flake.nix` (or one without a `devShells.default`
 for your system), csb falls back to a generic devShell from its own flake so the
 sandbox still runs, logging a note on launch. nix ignores untracked files, so a
 brand-new `flake.nix` counts as absent until you `git add` it -- csb falls back

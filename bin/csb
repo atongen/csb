@@ -244,8 +244,42 @@ process_worktreeinclude() {
   fi
 }
 
-# Resolve the devShell flake ref for DIR: the repo's own devShells.<system>.
-# <target> if present, else csb's generic fallback (with a warning to stderr).
+# Refuse a local flake= directory the agent could write. nix evaluates the flake
+# and runs its shellHook on the HOST, outside the deny wrapper, so a flake under
+# a write root is a sandbox -> host-exec path. The roots: the launch repo (its
+# worktrees live inside it), every namespace HOME, the temp dirs, tmpdir= and
+# allow_write=. Bound: hygiene against the likely placements, not containment
+# -- another repo's agent can still write its own checkout.
+refuse_writable_flake() {
+  local dir="$1" fd root rr gc dtmp
+  [[ ! -f "$flake_dir" ]] || die "flake: $flake_dir is a file; name the DIRECTORY holding its flake.nix
+  (nix reads a flake only as <dir>/flake.nix, e.g. ~/.config/csb/flakes/basic/flake.nix)"
+  [[ -f "$flake_dir/flake.nix" ]] || die "flake: no flake.nix in $flake_dir"
+  fd=$(realpath "$flake_dir")
+  gc=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  local -a roots=("$dir" "$(main_checkout_root "$dir")" "$gc" "$CSB_NS_ROOT"
+                  "$CSB_NS_ROOT_LEGACY" "$cfg_tmpdir" "$cfg_tmp_base" "${TMPDIR:-}"
+                  /tmp /var/tmp /dev
+                  "${allow_write_paths[@]+"${allow_write_paths[@]}"}")
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    dtmp="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+    [[ -n "$dtmp" ]] && roots+=("$(dirname "$dtmp")")
+  fi
+  for root in "${roots[@]}"; do
+    [[ -n "$root" ]] || continue
+    rr=$(canon_path "$root")
+    if path_at_or_under "$fd" "$rr"; then
+      die "flake '$flake_dir' is under '$rr', which the sandbox can write: nix
+  evaluates it and runs its shellHook on the HOST, so the agent could rewrite what
+  runs there (keep it outside every write root, e.g. under ~/.config/csb/flakes)"
+    fi
+  done
+  return 0
+}
+
+# Resolve the devShell flake ref for DIR: flake= when set (never falling back),
+# else the repo's own devShells.<system>.<target> if present, else csb's
+# generic fallback (with a warning to stderr).
 # Shared by the main launch and by run_worktreesetup's sandboxing below.
 #
 # The target is `default` unless --nix-target (or its per-mode variants, or the
@@ -261,6 +295,14 @@ resolve_devshell_ref() {
     Linux-aarch64|Linux-arm64) system="aarch64-linux" ;;
     *)                         system="" ;;
   esac
+  if [[ -n "$flake" ]]; then
+    [[ -z "$flake_dir" ]] || refuse_writable_flake "$dir"
+    if [[ -n "$system" ]] && ! nix eval "$flake#devShells.$system.$target.name" >/dev/null 2>&1; then
+      die "no devShells.$system.$target in the flake at $flake (flake=, nix target '$target')"
+    fi
+    echo "$flake#$target"
+    return
+  fi
   # nix flakes ignore UNTRACKED files, so a brand-new flake.nix that hasn't
   # been `git add`ed is invisible to nix develop -- the eval below treats that
   # as "no devShell" and falls back too.
@@ -1955,7 +1997,7 @@ csb_config_scalars=(dump mode no_launch here shell agent agent_bin_attr
                     token_hint
                     cred_check cred_usable_expr cred_clear_expr ns_migrate
                     paranoid pasteboard
-                    nix_target_effective sandbox real_home yolo latest verbose
+                    nix_target_effective flake flake_dir sandbox real_home yolo latest verbose
                     namespace branch ephemeral ephemeral_name seed_creds
                     seed_home reseed accent cfg_tmpdir tmp_base token_cmd aws_profile
                     aws_expiry_var filter_egress
@@ -2010,6 +2052,8 @@ resolve_config() {
       paranoid)             paranoid="$v" ;;
       pasteboard)           pasteboard="$v" ;;
       nix_target_effective) nix_target_effective="$v" ;;
+      flake)                flake="$v" ;;
+      flake_dir)            flake_dir="$v" ;;
       sandbox)              sandbox="$v" ;;
       real_home)            real_home="$v" ;;
       yolo)                 yolo="$v" ;;
@@ -2125,6 +2169,8 @@ ns_migrate="false"        # whether an unsuffixed repo-<key> HOME is this agent'
 paranoid="false"
 pasteboard="false"
 nix_target_effective="default"  # devShells.<system>.NAME for THIS launch mode
+flake=""                        # flake= : the devShell flake, instead of the repo's
+flake_dir=""                    # the same, when it is a local directory
 sandbox="true"
 real_home="false"
 yolo="false"

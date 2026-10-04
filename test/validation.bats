@@ -726,6 +726,78 @@ none
   assert_line "    type filter hook output priority 0; policy drop;"
 }
 
+# --- flake= may not name a directory the sandbox can write -------------------
+
+@test "--flake and --no-flake are mutually exclusive" {
+  dump_config --flake github:me/shells --no-flake
+  assert_failure
+  assert_output --partial "--flake and --no-flake are mutually exclusive"
+}
+
+@test "a flake carrying a '#' target is refused" {
+  dump_config --flake "github:me/shells#ci"
+  assert_failure
+  assert_output --partial "the target comes from nix_target"
+}
+
+@test "a bare flake registry name is refused" {
+  write_profile p "flake=nixpkgs"
+  dump_config -p p
+  assert_failure
+  assert_output --partial "absolute or ~/ path, or a SCHEME:... ref"
+}
+
+@test "a relative flake path is refused" {
+  dump_config --flake flakes/api
+  assert_failure
+  assert_output --partial "absolute or ~/ path, or a SCHEME:... ref"
+}
+
+@test "a local flake scheme is refused in favour of the bare path" {
+  dump_config --flake path:/opt/flakes/api
+  assert_failure
+  assert_output --partial "name a local flake by its absolute path"
+  dump_config --flake git+file:///opt/flakes/api
+  assert_failure
+  assert_output --partial "name a local flake by its absolute path"
+}
+
+# bats test_tags=dump-sandbox
+@test "a flake directory with no flake.nix is refused" {
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$TEST_TMP/empty"
+  dump_sandbox "$repo" --flake "$TEST_TMP/empty"
+  assert_failure
+  assert_output --partial "flake: no flake.nix in $TEST_TMP/empty"
+}
+
+# bats test_tags=dump-sandbox
+@test "a flake naming a .nix file rather than its directory is refused" {
+  local repo; repo="$(fake_repo)"
+  touch "$TEST_TMP/basic.nix"
+  dump_sandbox "$repo" --flake "$TEST_TMP/basic.nix"
+  assert_failure
+  assert_output --partial "is a file; name the DIRECTORY holding its flake.nix"
+}
+
+# bats test_tags=dump-sandbox
+@test "a flake inside the launch repo is refused" {
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$repo/shells" && touch "$repo/shells/flake.nix"
+  dump_sandbox "$repo" --flake "$repo/shells"
+  assert_failure
+  assert_output --partial "is under '$(realpath "$repo")', which the sandbox can write"
+}
+
+# bats test_tags=dump-sandbox
+@test "a flake inside a namespace HOME is refused" {
+  local repo; repo="$(fake_repo)"
+  mkdir -p "$HOME/.csb/agents/@work/flake" && touch "$HOME/.csb/agents/@work/flake/flake.nix"
+  dump_sandbox "$repo" --flake "$HOME/.csb/agents/@work/flake"
+  assert_failure
+  assert_output --partial "is under '$(realpath "$HOME/.csb/agents")', which the sandbox can write"
+}
+
 # --- the agent axis ----------------------------------------------------------
 
 @test "an unknown --agent dies, naming the known ones" {

@@ -85,6 +85,13 @@ type nix_targets = {
   for_agent : string option;  (* --nix-target-agent *)
 }
 
+(* Where the devShell comes from when a layer names one instead of the repo.
+   A Flake_dir is read host-side, so bin/csb refuses one the agent could write;
+   a Flake_ref is fetched by nix and carries no '#': the target is appended. *)
+type flake =
+  | Flake_dir of string  (* absolute, ~/ expanded *)
+  | Flake_ref of string  (* SCHEME:... *)
+
 type t = {
   mode : mode;
   dump : dump;
@@ -102,6 +109,7 @@ type t = {
   reseed : bool;
   seed_creds : bool;
   nix_targets : nix_targets;
+  flake : flake option;
   (* Every -p in the order given, each its own sub-layer: the last one to answer
      a scalar wins, and their lists union. Empty when no -p was passed. *)
   profiles : string list;

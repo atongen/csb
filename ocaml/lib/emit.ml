@@ -57,6 +57,10 @@ let records env c =
       ("paranoid", b c.paranoid);
       ("pasteboard", b c.pasteboard);
       ("nix_target_effective", s (effective_nix_target c));
+      (* flake_dir is set exactly when flake is a local directory, the one kind
+         bin/csb must check against the write roots before nix reads it. *)
+      ("flake", s (Dump.flake_ref c.flake));
+      ("flake_dir", s (Dump.flake_dir c.flake));
       ("sandbox", b c.sandbox);
       ("real_home", b (Dump.is_real_home c.home));
       ("yolo", b c.yolo);

@@ -32,6 +32,7 @@ type t = {
   filter_egress : bool option;
   allow_loopback : bool option;
   nix : Types.nix_targets Layer.t;
+  flake : Types.flake Layer.t;
   home : Types.home_sel Layer.t;
   agent : Types.agent Layer.t;
   seed_home : string Layer.t;
@@ -70,7 +71,7 @@ type t = {
 
 let value_taking =
   [ "-N"; "--ns"; "--agent"; "--nix-target"; "--nix-target-shell";
-    "--nix-target-agent";
+    "--nix-target-agent"; "--flake";
     "--seed-home"; "--accent"; "--token-cmd"; "--token-env"; "--aws"; "--tmpdir"; "--setenv";
     "--setenv-cmd"; "--seed-merge";
     "-p"; "--profile"; "-k"; "--keep"; "--deny-read";
@@ -499,6 +500,9 @@ let term env pre =
     flag [ "no-allow-loopback" ] ~docs:s_negate ~doc:"Cancel a profile allow_loopback=true."
   and+ no_nix_target =
     flag [ "no-nix-target" ] ~docs:s_negate ~doc:"Cancel all three profile nix_target keys."
+  and+ no_flake =
+    flag [ "no-flake" ] ~docs:s_negate
+      ~doc:"Cancel a configured flake= and use the repo's own devShell again."
   and+ no_token_cmd =
     flag [ "no-token-cmd" ] ~docs:s_negate
       ~doc:"Cancel a configured token_cmd= and authenticate some other way."
@@ -533,6 +537,16 @@ let term env pre =
   and+ nix_target_agent =
     opt_str [ "nix-target-agent" ] ~docv:"NAME"
       ~doc:"As --nix-target, for agent runs only; it beats --nix-target for those runs."
+  and+ flake =
+    opt_str [ "flake" ] ~complete:Arg.Completion.complete_dirs ~docv:"REF"
+      ~doc:
+        "Take the devShell from REF instead of the repo's own flake: an absolute \
+         or ~/ directory, or a remote ref such as github:OWNER/REPO. The target \
+         is still --nix-target's (default if none), and a REF without it FAILS \
+         the launch rather than falling back. A directory the sandbox could \
+         write -- the repo, a namespace HOME, a temp dir, an --allow-write root \
+         -- is refused: nix evaluates the flake and runs its shellHook on the \
+         HOST."
   and+ agent = agent_a
   and+ ns =
     opt_str [ "N"; "ns" ] ~complete:(Complete.namespaces env) ~docv:"NAME" ~docs:s_home
@@ -703,6 +717,12 @@ let term env pre =
           (Option.map (Validate.nix_target ~where:"--nix-target-agent")
              (need ~msg:"--nix-target-agent requires a NAME" nix_target_agent))
         ~cleared:(given no_nix_target);
+    flake =
+      Layer.map
+        (Validate.flake env ~where:"--flake")
+        (setting ~pos:"--flake" ~neg:"--no-flake" ~cleared:(given no_flake)
+           (need ~msg:"--flake requires a REF (--no-flake uses the repo's own devShell)"
+              flake));
     agent = agent_of ~agent ~no_agent;
     home =
       home_of

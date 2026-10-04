@@ -40,6 +40,28 @@ let nix_target ~where v =
   then v
   else Err.die "%s: invalid nix target '%s' (use letters, digits, . _ -)" where v
 
+(* A devShell flake: an absolute or ~/ directory, or a SCHEME:... ref. Spliced
+   into the nix argv with '#target' appended, so no '#', quote or whitespace.
+   A local scheme is refused because the write-root check needs the directory,
+   and a bare word because nix would resolve it through the mutable registry. *)
+let flake env ~where v =
+  let ok c = is_alnum c || String.contains "._-/:?&=@+~%" c in
+  if v = "" || not (for_all ok v) then
+    Err.die "%s: invalid flake '%s' (no '#', quotes or whitespace; the target comes from nix_target)"
+      where v;
+  if starts_with ~prefix:"/" v || starts_with ~prefix:"~/" v then
+    Types.Flake_dir (Env.expand_tilde env v)
+  else
+    match String.index_opt v ':' with
+    | Some i
+      when i > 0 && is_alpha v.[0]
+           && for_all (fun c -> is_alnum c || c = '+' || c = '.' || c = '-') (String.sub v 0 i) ->
+        let scheme = String.sub v 0 i in
+        if scheme = "path" || String.ends_with ~suffix:"file" scheme then
+          Err.die "%s: name a local flake by its absolute path, not '%s:': '%s'" where scheme v
+        else Types.Flake_ref v
+    | _ -> Err.die "%s: flake must be an absolute or ~/ path, or a SCHEME:... ref: '%s'" where v
+
 (* A namespace becomes a directory ~/.csb/agents/@NAME; the leading @ is
    optional here (it is added at resolve time). *)
 let namespace v =

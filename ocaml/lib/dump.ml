@@ -44,6 +44,14 @@ let is_real_home = function
   | Real_home -> true
   | Per_repo | Shared _ | Throwaway _ -> false
 
+let flake_ref = function
+  | Some (Types.Flake_dir d) | Some (Types.Flake_ref d) -> d
+  | None -> ""
+
+let flake_dir = function
+  | Some (Types.Flake_dir d) -> d
+  | Some (Types.Flake_ref _) | None -> ""
+
 let to_lines c =
   [
     ("mode", mode_name c.mode);
@@ -58,6 +66,7 @@ let to_lines c =
     ("nix_target_shell", opt c.nix_targets.for_shell);
     ("nix_target_agent", opt c.nix_targets.for_agent);
     ("nix_target_effective", effective_nix_target c);
+    ("flake", flake_ref c.flake);
     ("sandbox", string_of_bool c.sandbox);
     ("real_home", string_of_bool (is_real_home c.home));
     ("yolo", string_of_bool c.yolo);

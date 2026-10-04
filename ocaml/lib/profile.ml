@@ -12,6 +12,7 @@
 type t = {
   home : Types.home_sel Layer.t;
   nix : Types.nix_targets Layer.t;
+  flake : Types.flake Layer.t;
   agent : Types.agent Layer.t;
   shell : bool option;
   token_cmd : string Layer.t;
@@ -46,7 +47,7 @@ type t = {
 
 let empty =
   {
-    home = Layer.Unset; nix = Layer.Unset; agent = Layer.Unset; shell = None;
+    home = Layer.Unset; nix = Layer.Unset; flake = Layer.Unset; agent = Layer.Unset; shell = None;
     token_cmd = Layer.Unset; token_env = Layer.Unset; aws_profile = Layer.Unset;
     latest = None; verbose = None; yolo = None; paranoid = None;
     pasteboard = None; sandbox = None; here = None; seed_creds = None;
@@ -82,7 +83,7 @@ let blank =
 let known_keys =
   "agent, ns, token_cmd, token_env, aws_profile, latest, verbose, yolo, paranoid, pasteboard, \
    sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
-   nix_target_agent, seed_creds, seed_home, seed_merge, tmpdir, accent, args, \
+   nix_target_agent, flake, seed_creds, seed_home, seed_merge, tmpdir, accent, args, \
    keep, setenv, setenv_cmd, deny_read, allow_write, allow_socket, \
    filter_egress, allow_loopback, allow_host, allow_port, paranoid_deny_read, \
    paranoid_allow_read"
@@ -111,6 +112,12 @@ let apply env ~where d key value =
   | "nix_target" -> { d with raw_nix = target () }
   | "nix_target_shell" -> { d with raw_nix_shell = target () }
   | "nix_target_agent" -> { d with raw_nix_agent = target () }
+  | "flake" ->
+      keep_layer
+        { p with
+          flake =
+            (if value = "" then Layer.Cleared
+             else Layer.Set (Validate.flake env ~where:(where ^ ": flake") value)) }
   | "agent" ->
       keep_layer
         { p with
@@ -285,6 +292,7 @@ let overlay ~base ~over =
   {
     home = Layer.over over.home base.home;
     nix = Layer.over over.nix base.nix;
+    flake = Layer.over over.flake base.flake;
     agent = Layer.over over.agent base.agent;
     shell = s over.shell base.shell;
     token_cmd = Layer.over over.token_cmd base.token_cmd;
