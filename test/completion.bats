@@ -48,6 +48,15 @@ groups() {
   [[ "$(items)" == *--paranoid* ]]
 }
 
+@test "--system-path and its negation complete" {
+  complete --sys
+  assert_success
+  [[ "$(items)" == *--system-path* ]]
+  complete --no-sys
+  assert_success
+  [[ "$(items)" == *--no-system-path* ]]
+}
+
 @test "an unknown flag earlier on the line still completes" {
   complete --bogus --par
   assert_success

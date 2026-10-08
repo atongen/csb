@@ -54,6 +54,39 @@ load helpers
   assert_line "pasteboard=true"
 }
 
+# --- system_path (append existing system bin dirs to PATH) ------------------
+
+@test "system_path defaults off" {
+  dump_config
+  assert_success
+  assert_line "system_path=false"
+}
+
+@test "CLI --system-path beats profile system_path=false" {
+  write_profile p "system_path=false"
+  dump_config -p p --system-path
+  assert_success
+  assert_line "system_path=true"
+}
+
+@test "CLI --no-system-path beats profile system_path=true" {
+  write_profile p "system_path=true"
+  dump_config -p p --no-system-path
+  assert_success
+  assert_line "system_path=false"
+}
+
+@test "profile system_path=true applies with no CLI override" {
+  write_profile p "system_path=true"
+  dump_config -p p
+  assert_line "system_path=true"
+}
+
+@test "--system-path and --no-system-path together are refused" {
+  dump_config --system-path --no-system-path
+  assert_failure
+}
+
 # --- allow_loopback (widen --filter-egress to every loopback port) -----------
 
 @test "allow_loopback defaults off" {

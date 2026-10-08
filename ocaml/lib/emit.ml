@@ -56,6 +56,7 @@ let records env c =
       ("ns_migrate", b (Agent.ns_migrate c.agent));
       ("paranoid", b c.paranoid);
       ("pasteboard", b c.pasteboard);
+      ("system_path", b c.system_path);
       ("nix_target_effective", s (effective_nix_target c));
       (* flake_dir is set exactly when flake is a local directory, the one kind
          bin/csb must check against the write roots before nix reads it. *)

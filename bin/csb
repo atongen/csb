@@ -1996,7 +1996,7 @@ csb_config_scalars=(dump mode no_launch here shell agent agent_bin_attr
                     agent_bin_name agent_config_dir agent_config_env token_env
                     token_hint
                     cred_check cred_usable_expr cred_clear_expr ns_migrate
-                    paranoid pasteboard
+                    paranoid pasteboard system_path
                     nix_target_effective flake flake_dir sandbox real_home yolo latest verbose
                     namespace branch ephemeral ephemeral_name seed_creds
                     seed_home reseed accent cfg_tmpdir tmp_base token_cmd aws_profile
@@ -2051,6 +2051,7 @@ resolve_config() {
       ns_migrate)           ns_migrate="$v" ;;
       paranoid)             paranoid="$v" ;;
       pasteboard)           pasteboard="$v" ;;
+      system_path)          system_path="$v" ;;
       nix_target_effective) nix_target_effective="$v" ;;
       flake)                flake="$v" ;;
       flake_dir)            flake_dir="$v" ;;
@@ -2168,6 +2169,7 @@ cred_clear_expr=""        # jq: drop the session credential, keep other auth
 ns_migrate="false"        # whether an unsuffixed repo-<key> HOME is this agent's
 paranoid="false"
 pasteboard="false"
+system_path="false"
 nix_target_effective="default"  # devShells.<system>.NAME for THIS launch mode
 flake=""                        # flake= : the devShell flake, instead of the repo's
 flake_dir=""                    # the same, when it is a local directory
@@ -2697,15 +2699,26 @@ vecho "$PROG:   scrubbed env, HOME=$agent_home, fs deny-list on; network OPEN"
 #   - PREPEND $HOME/bin when it exists, so the operator's own scripts (deploy
 #     wrappers under --real-home; anything seeded into a namespace HOME) take
 #     precedence. This intentionally outranks the devShell toolchain.
-#   - APPEND /usr/bin so bare-name lookups resolve system-only tools
-#     (pbcopy/pbpaste, osascript) already exec'able by absolute path -- name
+#   - APPEND, under --system-path, each system bin dir that exists, so bare
+#     names resolve system-only tools (pbcopy/pbpaste, osascript) -- name
 #     resolution only, not the sandbox boundary. Appended LAST so the devShell's
 #     GNU tools keep priority over macOS BSD ones.
+# The dirs ride as shim arguments up to a `--`, ahead of the command.
+system_dirs=()
+if [[ "$system_path" == "true" ]]; then
+  system_dirs=(/run/current-system/sw/bin /nix/var/nix/profiles/default/bin
+               /bin /usr/bin /sbin /usr/sbin)
+fi
 # shellcheck disable=SC2016  # $HOME/$PATH/$@ must expand at shim runtime, not here
 path_shim=(bash -c '
   [[ -d "$HOME/bin" ]] && PATH="$HOME/bin${PATH:+:$PATH}"
-  export PATH="${PATH:+$PATH:}/usr/bin"
-  exec "$@"' csb-path-shim)
+  while [[ "$1" != "--" ]]; do
+    [[ -d "$1" ]] && PATH="${PATH:+$PATH:}$1"
+    shift
+  done
+  shift
+  export PATH
+  exec "$@"' csb-path-shim "${system_dirs[@]+"${system_dirs[@]}"}" --)
 
 # --shell: same worktree/devShell/scrub/HOME/deny-list, but exec an interactive
 # bash (or the args after --) instead of the agent. No agent build needed.

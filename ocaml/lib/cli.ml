@@ -24,6 +24,7 @@ type t = {
   yolo : bool option;
   paranoid : bool option;
   pasteboard : bool option;
+  system_path : bool option;
   sandbox : bool option;
   here : bool option;
   seed_creds : bool option;
@@ -401,6 +402,16 @@ let term env pre =
          is readable by it. A no-op on Linux and under --no-sandbox."
   and+ no_pasteboard =
     flag [ "no-pasteboard" ] ~docs:s_negate ~doc:"Cancel a profile pasteboard=true."
+  and+ system_path =
+    flag [ "system-path" ] ~docs:s_policy
+      ~doc:
+        "Append the host's system bin directories that exist -- \
+         /run/current-system/sw/bin, /nix/var/nix/profiles/default/bin, /bin, \
+         /usr/bin, /sbin, /usr/sbin -- to PATH, after the devShell. OFF by \
+         default: PATH is the devShell's (plus HOME/bin when it exists). Name \
+         resolution only; the sandbox boundary is unchanged."
+  and+ no_system_path =
+    flag [ "no-system-path" ] ~docs:s_negate ~doc:"Cancel a profile system_path=true."
   and+ sandbox =
     flag [ "sandbox" ] ~docs:s_policy ~doc:"Keep the filesystem sandbox. This is the default."
   and+ no_sandbox =
@@ -692,6 +703,9 @@ let term env pre =
     pasteboard =
       pair ~pos:"--pasteboard" ~neg:"--no-pasteboard" (given pasteboard)
         (given no_pasteboard);
+    system_path =
+      pair ~pos:"--system-path" ~neg:"--no-system-path" (given system_path)
+        (given no_system_path);
     sandbox = pair ~pos:"--sandbox" ~neg:"--no-sandbox" (given sandbox) (given no_sandbox);
     here = pair ~pos:"--here" ~neg:"--no-here" (given here) (given no_here);
     seed_creds =

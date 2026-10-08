@@ -45,6 +45,14 @@ setup_root() { export CSB_MAIN_ROOT="$REPO"; }
   assert_line "config_sections=config[*]"
 }
 
+@test "a config section sets system_path" {
+  setup_root
+  write_config config "[*]" "system_path = true"
+  dump_config
+  assert_success
+  assert_line "system_path=true"
+}
+
 @test "an exact-path section applies to that repo only" {
   write_config config "[$REPO]" "paranoid=true"
   export CSB_MAIN_ROOT="$REPO"

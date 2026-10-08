@@ -62,6 +62,7 @@ let to_lines c =
     ("agent_bin_attr", Agent.bin_attr c.agent);
     ("paranoid", string_of_bool c.paranoid);
     ("pasteboard", string_of_bool c.pasteboard);
+    ("system_path", string_of_bool c.system_path);
     ("nix_target", opt c.nix_targets.shared);
     ("nix_target_shell", opt c.nix_targets.for_shell);
     ("nix_target_agent", opt c.nix_targets.for_agent);

@@ -640,6 +640,7 @@ verbose=true                              # as -v/--verbose; beats CSB_VERBOSE, 
 yolo=true                                 # as -y/--yolo (allow-all)
 paranoid=true                             # as --paranoid (whitelist reads under HOME; see below)
 pasteboard=true                           # as --pasteboard (macOS pbcopy/pbpaste)
+system_path=true                          # as --system-path: append existing system bin dirs to PATH
 sandbox=false                             # as --no-sandbox (shell only; drops the fs lockdown)
 nix_target=release                        # as --nix-target: devShells.<system>.NAME
 nix_target_shell=dev                      # as --nix-target-shell; beats nix_target for -s runs
@@ -1218,6 +1219,10 @@ it was measured not to reopen the escape, and `test/escape/escape.bats` keeps
 that a regression guard. No-op on Linux (an X11/Wayland concern) and under
 `--no-sandbox`.
 
+`pbcopy`/`pbpaste` live in `/usr/bin`, which is not on `PATH` by default: call
+them by absolute path, or add `--system-path` (see
+[What a repo needs](#what-a-repo-needs)) so the bare names resolve.
+
 ## Filtering egress (`--filter-egress`)
 
 **Off by default.** Turn it on and the sandbox's only route out is `csb-proxy`,
@@ -1662,6 +1667,29 @@ namespace/ephemeral HOME) it is **prepended** to `PATH`, so your own scripts
 (e.g. deploy wrappers) take precedence -- ahead of the devShell toolchain. This
 happens inside the launched process only; host-side `nix` runs first with the
 real PATH, so the trust model is unaffected.
+
+**System dirs on PATH (`--system-path`).** By default `PATH` is the devShell's
+alone (plus `~/bin` above): a tool the devShell does not provide is "command not
+found" rather than a silent fallback to a host copy -- on macOS, usually a BSD
+variant whose flags differ from the GNU one the agent expects. `--system-path`
+(profile `system_path=true`) **appends** whichever of these exist, after the
+devShell so its tools keep priority:
+
+```
+/run/current-system/sw/bin  /nix/var/nix/profiles/default/bin
+/bin  /usr/bin  /sbin  /usr/sbin
+```
+
+That is how bare names like `pbcopy`/`pbpaste` (with `--pasteboard`),
+`osascript` or `open` resolve. It is name resolution only, not a sandbox
+boundary: those binaries are exec'able by absolute path either way, and only a
+`deny_read=` stops that. A profile pairing the two:
+
+```
+# ~/.config/csb/profiles/mac
+system_path=true
+pasteboard=true
+```
 
 For a project-specific toolchain, expose a standard `flake.nix` with
 `devShells.default` (the repo's full toolchain); csb prefers it over the

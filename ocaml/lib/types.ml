@@ -102,6 +102,7 @@ type t = {
   home : home;
   paranoid : bool;
   pasteboard : bool;
+  system_path : bool;
   sandbox : bool;
   yolo : bool;
   latest : bool;

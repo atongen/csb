@@ -117,6 +117,9 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
   let pasteboard =
     bool_layer ~cli:cli.pasteboard ~profile:(pf (fun p -> p.pasteboard)) ~default:false
   in
+  let system_path =
+    bool_layer ~cli:cli.system_path ~profile:(pf (fun p -> p.system_path)) ~default:false
+  in
   let sandbox = bool_layer ~cli:cli.sandbox ~profile:(pf (fun p -> p.sandbox)) ~default:true in
   let seed_creds =
     bool_layer ~cli:cli.seed_creds ~profile:(pf (fun p -> p.seed_creds)) ~default:false
@@ -311,6 +314,7 @@ let resolve ~(env : Env.t) ~(cli : Cli.t) ~(layers : Profile.t) ~config_sections
     home;
     paranoid;
     pasteboard;
+    system_path;
     sandbox;
     yolo;
     latest;

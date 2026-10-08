@@ -120,7 +120,9 @@
       prefix is user-writable (`atongen:admin`) and a planted binary would run
       on the HOST later; same family as the `.worktreesetup.sh` / `flake.nix`
       host-exec residual in PLAN-004. `brew` is not on PATH either (nix owns
-      PATH; the shim adds only `$HOME/bin` and `/usr/bin`, bin/csb:2230-2231).
+      PATH; the shim adds only `$HOME/bin`, plus the existing system bin dirs
+      under `--system-path` -- none of them a brew prefix; see `path_shim` in
+      bin/csb).
       What remains is exec by ABSOLUTE path, so the goal here is a hermetic
       toolchain, not containment.
     * deliberately NOT in the built-in floor: that floor is a credential

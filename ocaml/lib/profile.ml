@@ -23,6 +23,7 @@ type t = {
   yolo : bool option;
   paranoid : bool option;
   pasteboard : bool option;
+  system_path : bool option;
   sandbox : bool option;
   here : bool option;
   seed_creds : bool option;
@@ -50,7 +51,7 @@ let empty =
     home = Layer.Unset; nix = Layer.Unset; flake = Layer.Unset; agent = Layer.Unset; shell = None;
     token_cmd = Layer.Unset; token_env = Layer.Unset; aws_profile = Layer.Unset;
     latest = None; verbose = None; yolo = None; paranoid = None;
-    pasteboard = None; sandbox = None; here = None; seed_creds = None;
+    pasteboard = None; system_path = None; sandbox = None; here = None; seed_creds = None;
     seed_home = Layer.Unset; tmpdir = Layer.Unset; accent = Layer.Unset;
     args = Layer.Unset;
     filter_egress = None; allow_loopback = None; keep = []; setenv = [];
@@ -82,7 +83,7 @@ let blank =
 
 let known_keys =
   "agent, ns, token_cmd, token_env, aws_profile, latest, verbose, yolo, paranoid, pasteboard, \
-   sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
+   system_path, sandbox, real_home, here, ephemeral, shell, nix_target, nix_target_shell, \
    nix_target_agent, flake, seed_creds, seed_home, seed_merge, tmpdir, accent, args, \
    keep, setenv, setenv_cmd, deny_read, allow_write, allow_socket, \
    filter_egress, allow_loopback, allow_host, allow_port, paranoid_deny_read, \
@@ -143,6 +144,7 @@ let apply env ~where d key value =
   | "yolo" -> keep_layer { p with yolo = b () }
   | "paranoid" -> keep_layer { p with paranoid = b () }
   | "pasteboard" -> keep_layer { p with pasteboard = b () }
+  | "system_path" -> keep_layer { p with system_path = b () }
   | "sandbox" -> keep_layer { p with sandbox = b () }
   | "here" -> keep_layer { p with here = b () }
   | "seed_creds" -> keep_layer { p with seed_creds = b () }
@@ -303,6 +305,7 @@ let overlay ~base ~over =
     yolo = s over.yolo base.yolo;
     paranoid = s over.paranoid base.paranoid;
     pasteboard = s over.pasteboard base.pasteboard;
+    system_path = s over.system_path base.system_path;
     sandbox = s over.sandbox base.sandbox;
     here = s over.here base.here;
     seed_creds = s over.seed_creds base.seed_creds;

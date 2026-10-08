@@ -152,7 +152,7 @@ let man =
        is its own layer folded left to right.";
     `P
       "Every layer takes the same keys: agent, ns, token_cmd, token_env, \
-       aws_profile, latest, verbose, yolo, paranoid, pasteboard, sandbox, \
+       aws_profile, latest, verbose, yolo, paranoid, pasteboard, system_path, sandbox, \
        real_home, here, ephemeral, \
        shell, nix_target, nix_target_shell, nix_target_agent, flake, seed_creds, \
        seed_home, seed_merge, tmpdir, accent, args, keep, setenv, setenv_cmd, \
